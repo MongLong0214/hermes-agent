@@ -1799,8 +1799,8 @@ def _run_conversation_turn(
 
     result = _finalize_from_state(agent, s)
     if s._compression_timeout_exhausted:
-        # Reuse the gateway's context-recovery contract: transcript stays intact while
-        # future input can move to a clean session (#98722).
+        # Reuse the gateway's context-recovery contract: the session keeps its history, the
+        # unanswered ask is retracted owner-side, and the user chooses /compress or /new (#98722).
         result.update(error=_COMPRESSION_TIMEOUT_FINAL_RESPONSE, partial=True, compression_exhausted=True)
     return result
 
@@ -1925,7 +1925,9 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
 
     Excluded: the context-pressure classes (``compression_exhausted``, ``compression_deferred``,
     ``failure_reason == "context_overflow"``) — appending to an already-oversized session is the
-    #1630 growth loop; their repair is rotation or a retry. ``content_policy_blocked`` too: the
+    #1630 growth loop; an exhausted turn's own user row is retracted owner-side once the turn lease
+    is released (the gateway's ``_hmwa_retract_exhausted_turn``), the others are left for a retry.
+    ``content_policy_blocked`` too: the
     WHOLE refused turn is erased from the conversation — the user message, any tool rounds that ran,
     and the refusal (the owner rewinds it durably: the gateway owner-side for Bot Chat, the CLI/ACP
     owner for their direct DB; in-memory surfaces return the pre-refusal history). Erasing the whole

@@ -387,13 +387,13 @@ class GatewayTurnPersistenceMixin:
     async def _hmwa_compression_exhaustion_reset(
         self, agent_result, response, session_entry, session_key, source,
     ):
-        """Auto-reset a permanently oversized session so the next message starts fresh instead of
-        replaying the oversized context forever. Never on a lock-contended defer — that is the
-        OPPOSITE case (a concurrent path holds the lock and is shrinking it). Returns
-        ``(response, session_entry)``."""
-        # When compression is exhausted, the session is permanently too large to process. (#9893) Never wipe
-        # the session for that — retry-next-message semantics apply (#69870 lock-skip consumer; salvaged
-        # from #49874).
+        """Keep the session after compression exhaustion; returns ``(response, session_entry)``.
+
+        Exhaustion never resets: the conversation, its id and everything scoped to it stay, and messages
+        queued behind the turn run on it. The unanswered ask is retracted when the transcript is persisted
+        (``_hmwa_retract_exhausted_turn``) and the reply says to /compress and resend, or /new. A
+        lock-contended defer is the OPPOSITE case (a concurrent path is shrinking the session): the next
+        message retries normally (#69870 lock-skip consumer; salvaged from #49874)."""
         if agent_result.get("compression_deferred"):
             logger.info(
                 "Compression deferred for session %s — the compression "
@@ -401,77 +401,40 @@ class GatewayTurnPersistenceMixin:
                 "session intact; the next message retries normally.",
                 session_entry.session_id if session_entry else "?",
             )
-        elif agent_result.get("compression_exhausted") and (
-                getattr(source, "platform", None) == Platform.API_SERVER or detached_route_of(source)):
-            # The caller addresses an API conversation by its id and every API door re-validates that
-            # binding (``restore_api_session``): a rotated entry would refuse each later request to it
-            # (``admission_conflict``). A conversation its chat moved past has no route of its own to
-            # reset (gateway/session_detached.py): its app viewer gets the start-fresh guidance a
-            # failed overflow turn gives. Never a reset that did not happen.
+        elif agent_result.get("compression_exhausted"):
             logger.info("Keeping session %s after compression exhaustion.",
                         session_entry.session_id if session_entry else "?")
-            from gateway.run import _context_overflow_reply
-            guidance = _context_overflow_reply() if detached_route_of(source) else ""
-            if guidance not in (response or ""):
-                response = f"{response}\n\n{guidance}" if response else guidance
-        elif agent_result.get("compression_exhausted") and session_entry and session_key:
-            if not self._hmwa_defer_exhaustion_reset(session_entry, session_key, source):
-                session_entry = await self._hmwa_rotate_exhausted_session(session_entry, session_key, source)
-            response = (response or "") + t("gateway.session.auto_reset_context_exhausted")
+            # A conversation its chat moved past (gateway/session_detached.py): its app viewer gets the
+            # guidance a failed overflow turn gives.
+            if detached_route_of(source):
+                from gateway.run import _context_overflow_reply
+                guidance = _context_overflow_reply()
+                if guidance not in (response or ""):
+                    response = f"{response}\n\n{guidance}" if response else guidance
         return response, session_entry
 
-    def _hmwa_defer_exhaustion_reset(self, session_entry, session_key, source):
-        """True when the reset was handed to the authority drain. A LOCAL session (the Bot Chat a
-        ``hermes peer dm`` lands in) resets its target in the store, which refuses while an admission
-        on it is started (``session_busy``): this turn's own. The drain runs the reset right after it
-        settles this admission, before it claims any successor (the Bot Chat's retry included)."""
-        from gateway.session_ingress import executing_admission
-        if getattr(source, "platform", None) != Platform.LOCAL or not executing_admission.get():
-            return False
-        from gateway.session_authorities import active_authority
-        authority = active_authority(self)
-        if authority is None:
-            return False
-        authority.deferred_resets[session_key] = lambda: self._hmwa_rotate_exhausted_session(
-            session_entry, session_key, source)
-        return True
+    async def _hmwa_retract_exhausted_turn(self, sid, session_key):
+        """Soft-delete a compression-exhausted turn's own user row, the durable tail the agent's turn-start
+        flush wrote (the same rewind ``/undo`` uses), now that the turn lease is released.
 
-    async def _hmwa_rotate_exhausted_session(self, session_entry, session_key, source):
-        """The compression-exhaustion auto-reset itself; returns the route's (fresh) entry."""
-        logger.info("Auto-resetting session %s after compression exhaustion.", session_entry.session_id)
-        from gateway.session_automation import move_route_wakes, reset_and_rehome_messages
-        # Messages queued behind the exhausted turn still run, on the fresh session (unlike /new).
-        new_entry, release_fresh = await reset_and_rehome_messages(self, session_key, session_entry.session_id)
+        The session is kept, so an open row would be merged into the next ask (#107070) and replayed on
+        every later request, and closing it with a boundary would grow an oversized session (#1630). Only a
+        ``user`` tail is retracted: a turn that ran tools first keeps its record, and a retry whose row is
+        already gone retracts nothing. The cached agent is evicted so the next turn rebuilds from the
+        active transcript."""
+        store = self.async_session_store
         try:
-            await move_route_wakes(self, session_key, session_entry.session_id)
+            if await store.transcript_tail_role(sid) != "user":
+                return
+            outcome = await store.rewind_session(sid, 1)
+        except Exception as e:  # health: allow BLE001 -- best-effort; must never crash turn teardown
+            logger.warning("compression exhaustion: retracting the unanswered ask for %s raised: %s", sid, e)
+            return
+        if outcome is None:
+            logger.warning("compression exhaustion: could not retract the unanswered ask for %s", sid)
+            return
+        with suppress(Exception):
             self._evict_cached_agent(session_key)
-            # The /queue overflow behind the deferred head slot is queued user input, like the
-            # re-homed native rows: it survives the boundary the funnel below otherwise clears.
-            queued = list(self._overflow_queue(session_key) or ())
-            # Conversation boundary: the funnel clears every conversation-scoped per-session dict.
-            self._clear_conversation_scope(session_key, reason="compression_exhausted_reset")
-            if queued:
-                self._session_state(session_key).conversation.queued_events.extend(queued)
-            if new_entry is not None:
-                # Re-point the Telegram topic binding at the fresh session, or the binding-heal walk
-                # switches the next message back onto the bloated child and re-triggers exhaustion
-                # forever. No-op on non-topic lanes.
-                # Compression rotated session_entry.session_id to the oversized compressed child earlier
-                # this turn (the agent-result sync above), and that _sync also rewrote the (chat_id,
-                # thread_id) -> bloated-child binding. reset_session swaps in a clean, parentless session,
-                # but without re-syncing the binding the next inbound message in this topic gets
-                # switch_session'd back onto the bloated child by the binding-heal walk, reloads the
-                # oversized transcript, and re-triggers compression exhaustion forever (#35809 — regression
-                # of the #9893/#10063 auto-reset).
-                session_entry = new_entry
-                await asyncio.to_thread(
-                    self._sync_telegram_topic_binding, source, session_entry, reason="compression-exhausted-reset",
-                )
-        finally:
-            # Only now may the fresh session's FIFO claim (it is fenced until here, against every
-            # scheduler): after eviction, scope clear and binding sync.
-            release_fresh()
-        return session_entry
 
     @staticmethod
     def _hmwa_user_transcript_entry(event, prepared, ts):
@@ -525,7 +488,11 @@ class GatewayTurnPersistenceMixin:
         _user_row = self._hmwa_user_transcript_entry(event, prepared, ts)
 
         if is_context_overflow_failure:
-            pass  # Skip all transcript writes — don't grow a broken session
+            # Skip all transcript writes — don't grow a broken session. An exhausted turn keeps the
+            # session, so the ask the agent flushed at turn start is retracted (a defer is not exhaustion).
+            if (agent_persisted and agent_result.get("compression_exhausted")
+                    and not agent_result.get("compression_deferred")):
+                await self._hmwa_retract_exhausted_turn(sid, session_key)
         elif agent_result.get("failure_reason") == "content_policy_blocked":
             # A safety refusal is deterministic for the unchanged conversation (the filter judges the
             # whole thread), so a persisted refused turn re-trips the filter on every later message and
