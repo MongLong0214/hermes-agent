@@ -10,7 +10,11 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 import run_agent
+from agent.chat_completion_accepted_failure import _CodexStreamTerminalFailure
 from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE
+
+
+_REAL_SLEEP = __import__("time").sleep
 
 
 @pytest.fixture(autouse=True)
@@ -2663,3 +2667,554 @@ def test_codex_text_only_max_output_incomplete_keeps_codex_continuation(monkeypa
     assert result["completed"] is True
     assert not any(m.get("_length_continuation_nudge") for m in result["messages"])
     assert any(m.get("finish_reason") == "incomplete" for m in result["messages"] if m["role"] == "assistant")
+
+
+# ── Accepted-stream failure: the turn loop's consumer ──────────────────────────────────────────
+# The producers (``run_codex_stream`` and the watchdog kill) return ``_CodexStreamTerminalFailure``
+# once a Responses event was accepted. These tests stub the physical call to hand that outcome
+# back, so they pin the loop's contract on its own.
+
+
+def _accepted_transport_error():
+    import httpx
+
+    return httpx.ReadError(
+        "connection dropped after accepted events",
+        request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses"),
+    )
+
+
+def _stub_accepted_outcome(monkeypatch, agent, partial, *, streaming=True, during=None, later=None):
+    """The first physical call streams ``partial`` and returns this call's accepted outcome;
+    later calls answer with ``later(api_kwargs)``. Returns the list of physical calls."""
+    calls = []
+
+    def _call(api_kwargs, **_kwargs):
+        calls.append(api_kwargs)
+        if len(calls) > 1 and later is not None:
+            return later(api_kwargs)
+        if partial:
+            agent._fire_stream_delta(partial)
+        if during is not None:
+            during()
+        return _CodexStreamTerminalFailure(_accepted_transport_error())
+
+    if not streaming:
+        agent._disable_streaming = True
+    monkeypatch.setattr(
+        agent, "_interruptible_streaming_api_call" if streaming else "_interruptible_api_call", _call,
+    )
+    return calls
+
+
+def _record_fallback_attempts(monkeypatch, agent):
+    attempts = []
+
+    def _try_activate_fallback(*args, **kwargs):
+        attempts.append((args, kwargs))
+        return False
+
+    monkeypatch.setattr(agent, "_try_activate_fallback", _try_activate_fallback)
+    return attempts
+
+
+def _use_llm_execution_middleware(monkeypatch, callback):
+    from hermes_cli.plugins import get_plugin_manager
+
+    manager = get_plugin_manager()
+    monkeypatch.setattr(manager, "_discovered", True, raising=False)
+    monkeypatch.setitem(manager._middleware, "llm_execution", [callback])
+
+
+def _roles_alternate(messages):
+    from itertools import pairwise
+
+    roles = [message["role"] for message in messages]
+    return all(left != right for left, right in pairwise(roles))
+
+
+@pytest.mark.parametrize("streaming", [True, False], ids=["streaming", "relay_execute"])
+def test_accepted_stream_outcome_ends_the_turn_on_one_request(monkeypatch, streaming):
+    """The outcome means the request is billed: one physical call, no generic retry, no
+    failover, no reconnect, and the delivered partial is the turn's transcript row."""
+    agent = _build_agent(monkeypatch)
+    partial = "The first delivered sentence."
+    calls = _stub_accepted_outcome(
+        monkeypatch, agent, partial, streaming=streaming,
+        later=lambda _kwargs: _codex_message_response("replayed"),
+    )
+    fallback_attempts = _record_fallback_attempts(monkeypatch, agent)
+
+    result = agent.run_conversation("Explain the result", stream_callback=lambda _text: None)
+
+    assert len(calls) == 1
+    assert fallback_attempts == []
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "partial_stream_recovery"
+    assert [message["role"] for message in result["messages"]] == ["user", "assistant"]
+    assert result["messages"][-1]["content"] == partial
+    assert "replayed" not in str(result["messages"])
+
+
+def test_relay_copy_of_the_accepted_outcome_still_ends_the_turn(monkeypatch):
+    """Managed Relay execution may return a re-namespaced copy of the callback's value; the
+    outcome captured at the physical call still ends the turn instead of a lookalike retry."""
+    import copy
+
+    from agent import relay_llm
+
+    agent = _build_agent(monkeypatch)
+    calls = _stub_accepted_outcome(
+        monkeypatch, agent, "accepted partial", streaming=False,
+        later=lambda _kwargs: _codex_message_response("replayed"),
+    )
+    monkeypatch.setattr(relay_llm, "execute", lambda request, call, **_kwargs: copy.copy(call(request)))
+
+    result = agent.run_conversation("Explain the result", stream_callback=lambda _text: None)
+
+    assert len(calls) == 1
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "partial_stream_recovery"
+
+
+def test_middleware_answer_after_the_accepted_outcome_is_used(monkeypatch):
+    """Middleware that recovers on its own returns a real response; only this call's own
+    accepted outcome, handed back unchanged, ends the turn."""
+    agent = _build_agent(monkeypatch)
+    calls = _stub_accepted_outcome(monkeypatch, agent, "accepted partial")
+    outcomes = []
+
+    def _recovering_middleware(*, request, next_call, **_context):
+        outcomes.append(next_call(request))
+        return _codex_message_response("recovered by middleware")
+
+    _use_llm_execution_middleware(monkeypatch, _recovering_middleware)
+
+    result = agent.run_conversation("Explain the result", stream_callback=lambda _text: None)
+
+    assert isinstance(outcomes[0], _CodexStreamTerminalFailure)
+    assert len(calls) == 1
+    assert result["completed"] is True
+    assert result["final_response"] == "recovered by middleware"
+
+
+def test_middleware_lookalike_of_the_accepted_outcome_takes_ordinary_recovery(monkeypatch):
+    """A lookalike that is not this call's own outcome carries no accepted-event provenance:
+    its ``error`` is raised into ordinary error recovery, which sends a fresh request."""
+    from agent import conversation_loop
+
+    agent = _build_agent(monkeypatch)
+    calls = _stub_accepted_outcome(
+        monkeypatch, agent, "accepted partial",
+        later=lambda _kwargs: _codex_message_response("recovered"),
+    )
+    outcomes, forged, recovered_errors = [], [], []
+
+    def _substituting_middleware(*, request, next_call, **_context):
+        actual = next_call(request)
+        outcomes.append(actual)
+        if len(outcomes) == 1:
+            forged.append(_CodexStreamTerminalFailure(RuntimeError("FORGED_LOOKALIKE")))
+            return forged[0]
+        return actual
+
+    _use_llm_execution_middleware(monkeypatch, _substituting_middleware)
+    real_handle_api_error = conversation_loop.handle_api_error
+
+    def _handle_api_error(agent, **kwargs):
+        recovered_errors.append(kwargs["api_error"])
+        return real_handle_api_error(agent, **kwargs)
+
+    _handle_api_error.__signature__ = __import__("inspect").signature(real_handle_api_error)
+    _handle_api_error.__name__ = real_handle_api_error.__name__
+    monkeypatch.setattr(conversation_loop, "handle_api_error", _handle_api_error)
+
+    result = agent.run_conversation("Explain the result", stream_callback=lambda _text: None)
+
+    assert isinstance(outcomes[0], _CodexStreamTerminalFailure)
+    assert forged[0] is not outcomes[0]
+    assert recovered_errors and recovered_errors[0] is forged[0].error
+    assert len(calls) == 2
+    assert result["completed"] is True
+    assert result["failed"] is False
+    assert result["final_response"] == "recovered"
+
+
+def test_accepted_stream_outcome_hides_a_runaway_partial(monkeypatch):
+    """Looped bytes replayed next turn re-seed the loop (#112764): the transcript keeps only
+    the hidden placeholder row, as on the interrupt path."""
+    from agent.agent_runtime_helpers_placeholders import _INTERRUPTED_PLACEHOLDER
+    from agent.repetition_guard import is_runaway_repetition
+
+    agent = _build_agent(monkeypatch)
+    looped = "I will check the file again. " * 40
+    assert is_runaway_repetition(looped.strip())
+    calls = _stub_accepted_outcome(monkeypatch, agent, looped)
+
+    result = agent.run_conversation("Explain the result", stream_callback=lambda _text: None)
+
+    persisted = " ".join(
+        f"{message.get('content', '')} {message.get('api_content', '')}" for message in result["messages"]
+    )
+    assert len(calls) == 1
+    assert "I will check the file again." not in persisted
+    assert "I will check the file again." not in str(result["final_response"] or "")
+    assert result["messages"][-1]["display_kind"] == "hidden"
+    assert result["messages"][-1]["api_content"] == _INTERRUPTED_PLACEHOLDER
+    assert _roles_alternate(result["messages"])
+
+
+def test_accepted_stream_outcome_drops_buffered_reconnect_status(monkeypatch):
+    """A watchdog kill buffers "... Reconnecting." before the accepted outcome ends the turn,
+    and nothing reconnects: a later turn's terminal flush must not replay that line."""
+    import httpx
+    import openai
+
+    agent = _build_agent(monkeypatch)
+
+    def _buffer_reconnect():
+        agent._buffer_diagnostic_status(
+            "⚠️ Codex stream sent no events for 2s after the first parsed event "
+            "(model: gpt-5-codex). Reconnecting."
+        )
+
+    def _rejected(_kwargs):
+        raise openai.BadRequestError("rejected", body=None, response=httpx.Response(
+            400, request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses"),
+        ))
+
+    calls = _stub_accepted_outcome(monkeypatch, agent, "partial", during=_buffer_reconnect, later=_rejected)
+    first = agent.run_conversation("Explain the result", stream_callback=lambda _text: None)
+    statuses = []
+    monkeypatch.setattr(agent, "_emit_status", lambda message: statuses.append(str(message)))
+
+    second = agent.run_conversation("Try again", stream_callback=lambda _text: None)
+
+    assert first["failed"] is True
+    assert first["turn_exit_reason"] == "partial_stream_recovery"
+    assert len(calls) == 2
+    assert second["failed"] is True
+    assert not [status for status in statuses if "Reconnecting." in status]
+
+
+# ── Accepted-stream failure: the producers ─────────────────────────────────────────────────────
+# A Responses attempt that accepted any event (lifecycle frames included) is billed: the stream
+# runner and the watchdog kill hand back ``_CodexStreamTerminalFailure`` instead of raising a
+# replayable error. Only the physical wire is faked below.
+
+
+def _install_codex_wire(monkeypatch, agent, *event_factories):
+    """Serve each ``responses.create`` from ``event_factories`` in order (the last repeats),
+    through the per-request client factory, so the real dispatch and retry paths run."""
+    wire_calls = []
+
+    def _create(**kwargs):
+        wire_calls.append(kwargs)
+        return _LazyCreateStream(event_factories[min(len(wire_calls), len(event_factories)) - 1])
+
+    client = SimpleNamespace(base_url=agent.base_url, responses=SimpleNamespace(create=_create))
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_kwargs: client)
+    agent.client = client
+    return wire_calls
+
+
+def _accepted_then_lost(*deltas):
+    """A lifecycle frame plus ``deltas`` reach the decoder, then the transport drops."""
+    import httpx
+
+    def _events():
+        yield SimpleNamespace(type="response.created")
+        for delta in deltas:
+            yield SimpleNamespace(type="response.output_text.delta", delta=delta)
+        raise httpx.ReadError(
+            "connection dropped after accepted events",
+            request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses"),
+        )
+
+    return _events
+
+
+def _completed_codex_stream(text, *, status="completed"):
+    def _events():
+        yield SimpleNamespace(type="response.output_text.delta", delta=text)
+        yield SimpleNamespace(type="response.output_item.done", item=SimpleNamespace(
+            type="message", status=status, content=[SimpleNamespace(type="output_text", text=text)],
+        ))
+        yield SimpleNamespace(type="response.completed", response=SimpleNamespace(status=status))
+
+    return _events
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["transport_error", "sdk_apiconnectionerror"])
+def test_run_codex_stream_returns_typed_failure_after_accepted_sse_then_transport_failure(monkeypatch, wrapped):
+    """Once a semantic SSE frame is accepted, a replay risks a second billed request: the
+    stream runner returns the typed outcome carrying the same transport error, on one call.
+    The SDK's ``APIConnectionError`` wrapper of a transport error is the same loss."""
+    import httpx
+    from openai import APIConnectionError
+
+    agent = _build_agent(monkeypatch)
+    request = httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses")
+    calls = {"count": 0}
+    read_error = httpx.ReadError("connection dropped after response.created", request=request)
+    if wrapped:
+        cause, read_error = read_error, APIConnectionError(request=request)
+        read_error.__cause__ = cause
+
+    def _events():
+        yield SimpleNamespace(type="response.created")
+        raise read_error
+
+    def _fake_create(**kwargs):
+        calls["count"] += 1
+        return _LazyCreateStream(_events)
+
+    agent.client = SimpleNamespace(responses=SimpleNamespace(create=_fake_create))
+
+    outcome = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert isinstance(outcome, _CodexStreamTerminalFailure)
+    assert outcome.error is read_error
+    assert calls["count"] == 1
+
+
+@pytest.mark.parametrize("streaming", [True, False], ids=["streaming", "streaming_disabled"])
+def test_run_conversation_codex_accepted_stream_failure_ends_turn_without_replay(monkeypatch, streaming):
+    """The real Responses runner loses transport after accepted events: one wire call, the
+    partial owns one transcript row, and the turn ends failed. ``streaming: false`` still
+    reaches the Codex decoder, so it must not fall into invalid-response retries either."""
+    agent = _build_agent(monkeypatch)
+    if not streaming:
+        agent._disable_streaming = True
+    partial = "The first delivered sentence."
+    wire_calls = _install_codex_wire(
+        monkeypatch, agent, _accepted_then_lost(partial), _completed_codex_stream("replayed"),
+    )
+
+    result = agent.run_conversation("Explain the result", stream_callback=lambda _text: None)
+
+    assert len(wire_calls) == 1
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "partial_stream_recovery"
+    assert [message["role"] for message in result["messages"]] == ["user", "assistant"]
+    assert result["messages"][-1]["content"] == partial
+
+
+def test_redirect_crossing_accepted_stream_failure_restarts_with_the_correction(monkeypatch):
+    """A correction queued before the transport loss restarts the turn instead of being dropped
+    by failure finalization; the partial is replayed once, as context for the correction."""
+    import httpx
+
+    agent = _build_agent(monkeypatch)
+    partial, correction = "partial", "focus on the corrected task"
+
+    def _redirect_then_lost():
+        yield SimpleNamespace(type="response.output_text.delta", delta=partial)
+        assert agent.redirect(correction) is True
+        # The transport loss wins the race against the redirect's cancellation poll.
+        agent._interrupt_requested = False
+        raise httpx.ConnectError(
+            "stream dropped after redirect",
+            request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses"),
+        )
+
+    wire_calls = _install_codex_wire(
+        monkeypatch, agent, _redirect_then_lost, _completed_codex_stream("redirected completion"),
+    )
+
+    result = agent.run_conversation("continue", stream_callback=lambda _text: None)
+
+    assert len(wire_calls) == 2
+    assert correction in str(wire_calls[1])
+    assert result["completed"] is True
+    assert result["final_response"] == "redirected completion"
+    assert [message.get("content") for message in result["messages"]].count(partial) == 1
+    assert _roles_alternate(result["messages"])
+    assert agent._has_pending_redirect() is False
+
+
+def test_accepted_stream_failure_after_codex_interim_keeps_role_alternation(monkeypatch):
+    """An in_progress interim leaves an assistant tail and a bare continuation; the failed
+    continuation's partial must not become a second assistant row after it."""
+    agent = _build_agent(monkeypatch)
+    wire_calls = _install_codex_wire(
+        monkeypatch, agent,
+        _completed_codex_stream("Part A", status="in_progress"), _accepted_then_lost("Part B"),
+    )
+
+    result = agent.run_conversation("Explain the result", stream_callback=lambda _text: None)
+
+    assert len(wire_calls) == 2
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "partial_stream_recovery"
+    assert _roles_alternate(result["messages"]), [m["role"] for m in result["messages"]]
+
+
+@pytest.mark.parametrize("dispatch", ["worker", "inline"])
+def test_accepted_stream_failure_is_not_reported_as_a_completed_request(monkeypatch, dispatch):
+    """The stream-end hook reports the failure, the request client is discarded instead of
+    pooled for reuse, and a call that never completed does not clear the stale breaker."""
+    agent = _build_agent(monkeypatch)
+    if dispatch == "inline":
+        monkeypatch.setattr(
+            "agent.chat_completion_helpers.should_use_direct_api_call", lambda _agent: True
+        )
+    _install_codex_wire(monkeypatch, agent, _accepted_then_lost("partial"))
+    stream_ends, closes = [], []
+    monkeypatch.setattr(agent, "_emit_stream_end", lambda **kwargs: stream_ends.append(kwargs))
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client", lambda _client, *, reason: closes.append(reason)
+    )
+    agent._consecutive_stale_streams = 2
+
+    agent.run_conversation("Explain the result", stream_callback=lambda _text: None)
+
+    assert stream_ends and all(not end["finished"] and end["error"] for end in stream_ends)
+    assert "request_error_cleanup" in closes
+    assert "request_complete" not in closes
+    assert agent._consecutive_stale_streams == 2
+
+
+@pytest.mark.parametrize("dispatch", ["worker", "inline"])
+def test_watchdog_kill_after_accepted_event_ends_turn_without_replay(monkeypatch, dispatch):
+    """Our own stale kill cutting a stream the decoder already accepted still cuts a billed
+    request: the turn ends failed on one wire call, and the breaker keeps the kill."""
+    import threading
+
+    import httpx
+
+    agent = _build_agent(monkeypatch)
+    if dispatch == "inline":
+        monkeypatch.setattr(
+            "agent.chat_completion_helpers.should_use_direct_api_call", lambda _agent: True
+        )
+    monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda _kwargs: 2.0)
+    killed, reasons = threading.Event(), []
+
+    def _record_close(_client, *, reason=None):
+        reasons.append(reason)
+        if reason == "stale_call_kill":
+            killed.set()
+
+    monkeypatch.setattr(agent, "_abort_request_openai_client", _record_close)
+    monkeypatch.setattr(agent, "_close_request_openai_client", _record_close)
+
+    def _accepted_then_stalled():
+        yield SimpleNamespace(type="response.created")
+        yield SimpleNamespace(type="response.output_text.delta", delta="partial")
+        killed.wait(10.0)
+        raise httpx.ReadError(
+            "closed by the stale watchdog",
+            request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses"),
+        )
+
+    wire_calls = _install_codex_wire(
+        monkeypatch, agent, _accepted_then_stalled, _completed_codex_stream("replayed"),
+    )
+
+    result = agent.run_conversation("Explain the result", stream_callback=lambda _text: None)
+
+    assert "stale_call_kill" in reasons
+    assert len(wire_calls) == 1
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "partial_stream_recovery"
+    assert agent._consecutive_stale_streams == 1
+
+
+def _accepted_then_killed(agent, after_kill, before_kill=()):
+    """Accept a lifecycle frame, a delta and ``before_kill``, hold until a watchdog kill retires
+    the request, then run ``after_kill`` (what the killed worker does next) and lose the transport."""
+    import time
+
+    import httpx
+
+    def _events():
+        yield SimpleNamespace(type="response.created")
+        yield SimpleNamespace(type="response.output_text.delta", delta="partial")
+        yield from before_kill
+        deadline = time.monotonic() + 10.0
+        while getattr(agent, "_active_codex_stream_request_token", None) is not None:
+            assert time.monotonic() < deadline, "no watchdog kill retired the request"
+            time.sleep(0.01)
+        yield from after_kill()
+        raise httpx.ReadError(
+            "closed by the watchdog",
+            request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses"),
+        )
+
+    return _events
+
+
+@pytest.mark.parametrize(
+    ("shape", "kill"),
+    [
+        ("stuck_past_join", "stale_call_kill"),
+        ("stuck_past_join", "codex_stream_idle_kill"),
+        ("reads_buffered_event", "stale_call_kill"),
+        ("completes_while_draining", "stale_call_kill"),
+    ],
+)
+def test_worker_kill_after_accepted_event_never_replays(monkeypatch, shape, kill):
+    """Whatever a killed worker does next (stays stuck past the kill's join, reads one more
+    buffered event and swallows its retirement, or returns a completed response once a slow
+    post-terminal drain ends) an accepted event already billed the request: one wire call, the
+    turn ends failed, and the late worker never reports a completed request or clears the breaker."""
+    import threading
+    import time as _time
+
+    import agent.agent_runtime_helpers as runtime_helpers
+    from agent import codex_runtime
+
+    agent = _build_agent(monkeypatch)
+    # The suite stubs time.sleep; the stalled worker and the watchdog poll need the real one.
+    monkeypatch.setattr(_time, "sleep", _REAL_SLEEP)
+    monkeypatch.setattr(
+        agent, "_compute_non_stream_stale_timeout", lambda _kwargs: 2.0 if kill == "stale_call_kill" else 60.0
+    )
+    if kill == "codex_stream_idle_kill":
+        monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "2")
+    # An idle kill never bumps the breaker: start it at 1 so a reset would show.
+    agent._consecutive_stale_streams = 0 if kill == "stale_call_kill" else 1
+    reasons, release, worker_closed = [], threading.Event(), threading.Event()
+
+    def _record_worker_close(_client, *, reason=None):
+        reasons.append(reason)
+        worker_closed.set()
+
+    monkeypatch.setattr(agent, "_abort_request_openai_client", lambda _c, *, reason=None: reasons.append(reason))
+    monkeypatch.setattr(agent, "_close_request_openai_client", _record_worker_close)
+
+    def _after_kill():
+        if shape == "reads_buffered_event":
+            yield SimpleNamespace(type="response.output_text.delta", delta=" late")
+        else:
+            release.wait(30.0)
+
+    before_kill = ()
+    if shape == "completes_while_draining":
+        # The terminal frame lands first; the post-terminal drain that follows outlives the kill
+        # and its join (a drain needs a shutdown-capable socket, faked here; never shut down).
+        monkeypatch.setattr(codex_runtime, "_stream_drain_timeout", lambda: 30.0)
+        monkeypatch.setattr(runtime_helpers, "_socket_from_response", lambda _response: object())
+        monkeypatch.setattr(runtime_helpers, "_shutdown_socket", lambda _sock: None)
+        before_kill = [
+            event for event in _completed_codex_stream("partial")()
+            if event.type != "response.output_text.delta"
+        ]
+    wire_calls = _install_codex_wire(
+        monkeypatch, agent, _accepted_then_killed(agent, _after_kill, before_kill),
+        _completed_codex_stream("replayed"),
+    )
+
+    result = agent.run_conversation("Explain the result", stream_callback=lambda _text: None)
+    release.set()
+
+    assert kill in reasons
+    assert len(wire_calls) == 1
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "partial_stream_recovery"
+    assert worker_closed.wait(10.0)
+    assert "request_complete" not in reasons
+    assert agent._consecutive_stale_streams == 1
