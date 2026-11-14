@@ -191,6 +191,13 @@ def _inbound_owes_nothing(event: Any) -> None:
         event._inbound_outcome = INBOUND_NO_REPLY
 
 
+def _owes_tracked_reply(adapter: Any, answer_ref: Optional[str]) -> bool:
+    """The reply is an owner message's (it has an answer reference) and goes out through an adapter
+    that tracks its components (platforms/base.py, owe_explicit_reply)."""
+    from gateway.platforms.base import BasePlatformAdapter
+    return bool(answer_ref) and isinstance(adapter, BasePlatformAdapter)
+
+
 def _inbound_answer_ref_of(row_metadata: Any) -> Optional[str]:
     """The ledger reference of the answer to the row's message, this run of it (delivery_ledger.
     inbound_answer_ref), or None when the row names no record."""
@@ -2038,9 +2045,21 @@ class GatewayTurnMixin:
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
         if agent_result.get("already_sent") and not agent_result.get("failed"):
+            # An owner message's streamed reply: its components (the streamed text, and each MEDIA: file
+            # still to upload) are stored before the uploads, which are recorded one by one, so its
+            # records go only once all of them read back delivered (gateway/run_inbound.py).
+            _owed = None
+            if response and _owes_tracked_reply(adapter, getattr(event, "_inbound_answer_ref", None)):
+                _owed = await adapter.owe_explicit_reply(
+                    source, session_key, event._inbound_answer_ref, str(response), str(response),
+                    attachments=not agent_result.get("media_already_delivered"))
             # The queued-follow-up lane uploads this response's attachments itself; re-scanning here
             # would upload every file a second time.
-            if response and adapter and not agent_result.get("media_already_delivered"):
+            if _owed is not None:
+                event._inbound_streamed_sent = await _owed.finish(
+                    text_delivered=True, metadata=self._thread_metadata_for_source(
+                        source, self._reply_anchor_for_event(event)))
+            elif response and adapter and not agent_result.get("media_already_delivered"):
                 await self._deliver_media_from_response(response, event, adapter)
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
             if _footer_line and adapter:
@@ -2052,32 +2071,13 @@ class GatewayTurnMixin:
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):
                 event._streamed_final_response = str(response or "")
-            await self._record_streamed_inbound_answer(event, source, session_key, response)
+            if _owed is not None:
+                # The adapter's final settles the records from the stored components (platforms/base.py,
+                # _final_reply_proof): the text the consumer confirmed, and each upload's outcome.
+                event._inbound_outcome = "streamed"
             return None
 
         return response
-
-    async def _record_streamed_inbound_answer(self, event, source, session_key, response) -> None:
-        """The stream consumer confirmed the final reply of an owner message's turn reached the chat:
-        that delivery goes into the ledger under the reply's obligation (delivery_ledger.record_delivered),
-        so the settlement boundary reads it back delivered like a ledgered send (gateway/run_inbound.py,
-        _settle_inbound). A failed write leaves no proof, and the records stay for the next start."""
-        answer_ref = getattr(event, "_inbound_answer_ref", None)
-        if not answer_ref:
-            return
-        from gateway.delivery_ledger import InboundObligation, ledger_enabled, record_delivered
-        proof = InboundObligation.to(session_key, answer_ref, source)
-        try:
-            if await asyncio.to_thread(ledger_enabled):
-                await asyncio.to_thread(
-                    record_delivered, obligation_id=proof.obligation_id, session_key=session_key,
-                    platform=proof.platform, chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
-                    content=str(response or ""))
-        except Exception:
-            logger.warning("Recording a streamed reply as delivered failed; its inbound record stays",
-                           exc_info=True)
-            return
-        event._inbound_outcome = "streamed"
 
     # Chat-side next steps keyed by HTTP status; Hermes commands only (/login is the gateway's own
     # sign-in, `{relogin}` the profile-aware host equivalent, filled from the turn's agent provider).
@@ -4054,8 +4054,9 @@ class GatewayTurnMixin:
         self, turn_ctx: TurnContext, adapter: Any, response: Any, result: Any, stream_task: Any,
     ) -> bool:
         """Deliver the first response before a queued follow-up runs, unless streaming already did.
-        Returns whether its text reached the chat. A message with an inbound record is owed under its
-        record and run; its records are settled by that obligation (gateway/run_inbound.py,
+        Returns whether it reached the chat: its text, and for a message with an inbound record every
+        component (the ledger-off proof). That message is owed under its record and run; its records
+        are settled once the obligation's stored components read back delivered (gateway/run_inbound.py,
         _settle_inbound)."""
         if turn_ctx.mute_notification_reply:
             return False
@@ -4094,6 +4095,7 @@ class GatewayTurnMixin:
         # other turn-context fields added after it (``acp_admission``): a narrower context may lack it.
         _row_ref = _inbound_answer_ref_of(getattr(turn_ctx, "persist_user_display_metadata", None))
         _text_delivered = False
+        _owed, _owed_delivered = None, False
         if first_response:
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
@@ -4101,12 +4103,22 @@ class GatewayTurnMixin:
                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                 session_key or "?",
             )
+            # An owner message's first response: its components (the text this lane sends, and each
+            # MEDIA: file a completed turn uploads) are stored before anything is sent; the text goes out
+            # below, the uploads after it, each recorded (platforms/base.py, owe_explicit_reply).
+            if _owes_tracked_reply(adapter, _row_ref):
+                from gateway.run import _strip_response_attachments_for_direct_send
+                _owed = await adapter.owe_explicit_reply(
+                    turn_ctx.source, session_key, _row_ref,
+                    first_response if _already_streamed
+                    else _strip_response_attachments_for_direct_send(first_response, adapter),
+                    first_response, attachments=_deliver_media)
             try:
                 _text_delivered = await self._deliver_queued_first_response(
                     first_response, source=turn_ctx.source, adapter=adapter,
                     metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
                     text_already_delivered=_already_streamed,
-                    deliver_media=_deliver_media, stream_consumer=_sc,
+                    deliver_media=_deliver_media and _owed is None, stream_consumer=_sc,
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key,
@@ -4122,6 +4134,10 @@ class GatewayTurnMixin:
                 # (follow-up text refused, stale goal continuation) otherwise re-sends the text the
                 # fallback just delivered — the #81052 duplicate. A REFUSED send reports False, and
                 # the completion send stays the fallback so the user is not left with nothing.
+                if _owed is not None:
+                    # A refused text sends nothing more: the uploads stay owed with it.
+                    _owed_delivered = await _owed.finish(text_delivered=_text_delivered,
+                                                         metadata=turn_ctx._status_thread_metadata)
                 if _text_delivered and isinstance(result, dict):
                     result["already_sent"] = True
                     # The queued lane already uploaded this response's MEDIA: attachments; without
@@ -4134,7 +4150,8 @@ class GatewayTurnMixin:
                 _bg_result = _bg_cb()
                 if inspect.isawaitable(_bg_result):
                     await _bg_result
-        return bool(first_response) and bool(_text_delivered)
+        # Every component of an owner message's first response, or the text of any other.
+        return bool(first_response) and bool(_text_delivered) and (_owed is None or _owed_delivered)
 
     async def _run_agent_queued_followup(
         self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,

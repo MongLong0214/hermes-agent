@@ -1586,13 +1586,95 @@ def _append_text(existing: Optional[str], new: Optional[str]) -> str:
 
 @dataclass
 class _ExtractedResponse:
-    """Deliverable parts of a handler response (see ``_extract_response_content``)."""
+    """Deliverable parts of a handler response (see ``_extract_response_content``). ``ids``: the
+    component id of each image, MEDIA file and local file (parallel lists), when they are not the
+    default by position (a later start sending only what a reply still owes)."""
     text_content: str
     images: list
     media_files: list
     local_files: list
     force_document_attachments: bool
     pre_extract: str
+    ids: Optional[Dict[str, list]] = None
+
+    def component_ids(self) -> Dict[str, list]:
+        if self.ids is not None:
+            return self.ids
+        return {"images": [f"image:{i}" for i in range(len(self.images))],
+                "media": [f"media:{i}" for i in range(len(self.media_files))],
+                "files": [f"file:{i}" for i in range(len(self.local_files))]}
+
+    def components(self) -> List[Dict[str, Any]]:
+        """What delivering this reply requires, each with its component id and what its send needs
+        (gateway/delivery_ledger.py, record_components): the text, then every attachment."""
+        ids = self.component_ids()
+        parts: List[Dict[str, Any]] = [{"id": "text", "kind": "text", "text": self.text_content}] \
+            if self.text_content else []
+        parts += [{"id": cid, "kind": "image", "url": url, "alt": alt}
+                  for (url, alt), cid in zip(self.images, ids["images"])]
+        parts += [{"id": cid, "kind": "media", "path": path, "voice": bool(voice),
+                   "as_document": self.force_document_attachments}
+                  for (path, voice), cid in zip(self.media_files, ids["media"])]
+        parts += [{"id": cid, "kind": "file", "path": path, "as_document": self.force_document_attachments}
+                  for path, cid in zip(self.local_files, ids["files"])]
+        return parts
+
+    @classmethod
+    def of_attachments(cls, parts: List[Dict[str, Any]]) -> "_ExtractedResponse":
+        """The attachments among stored components *parts*, under their own ids."""
+        images = [p for p in parts if p.get("kind") == "image"]
+        media = [p for p in parts if p.get("kind") == "media"]
+        files = [p for p in parts if p.get("kind") == "file"]
+        return cls(text_content="", images=[(p["url"], p.get("alt") or "") for p in images],
+                   media_files=[(p["path"], bool(p.get("voice"))) for p in media],
+                   local_files=[p["path"] for p in files],
+                   force_document_attachments=any(p.get("as_document") for p in media + files), pre_extract="",
+                   ids={"images": [p["id"] for p in images], "media": [p["id"] for p in media],
+                        "files": [p["id"] for p in files]})
+
+
+def _same_component(held: Dict[str, Any], part: Dict[str, Any]) -> bool:
+    """*held* (a stored component) is *part* of this reply: same id, kind and source."""
+    return (held.get("id") == part.get("id") and held.get("kind") == part.get("kind")
+            and all(held.get(key) == part.get(key) for key in ("url", "path")))
+
+
+def _component_outcome(component_done: Optional[Callable], ids: Any, result: Any) -> None:
+    """Report one send's result for the components it carried (``ids``; None entries are untracked)."""
+    tracked = [cid for cid in (ids or ()) if cid]
+    if component_done is not None and tracked:
+        component_done(tracked, bool(getattr(result, "success", False)))
+
+
+class _OwedReply:
+    """A reply whose components are stored (``BasePlatformAdapter.owe_explicit_reply``) and whose text
+    reaches the chat by other means: a stream, an edit, or the queued lane's ledgered send."""
+
+    def __init__(self, adapter: "BasePlatformAdapter", source: Any, session_key: str,
+                 obligation_id: Optional[str], held: list, extracted: "_ExtractedResponse") -> None:
+        self.adapter, self.source, self.session_key = adapter, source, session_key
+        self.obligation_id, self.held, self.extracted = obligation_id, held, extracted
+
+    async def finish(self, *, text_delivered: bool, metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """The text reached the chat (``text_delivered``): it is recorded delivered (a ledgered send's
+        row is left as it is), then the attachments still owed are sent. A text that did not reach the
+        chat sends nothing more: the reply stays owed. True when every component was delivered."""
+        if not text_delivered:
+            return False
+        if self.obligation_id and self.extracted.text_content:
+            from gateway.delivery_ledger import record_delivered
+            source = self.source
+            try:
+                await asyncio.to_thread(
+                    record_delivered, obligation_id=self.obligation_id, session_key=self.session_key,
+                    platform=str(getattr(source.platform, "value", source.platform)), chat_id=source.chat_id,
+                    thread_id=getattr(source, "thread_id", None), content=self.extracted.text_content,
+                    adapter_profile=getattr(self.adapter, "_owner_profile", None))
+            except Exception:
+                logger.warning("Recording a reply's delivered text failed; the reply stays owed", exc_info=True)
+        return await self.adapter._deliver_owed_attachments(
+            MessageEvent(text="", source=self.source), self.extracted, dict(metadata or {}),
+            obligation_id=self.obligation_id, held=self.held)
 
 
 _PLAINTEXT_GATEWAY_RESTART_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -4257,6 +4339,121 @@ class BasePlatformAdapter(ABC):
         record_delivery(tts_result)
         return bool(caption and getattr(tts_result, "success", False))
 
+    def _final_unledgered(self, event: MessageEvent, is_ephemeral_response: bool) -> bool:
+        """The final text is sent without a ledger row: an ephemeral reply, or the reply to a command
+        (a managed /acp answer is always ledgered: its ledger row is the receipt's evidence)."""
+        if is_ephemeral_response:
+            return True
+        return (getattr(event, "_acp_admission", None) is None and not getattr(event, "_acp_handed_off", False)
+                and str(event.text or "").lstrip().startswith(("/", self.typed_command_prefix or "!")))
+
+    async def _record_reply_components(self, source: Any, session_key: str, answer_ref: Optional[str],
+                                       extracted: "_ExtractedResponse", *,
+                                       cut_short: bool = False) -> "tuple[Optional[str], list]":
+        """Store what the reply owed under *answer_ref* (an owner message's record and run, gateway/
+        run_inbound.py) requires, before any of it is sent (delivery_ledger.record_components): its text
+        and every attachment, under component ids stable within the reply. ``cut_short``: the run did
+        not end its message (a restart cut it short; its record stays), so this reply is marked as one
+        that does not settle the message by itself. Returns the obligation id and the components it
+        holds, with their states (an earlier store of this reply, partly delivered, wins); ``(None,
+        [])`` with the ledger off, without a reference, or when the store failed: nothing can then prove
+        the reply delivered, and its record stays."""
+        if not answer_ref:
+            return None, []
+        from gateway.delivery_ledger import CUT_SHORT, InboundObligation, ledger_enabled, record_components
+        try:
+            if not await asyncio.to_thread(ledger_enabled):
+                return None, []
+            obligation_id = InboundObligation.to(session_key, answer_ref, source).obligation_id
+            components = [{**part, CUT_SHORT: True} if cut_short else part for part in extracted.components()]
+            return obligation_id, await asyncio.to_thread(record_components, obligation_id, components)
+        except Exception:
+            logger.warning("[%s] Storing the components of an owner message's reply failed; its record stays",
+                           self.name, exc_info=True)
+            return None, []
+
+    async def _mark_components(self, obligation_id: str, outcomes: Dict[str, str]) -> List[str]:
+        """``delivery_ledger.mark_components`` off the loop; [] (logged) when it fails."""
+        from gateway.delivery_ledger import mark_components
+        try:
+            return await asyncio.to_thread(mark_components, obligation_id, outcomes)
+        except Exception:
+            logger.warning("[%s] Recording attachment outcomes failed; the reply stays owed", self.name,
+                           exc_info=True)
+            return []
+
+    async def _deliver_owed_attachments(
+        self, event: MessageEvent, extracted: "_ExtractedResponse", metadata: Dict[str, Any], *,
+        obligation_id: Optional[str], held: list, record_delivery: Optional[Callable] = None,
+        anything_sent: bool = True) -> bool:
+        """Send the attachments of *extracted* that the reply's stored components (*held*) do not
+        already show delivered, and record each one's outcome under *obligation_id* as soon as the
+        sends end, a cancellation included. An attachment the stored components do not name (another
+        reply already holds this obligation) is sent but proves nothing. True when every attachment of
+        *extracted* is delivered: the proof with the ledger off."""
+        parts = {p["id"]: p for p in extracted.components() if p["kind"] != "text"}
+        tracked = {c["id"]: c for c in held if c.get("id") in parts and _same_component(c, parts[c["id"]])}
+        skip = frozenset(cid for cid, c in tracked.items() if c.get("state") == "delivered")
+        outcomes: Dict[str, str] = {}
+
+        def component_done(ids: list, success: bool) -> None:
+            for cid in ids:
+                outcomes[cid] = "delivered" if success else "failed"
+        try:
+            await self._deliver_attachments(
+                event, extracted, metadata, anything_sent=anything_sent,
+                record_delivery=record_delivery or (lambda _result: None), component_done=component_done,
+                skip=skip)
+        finally:
+            recorded = {cid: state for cid, state in outcomes.items() if cid in tracked}
+            if obligation_id and recorded:
+                await asyncio.shield(self._mark_components(obligation_id, recorded))
+        return all(cid in skip or outcomes.get(cid) == "delivered" for cid in parts)
+
+    async def owe_explicit_reply(self, source: Any, session_key: str, answer_ref: Optional[str], text: str,
+                                 response: str, *, attachments: bool = True) -> "_OwedReply":
+        """The components of a reply whose attachments are its explicit ``MEDIA:`` tags only (a streamed
+        final, the queued first response: gateway/run_turn.py), stored before what is still to be sent
+        (``_record_reply_components``). *text* is the reply's text as it reaches the chat; without
+        ``attachments`` the reply requires its text only. ``_OwedReply.finish`` sends the rest."""
+        media: list = []
+        if attachments and response:
+            media, _rest = self.extract_media(response)
+            media = BasePlatformAdapter.filter_media_delivery_paths(media)
+        extracted = _ExtractedResponse(
+            text_content=(text or "").strip(), images=[], media_files=media, local_files=[],
+            force_document_attachments="[[as_document]]" in (response or ""), pre_extract=response or "")
+        obligation_id, held = await self._record_reply_components(source, session_key, answer_ref, extracted)
+        return _OwedReply(self, source, session_key, obligation_id, held, extracted)
+
+    async def redeliver_owed_attachments(self, source: Any, obligation_id: str, held: list, *,
+                                         metadata: Optional[Dict[str, Any]] = None) -> None:
+        """A later start's half of an owner message's reply (gateway/run_startup.py, _settle_stored_inbound):
+        send the attachments its stored components (*held*) still owe, never one already delivered. A
+        file whose source is gone is never sent and never counted: it is recorded ``missing``, logged,
+        and the chat is told once; the reply stays owed."""
+        from urllib.parse import unquote
+        owed = [c for c in held if c.get("kind") != "text" and c.get("state") != "delivered"]
+        sendable, missing = [], []
+        for part in owed:
+            url = str(part.get("url") or "")
+            local = part.get("path") or (unquote(url[7:]) if url.startswith("file://") else None)
+            (missing if local is not None and not os.path.isfile(str(local)) else sendable).append(part)
+        if missing:
+            changed = await self._mark_components(obligation_id, {p["id"]: "missing" for p in missing})
+            for part in missing:
+                logger.error("[%s] An owed attachment of a reply (obligation %s) is gone from %s; the reply "
+                             "is not delivered and its record stays", self.name, obligation_id,
+                             part.get("path") or part.get("url"))
+                if part["id"] in changed:
+                    await self._notify_media_delivery_failure(
+                        source.chat_id, str(part.get("path") or part.get("url")),
+                        is_voice=bool(part.get("voice")), metadata=metadata)
+        if sendable:
+            await self._deliver_owed_attachments(
+                MessageEvent(text="", source=source), _ExtractedResponse.of_attachments(sendable),
+                metadata or {}, obligation_id=obligation_id, held=held)
+
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
         delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool) -> Optional[str]:
@@ -4264,10 +4461,8 @@ class BasePlatformAdapter(ABC):
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None."""
         _acp = getattr(event, "_acp_admission", None)
-        # A managed /acp answer is always ledgered: its ledger row is the receipt's evidence.
         _handed_off = getattr(event, "_acp_handed_off", False)  # answers a chained follow-up instead
-        if is_ephemeral_response or (_acp is None and not _handed_off and str(event.text or "").lstrip().startswith(
-                ("/", self.typed_command_prefix or "!"))):
+        if self._final_unledgered(event, is_ephemeral_response):
             return None
         try:
             from gateway.delivery_ledger import (
@@ -4360,21 +4555,25 @@ class BasePlatformAdapter(ABC):
     async def _deliver_media_attachments(
         self, event: MessageEvent, media_files: list, local_files: list, *,
         force_document_attachments: bool, human_delay: float, metadata: Dict[str, Any],
-        record_delivery: Callable) -> None:
+        record_delivery: Callable, media_ids: Optional[list] = None, file_ids: Optional[list] = None,
+        component_done: Optional[Callable] = None) -> None:
         """Deliver MEDIA-tag files and detected local files by type: images batched via
         ``send_multiple_images`` unless ``[[as_document]]``; otherwise audio → send_voice (MEDIA
         tags only, never bare local files), video → send_video, else send_document. Every failure is
-        reported. Each send feeds ``record_delivery`` so media-only turns report SUCCESS."""
+        reported. Each send feeds ``record_delivery`` so media-only turns report SUCCESS, and
+        ``component_done`` with the component ids it carried (``media_ids`` / ``file_ids``)."""
         from urllib.parse import quote as _quote
 
         def _as_image(path: str) -> bool:
             return Path(path).suffix.lower() in _IMAGE_EXTS and not force_document_attachments
-        _image_paths = [p for p, is_voice in media_files if not is_voice and _as_image(p)]
-        _image_paths += [p for p in local_files if _as_image(p)]
-        if _image_paths:
+        media_ids = list(media_ids) if media_ids is not None else [None] * len(media_files)
+        file_ids = list(file_ids) if file_ids is not None else [None] * len(local_files)
+        _images = [(p, cid) for (p, is_voice), cid in zip(media_files, media_ids) if not is_voice and _as_image(p)]
+        _images += [(p, cid) for p, cid in zip(local_files, file_ids) if _as_image(p)]
+        if _images:
             await self._send_image_batch(
-                event, [(f"file://{_quote(p)}", "") for p in _image_paths], metadata, human_delay,
-                record_delivery)
+                event, [(f"file://{_quote(p)}", "") for p, _cid in _images], metadata, human_delay,
+                record_delivery, ids=[cid for _p, cid in _images], component_done=component_done)
         chat_id = event.source.chat_id
 
         async def _send_one(path: str, *, is_voice: bool, media_tag: bool) -> SendResult:
@@ -4394,36 +4593,45 @@ class BasePlatformAdapter(ABC):
                                "media" if media_tag else "local file", ext, result.error)
                 await self._notify_media_delivery_failure(chat_id, path, is_voice=is_voice, metadata=metadata)
             return result
-        queue = [(p, v, True) for p, v in media_files if v or not _as_image(p)]
+        queue = [(p, v, True, cid) for (p, v), cid in zip(media_files, media_ids) if v or not _as_image(p)]
         if queue:
             logger.info("[%s] Delivering %d non-image MEDIA attachment(s)", self.name, len(queue))
-        queue += [(p, False, False) for p in local_files if not _as_image(p)]
-        for path, is_voice, media_tag in queue:
+        queue += [(p, False, False, cid) for p, cid in zip(local_files, file_ids) if not _as_image(p)]
+        for path, is_voice, media_tag, cid in queue:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
             try:
-                record_delivery(await _send_one(path, is_voice=is_voice, media_tag=media_tag))
+                result = await _send_one(path, is_voice=is_voice, media_tag=media_tag)
             except Exception as err:
-                record_delivery(SendResult(success=False, error=str(err)))
+                result = SendResult(success=False, error=str(err))
                 if media_tag:
                     logger.warning("[%s] Error sending media: %s", self.name, err)
                 else:
                     logger.error("[%s] Error sending local file %s: %s", self.name, path, err)
+            record_delivery(result)
+            _component_outcome(component_done, [cid], result)
 
     async def _send_image_batch(
         self, event: MessageEvent, images: list, metadata: Dict[str, Any], human_delay: float,
-        record_delivery: Callable) -> None:
+        record_delivery: Callable, *, ids: Optional[list] = None, component_done: Optional[Callable] = None) -> None:
         """Batch-send images; a failure is logged (never raised) so other attachments still go.
         The batch result feeds ``record_delivery`` so media-only turns report their real
-        outcome instead of FAILURE."""
+        outcome instead of FAILURE, and ``component_done`` for every component in the batch. A batch
+        succeeds when any one image did, so images whose delivery is tracked (``ids``) go one per
+        batch: an image is proven delivered only by its own result."""
+        if component_done is not None and len(images) > 1 and any(ids or ()):
+            for image, cid in zip(images, ids):
+                await self._send_image_batch(event, [image], metadata, human_delay, record_delivery,
+                                             ids=[cid], component_done=component_done)
+            return
         try:
             result = await self.send_multiple_images(
                 chat_id=event.source.chat_id, images=images, metadata=metadata, human_delay=human_delay)
         except Exception as batch_err:
             logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
-            record_delivery(SendResult(success=False, error=str(batch_err)))
-            return
+            result = SendResult(success=False, error=str(batch_err))
         record_delivery(result)
+        _component_outcome(component_done, ids, result)
 
     async def send_final_ledgered(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any], *,
@@ -4501,14 +4709,14 @@ class BasePlatformAdapter(ABC):
 
     async def _final_reply_proof(self, event: MessageEvent, session_key: str, response: Any, *,
                                  text_content: str = "", caption_delivered: bool = False,
-                                 sent: bool = False, failed: bool = False) -> Any:
+                                 sent: bool = False) -> Any:
         """What settles the inbound records of the answer this turn's final reply gives
-        (``_inbound_ledger_ref``): for a reply, its obligation, which the boundary reads back from the
-        delivery ledger (``failed``: one of its components, text or attachment, was not delivered, so
-        it is not proven whatever the ledger says; ``sent``: every send succeeded, the proof with the
-        ledger off); for no reply, the explicit end the turn declared (``_inbound_outcome``: nothing
-        owed, or a stream that delivered it, gateway/run_turn.py). None, which proves nothing, when the
-        turn declared neither."""
+        (``_inbound_ledger_ref``): for a reply, its obligation, whose stored components the boundary
+        reads back from the delivery ledger, every one of which must be delivered (``sent``: every
+        component was sent successfully here, the proof with the ledger off); for no reply, the
+        explicit end the turn declared (``_inbound_outcome``: nothing owed, or a stream whose reply's
+        components are stored, gateway/run_turn.py). None, which proves nothing, when the turn declared
+        neither."""
         from gateway.delivery_ledger import InboundObligation
         from gateway.run_inbound import INBOUND_NO_REPLY
         answer_ref = getattr(event, "_inbound_ledger_ref", None)
@@ -4517,15 +4725,15 @@ class BasePlatformAdapter(ABC):
             if outcome == INBOUND_NO_REPLY:
                 return INBOUND_NO_REPLY
             if outcome == "streamed" and answer_ref:  # the consumer confirmed it (gateway/run_turn.py)
-                return InboundObligation.to(session_key, answer_ref, event.source, sent=True)
+                return InboundObligation.to(session_key, answer_ref, event.source,
+                                            sent=bool(getattr(event, "_inbound_streamed_sent", False)))
             return None
         if not answer_ref:
             return None
-        proof = InboundObligation.to(session_key, answer_ref, event.source, attachments_ok=not failed,
-                                     sent=sent and not failed)
-        if caption_delivered and text_content and not failed:
+        proof = InboundObligation.to(session_key, answer_ref, event.source, sent=sent)
+        if caption_delivered and text_content:
             # The text rode a voice reply's caption, not a ledgered send: the caption's success is the
-            # delivery the ledger records.
+            # delivery the ledger records for the text component.
             from gateway.delivery_ledger import ledger_enabled, record_delivered
             try:
                 if await asyncio.to_thread(ledger_enabled):
@@ -4581,20 +4789,32 @@ class BasePlatformAdapter(ABC):
 
     async def _deliver_attachments(self, event: MessageEvent, extracted: "_ExtractedResponse",
                                    metadata: Dict[str, Any], *, anything_sent: bool,
-                                   record_delivery: Callable) -> None:
+                                   record_delivery: Callable, component_done: Optional[Callable] = None,
+                                   skip: frozenset = frozenset()) -> None:
         """Send extracted image URLs, MEDIA files and bare local files (human-paced),
         then fail loudly if a non-empty response produced nothing deliverable. Attachment
-        results feed ``record_delivery`` so the turn outcome reflects them."""
+        results feed ``record_delivery`` so the turn outcome reflects them, and ``component_done``
+        (component ids, success) per send when the reply's components are tracked. A component in
+        ``skip`` was already delivered and is not sent again."""
         human_delay = self._get_human_delay()
-        images, media_files, local_files = extracted.images, extracted.media_files, extracted.local_files
+        ids = extracted.component_ids() if component_done is not None else None
+
+        def owed(items: list, kind: str) -> list:
+            cids = ids[kind] if ids is not None else [None] * len(items)
+            return [(item, cid) for item, cid in zip(items, cids) if cid is None or cid not in skip]
+        images, media, files = (owed(extracted.images, "images"), owed(extracted.media_files, "media"),
+                                owed(extracted.local_files, "files"))
         if images:
             logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
-            await self._send_image_batch(event, images, metadata, human_delay, record_delivery)
+            await self._send_image_batch(event, [i for i, _c in images], metadata, human_delay, record_delivery,
+                                         ids=[c for _i, c in images], component_done=component_done)
         await self._deliver_media_attachments(
-            event, media_files, local_files,
+            event, [m for m, _c in media], [f for f, _c in files],
             force_document_attachments=extracted.force_document_attachments,
-            human_delay=human_delay, metadata=metadata, record_delivery=record_delivery)
-        if not (anything_sent or images or local_files or media_files) and extracted.pre_extract.strip():
+            human_delay=human_delay, metadata=metadata, record_delivery=record_delivery,
+            media_ids=[c for _m, c in media], file_ids=[c for _f, c in files], component_done=component_done)
+        if not (anything_sent or extracted.images or extracted.local_files or extracted.media_files) \
+                and extracted.pre_extract.strip():
             logger.error("[%s] response_delivery_dropped: non-empty response "
                          "(%d chars) produced no delivered message or attachment "
                          "for %s (empty after extract, recovery yielded nothing).", self.name,
@@ -4611,6 +4831,25 @@ class BasePlatformAdapter(ABC):
         if self._accepts_kwarg(self._keep_typing, "stop_event", var_kw=False, unknown=True):
             kwargs["stop_event"] = interrupt_event
         return asyncio.create_task(self._keep_typing(event.source.chat_id, **kwargs))
+
+    @classmethod
+    def extract_reply_parts(cls, response: str, *, session_key: str = "") -> "_ExtractedResponse":
+        """``_extract_response_content``'s split of a stored reply, for a later start that owes it
+        (gateway/run_startup.py): MEDIA tags, image URLs, residual directives, bare local paths, an
+        emptied response recovered as text. No history dedupe: nothing of this reply was delivered.
+        The caller holds the routed profile's media scope."""
+        force_document = "[[as_document]]" in response
+        media_files, rest = cls.extract_media(response)
+        media_files = cls.filter_media_delivery_paths(media_files, session_key=session_key)
+        images, text_content = cls.extract_images(rest)
+        text_content = _strip_media_directives(text_content).strip()
+        local_files, text_content = cls.extract_local_files(text_content)
+        local_files = cls.filter_local_delivery_paths(local_files, session_key=session_key)
+        if not (text_content or images or local_files or media_files):
+            text_content = _strip_media_directives(response).strip()
+        return _ExtractedResponse(
+            text_content=text_content, images=images, media_files=media_files, local_files=local_files,
+            force_document_attachments=force_document, pre_extract=response)
 
     async def _extract_response_content(self, response: str, event: MessageEvent, session_key: str,
                                         *, is_ephemeral_response: bool) -> "_ExtractedResponse":
@@ -4718,6 +4957,9 @@ class BasePlatformAdapter(ABC):
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         handler_returned = reply_owed = False  # reply_owed: a returned reply not yet ledgered or delivered
         text_content, _tts_caption_delivered = "", False
+        # Every attachment of an owner message's reply was delivered: with ``sent``, the ledger-off proof.
+        # Set only by the attachment delivery of such a reply; nothing else reads it.
+        _attachments_ok = False
         try:
             # An owner message was stored on arrival and keeps its record while it waits in the queue,
             # so a follow-up taken from it here is already durable.
@@ -4747,6 +4989,15 @@ class BasePlatformAdapter(ABC):
                 extracted = await self._extract_response_content(
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
+                # An owner message's reply: what it requires (text and every attachment) is stored before
+                # anything is sent, and a component an earlier send of it already delivered is not sent
+                # again.
+                _answer_ref = getattr(event, "_inbound_ledger_ref", None)
+                _owed_id, _held = await self._record_reply_components(
+                    event.source, session_key,
+                    None if self._final_unledgered(event, is_ephemeral_response) else _answer_ref, extracted,
+                    cut_short=bool(getattr(event, "_inbound_cut_short", False)))
+                _text_done = any(c.get("id") == "text" and c.get("state") == "delivered" for c in _held)
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
                 _tts_paths, _tts_requested_path = [], None
@@ -4778,22 +5029,28 @@ class BasePlatformAdapter(ABC):
                 if text_content or extracted.images or extracted.media_files or extracted.local_files \
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
-                if text_content and not _tts_caption_delivered:
+                if text_content and not _tts_caption_delivered and not _text_done:
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery)
-                await self._deliver_attachments(
-                    event, extracted, _final_thread_metadata,
-                    anything_sent=delivery_attempted or _tts_caption_delivered,
-                    record_delivery=_record_delivery)
+                if _answer_ref:
+                    _attachments_ok = await self._deliver_owed_attachments(
+                        event, extracted, _final_thread_metadata, obligation_id=_owed_id, held=_held,
+                        record_delivery=_record_delivery,
+                        anything_sent=delivery_attempted or _tts_caption_delivered or _text_done)
+                else:
+                    await self._deliver_attachments(
+                        event, extracted, _final_thread_metadata,
+                        anything_sent=delivery_attempted or _tts_caption_delivered,
+                        record_delivery=_record_delivery)
             # An owner message's records and marker go only once its reply is proven delivered: every
-            # component of it, and its obligation read back delivered (_release_turn_marker, through
-            # the runner's boundary). Another turn's marker goes once a send succeeded or nothing was
-            # sent; a reply whose every send failed with no ledger row keeps it for the next start.
+            # component it requires reads back delivered (_release_turn_marker, through the runner's
+            # boundary). Another turn's marker goes once a send succeeded or nothing was sent; a reply
+            # whose every send failed with no ledger row keeps it for the next start.
             _final = await self._final_reply_proof(
                 event, session_key, response, text_content=text_content if response else "",
                 caption_delivered=bool(response) and _tts_caption_delivered,
-                sent=delivery_attempted and not delivery_failed, failed=delivery_failed)
+                sent=delivery_attempted and not delivery_failed and _attachments_ok)
             reply_owed = reply_owed and delivery_attempted and not delivery_succeeded
             await self._release_turn_marker(event, owed=reply_owed, final=_final, session_key=session_key)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
@@ -4856,6 +5113,7 @@ class BasePlatformAdapter(ABC):
             await self._release_turn_marker(event, owed=reply_owed)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             event._inbound_ledger_ref = event._inbound_outcome = None
+            event._inbound_streamed_sent = event._inbound_cut_short = False
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)

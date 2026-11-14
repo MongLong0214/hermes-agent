@@ -1507,8 +1507,14 @@ class GatewayInboundMixin:
                 _incoming._inbound_ledger_ref = getattr(event, "_inbound_answer_ref", None)
                 if event is not _incoming:
                     _incoming._inbound_outcome = getattr(event, "_inbound_outcome", None)
+                    _incoming._inbound_streamed_sent = getattr(event, "_inbound_streamed_sent", False)
                 _kept = self._settle_inbound_record(_settled_event, _quick_key, completed=_turn_ended,
                                                     also=event, delivery=_incoming)
+                # A run whose records stay for the next process (a restart cut it short) did not end its
+                # message: what the adapter still sends for it (an interruption notice) is stored as that
+                # run's reply, marked so, and the next start lets the transcript decide whether the run
+                # answered (gateway/run_startup.py, _owe_stored_answer).
+                _incoming._inbound_cut_short = bool(_kept)
                 # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean
                 # startup's recovery pass. A turn the adapter delivers hands its marker to that
                 # lifecycle, which clears it only once the reply is proven delivered (else a kill in
@@ -1604,29 +1610,31 @@ class GatewayInboundMixin:
 
     # ── The settlement boundary ──────────────────────────────────────────────────────────────────────
     # The only code that deletes an owner message's inbound record (and, for its turn, the active-turn
-    # marker) is _settle_inbound_records / _settle_inbound below, and only on positive proof: the
-    # obligation of that exact input, run and destination reads back ``delivered`` in the delivery
-    # ledger, or the caller states an explicit end that owes nothing (``INBOUND_NO_REPLY``,
-    # ``INBOUND_DROPPED``). Anything else keeps both: a reply not yet delivered, a partial delivery, a
-    # failed lookup, an exception. The next start reads them back and settles them the same way
-    # (gateway/run_startup.py, _settle_stored_inbound).
+    # marker) is _settle_inbound_records / _settle_inbound below, and only on positive proof: every
+    # component the reply of that exact input, run and destination requires (its text and each
+    # attachment, stored before the first send: delivery_ledger.record_components) reads back
+    # ``delivered`` in the delivery ledger, or the caller states an explicit end that owes nothing
+    # (``INBOUND_NO_REPLY``, ``INBOUND_DROPPED``). Anything else keeps both: a reply not yet delivered,
+    # a partial delivery, no stored components, a failed lookup, an exception. The adapter's final, the
+    # in-band first response, the streamed final and the next start (gateway/run_startup.py,
+    # _settle_stored_inbound) all settle through this one check.
 
     def _inbound_release_proven(self, proof: Any) -> Optional[bool]:
         """True when *proof* allows releasing the records it settles; False when it does not; None when
         the ledger could not be read (never taken as either). *proof* is an explicit end
-        (``INBOUND_NO_REPLY``, ``INBOUND_DROPPED``) or a ``delivery_ledger.InboundObligation``: its row
-        must read back ``delivered`` and every required attachment of this reply must have been
-        delivered (``attachments_ok``). With the delivery ledger off nothing can be read back, so this
-        process's own sends of every component of the reply (``sent``) are the proof."""
-        from gateway.delivery_ledger import InboundObligation, ledger_enabled, obligation_state
+        (``INBOUND_NO_REPLY``, ``INBOUND_DROPPED``) or a ``delivery_ledger.InboundObligation``: every
+        component of its reply must read back delivered (``obligation_complete``). With the delivery
+        ledger off nothing can be read back, so this process's own sends of every component of the
+        reply (``sent``) are the proof."""
+        from gateway.delivery_ledger import InboundObligation, ledger_enabled, obligation_complete
         if isinstance(proof, str) and proof in (INBOUND_NO_REPLY, INBOUND_DROPPED):
             return True
-        if not isinstance(proof, InboundObligation) or not proof.attachments_ok:
+        if not isinstance(proof, InboundObligation):
             return False
         try:
             if not ledger_enabled():
                 return bool(proof.sent)
-            return obligation_state(proof.obligation_id) == "delivered"
+            return obligation_complete(proof.obligation_id)
         except Exception:
             logger.warning("Reading the delivery obligation of an inbound record failed; the record stays",
                            exc_info=True)

@@ -224,6 +224,20 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         # the same UPDATE that marks the row delivered: an /acp receipt's delivery evidence.
         add_column_if_missing(conn, "delivery_obligations", "delivered_message_ids",
                               "delivered_message_ids TEXT")
+    # The components an owner message's reply requires (record_components): its text, whose delivery is
+    # the delivery_obligations row of the same id (mirrored here), and each attachment, which no row
+    # carries. A reply is delivered only when every one of them is (obligation_complete).
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS delivery_components (
+            obligation_id TEXT NOT NULL,
+            component_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            state TEXT NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (obligation_id, component_id)
+        )"""
+    )
 
 
 def _transaction():
@@ -307,17 +321,16 @@ def inbound_obligation_id(session_key: str, answer_ref: str, *, platform: str, c
 
 @dataclasses.dataclass(frozen=True)
 class InboundObligation:
-    """The reply one run of one owner message owes one destination (``inbound_obligation_id``), with what
-    this process saw of its delivery: the proof the settlement boundary reads back before it deletes the
-    message's inbound record (gateway/run_inbound.py, _settle_inbound_records). ``attachments_ok``: every
-    attachment the reply requires was delivered (False when one was not). ``sent``: every send of the reply
-    succeeded here, the only proof there is with the ledger off."""
+    """The reply one run of one owner message owes one destination (``inbound_obligation_id``): the proof
+    the settlement boundary reads back before it deletes the message's inbound record (gateway/
+    run_inbound.py, _settle_inbound_records), through ``obligation_complete``: every component the reply
+    requires (record_components) reads back delivered. ``sent``: every component of the reply was sent
+    successfully here, the only proof there is with the ledger off."""
     session_key: str
     answer_ref: str
     platform: str
     chat_id: Any
     thread_id: Any = None
-    attachments_ok: bool = True
     sent: bool = False
 
     @classmethod
@@ -339,6 +352,106 @@ def obligation_state(obligation_id: str) -> Optional[str]:
         row = conn.execute("SELECT state FROM delivery_obligations WHERE obligation_id=?",
                            (obligation_id,)).fetchone()
     return None if row is None else str(row[0])
+
+
+# A component's states: ``pending`` (not sent yet), ``failed`` (a send was refused), ``missing`` (its source
+# was gone when a later start went to send it), ``delivered``. Only ``delivered`` is ever final.
+COMPONENT_DELIVERED = "delivered"
+# Payload flag of every component of a reply sent by a run that did not end its message (a restart cut it
+# short and its record stays for the next process): such a reply, an interruption notice, never settles
+# the message by itself (obligation_progress).
+CUT_SHORT = "run_cut_short"
+
+
+def _components_unlocked(conn, obligation_id: str) -> List[Dict[str, Any]]:
+    import json as _json
+    rows = conn.execute(
+        """SELECT component_id, kind, payload, state FROM delivery_components
+           WHERE obligation_id=? ORDER BY rowid""", (obligation_id,)).fetchall()
+    return [{**_json.loads(payload), "id": cid, "kind": kind, "state": state} for cid, kind, payload, state in rows]
+
+
+def record_components(obligation_id: str, components: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Store what the reply under *obligation_id* requires, before any of it is sent: each component
+    (``id`` stable within the reply, ``kind`` text / image / media / file, and what its send needs: the
+    text, the image URL, the file path), state ``pending``. Insert-only: once a reply's components are
+    stored they are what the obligation requires, and a later call stores nothing. A text component
+    starts ``delivered`` when the text row of the same id already is. Returns the components the
+    obligation holds, with their states. Raises when the ledger cannot be written."""
+    import json as _json
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        held = _components_unlocked(conn, obligation_id)
+        if held or not components:
+            return held
+        text_delivered = conn.execute(
+            "SELECT 1 FROM delivery_obligations WHERE obligation_id=? AND state='delivered'",
+            (obligation_id,)).fetchone() is not None
+        for part in components:
+            payload = {k: v for k, v in part.items() if k not in ("id", "kind", "state")}
+            conn.execute(
+                """INSERT INTO delivery_components (obligation_id, component_id, kind, payload, state, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (obligation_id, str(part["id"]), str(part["kind"]), _json.dumps(payload, sort_keys=True),
+                 COMPONENT_DELIVERED if part["kind"] == "text" and text_delivered else "pending", now))
+        return _components_unlocked(conn, obligation_id)
+
+
+def obligation_components(obligation_id: str) -> List[Dict[str, Any]]:
+    """The components stored for *obligation_id* (``record_components``) with their states; ``[]`` when
+    none were. Raises when the ledger cannot be read."""
+    with _DB_LOCK, _transaction() as conn:
+        return _components_unlocked(conn, obligation_id)
+
+
+def mark_components(obligation_id: str, outcomes: Dict[str, str]) -> List[str]:
+    """Record attachment outcomes (component id -> ``delivered`` / ``failed`` / ``missing``). A delivered
+    component stays delivered, and the text component follows its row (``_update_state``), so neither is
+    written here. Returns the ids whose state changed."""
+    changed: List[str] = []
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        for component_id, state in outcomes.items():
+            cursor = conn.execute(
+                """UPDATE delivery_components SET state=?, updated_at=?
+                   WHERE obligation_id=? AND component_id=? AND kind != 'text' AND state NOT IN (?, ?)""",
+                (state, now, obligation_id, component_id, COMPONENT_DELIVERED, state))
+            if cursor.rowcount:
+                changed.append(component_id)
+    return changed
+
+
+def obligation_complete(obligation_id: str) -> bool:
+    """True only when the reply's components were stored and every one reads back delivered. No stored
+    components (an older row that carries only text, or nothing at all) is never complete. Raises when
+    the ledger cannot be read: a failed read is never an answer."""
+    components = obligation_components(obligation_id)
+    return bool(components) and all(c["state"] == COMPONENT_DELIVERED for c in components)
+
+
+def obligation_progress(obligation_id: str) -> Optional[str]:
+    """What the ledger holds for *obligation_id*: ``complete`` (every stored component delivered),
+    ``incomplete`` (components stored, one not delivered), ``cut_short`` (the components of a reply a
+    run sent after a restart cut it short: whether that run answered is not the ledger's to say),
+    ``untracked`` (a text row with no stored components, written before components were: never taken
+    as complete), or None (nothing at all). Raises when the ledger cannot be read."""
+    with _DB_LOCK, _transaction() as conn:
+        components = _components_unlocked(conn, obligation_id)
+        if any(c.get(CUT_SHORT) for c in components):
+            return "cut_short"
+        if components:
+            return "complete" if all(c["state"] == COMPONENT_DELIVERED for c in components) else "incomplete"
+        row = conn.execute("SELECT 1 FROM delivery_obligations WHERE obligation_id=?", (obligation_id,)).fetchone()
+    return None if row is None else "untracked"
+
+
+def _mirror_text_delivered(conn, obligation_id: str, now: float) -> None:
+    """The text component of *obligation_id* is delivered when its row is: same transaction."""
+    conn.execute(
+        """UPDATE delivery_components SET state=?, updated_at=?
+           WHERE obligation_id=? AND component_id='text' AND state != ?
+             AND EXISTS (SELECT 1 FROM delivery_obligations WHERE obligation_id=? AND state='delivered')""",
+        (COMPONENT_DELIVERED, now, obligation_id, COMPONENT_DELIVERED, obligation_id))
 
 
 class ObligationTaken(RuntimeError):
@@ -377,7 +490,8 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
 def record_delivered(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
     """Record a reply that reached the chat without a ledgered send (a stream whose final delivery
-    the consumer confirmed) as 'delivered' under *obligation_id*. An existing row is left as it is."""
+    the consumer confirmed) as 'delivered' under *obligation_id*. An existing row is left as it is;
+    the text component follows whatever the row then reads."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
@@ -387,6 +501,7 @@ def record_delivered(*, obligation_id: str, session_key: str, platform: str, cha
                VALUES (?, ?, ?, ?, ?, ?, 'delivered', 1, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
              content, now, now, str(adapter_profile).strip() if adapter_profile else "default"))
+        _mirror_text_delivered(conn, obligation_id, now)
         _prune_unlocked(conn, now)
 
 
@@ -466,6 +581,7 @@ def _update_state(obligation_id: str, state: str, error: str = "", *, attempt: O
     to failed is sent again). The pid alone is enough: the settler is the live claimant, and its claim
     re-stamped the row with its own pid and that count, so a start-time compare would add nothing."""
     pid = _owner_stamp()[0] if attempt is not None else None
+    now = time.time()
     with _DB_LOCK, _transaction() as conn:
         cursor = conn.execute(
             """UPDATE delivery_obligations
@@ -473,8 +589,10 @@ def _update_state(obligation_id: str, state: str, error: str = "", *, attempt: O
                    delivered_message_ids=COALESCE(?, delivered_message_ids)
                WHERE obligation_id=?
                  AND (? IS NULL OR (state='attempting' AND owner_pid IS ? AND attempts=?))""",
-            (state, time.time(), error[:500] if error else None, delivered_message_ids,
+            (state, now, error[:500] if error else None, delivered_message_ids,
              obligation_id, attempt, pid, attempt))
+        if cursor.rowcount and state == "delivered":
+            _mirror_text_delivered(conn, obligation_id, now)
     return bool(cursor.rowcount)
 
 
@@ -684,6 +802,12 @@ def _prune_unlocked(conn, now: float) -> None:
            WHERE state IN ('delivered', 'abandoned') AND updated_at < ?
              AND (acp_update_id IS NULL OR updated_at < ?)""",
         (now - _RETENTION_SECONDS, now - _ACP_RETENTION_SECONDS))
+    # A reply's components go together, once every one has been delivered for the retention period; one
+    # still owed keeps them all.
+    conn.execute(
+        """DELETE FROM delivery_components WHERE obligation_id IN (
+             SELECT obligation_id FROM delivery_components GROUP BY obligation_id
+             HAVING MIN(state = 'delivered') = 1 AND MAX(updated_at) < ?)""", (now - _RETENTION_SECONDS,))
     total = conn.execute("SELECT COUNT(*) FROM delivery_obligations WHERE acp_update_id IS NULL").fetchone()[0]
     if total > _MAX_ROWS:
         conn.execute(
