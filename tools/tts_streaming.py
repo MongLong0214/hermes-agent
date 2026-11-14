@@ -17,6 +17,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
+from agent.gemini_outbound_policy import deny_gemini_outbound
 from agent.think_scrubber import THINK_TAG_NAMES
 from tools.tool_backend_helpers import resolve_openai_audio_api_key
 from tools.tts_tool import _get_provider, _load_tts_config
@@ -154,10 +155,29 @@ def register(name: str) -> Callable[[type[StreamingTTSProvider]], type[Streaming
     return _wrap
 
 
+def _openai_stream_route(section: dict) -> dict:
+    """Non-secret model / endpoint of the OpenAI streamer (the same values ``stream`` sends to)."""
+    from hermes_cli.config import get_env_value
+    return {"model": section.get("model", "gpt-4o-mini-tts"),
+            "base_url": section.get("base_url") or get_env_value("OPENAI_BASE_URL") or ""}
+
+
+# Streamer name -> its route facts for the Google outbound policy (others have none).
+_STREAM_OUTBOUND_ROUTES: dict[str, Callable[[dict], dict]] = {
+    "gemini": lambda _section: {"canonical_provider": "gemini"},
+    "openai": _openai_stream_route,
+}
+
+
 def _try_instantiate(name: str, tts_config: dict) -> Optional[StreamingTTSProvider]:
     """Construct the registered streamer *name* if it's usable, else None."""
     cls = _REGISTRY.get(name)
-    if cls is None or not cls.available():
+    if cls is None:
+        return None
+    if (route := _STREAM_OUTBOUND_ROUTES.get(name)) is not None:
+        section = tts_config.get(name)
+        deny_gemini_outbound(**route(section if isinstance(section, dict) else {}))  # before available() reads a key
+    if not cls.available():
         return None
     try:
         return cls(tts_config, tts_config.get(name) or {})
@@ -168,7 +188,7 @@ def _try_instantiate(name: str, tts_config: dict) -> Optional[StreamingTTSProvid
 
 # Fallback priority for ``tts.streaming.provider: auto`` — best chunked latency/quality
 # first. Deliberately hard-coded (a UX decision); edge is absent (no chunked-PCM API).
-_PROVIDER_PRIORITY: list[str] = ["elevenlabs", "gemini", "openai", "xai"]
+_PROVIDER_PRIORITY: list[str] = ["elevenlabs", "openai", "xai"]
 
 
 class _PluginPCMStreamer(StreamingTTSProvider):
@@ -297,10 +317,11 @@ class OpenAIStreamer(StreamingTTSProvider):
 
     def stream(self, text: str) -> Iterator[bytes]:
         from openai import OpenAI
-        from hermes_cli.config import get_env_value
+        route = _openai_stream_route(self.section)
+        deny_gemini_outbound(**route)
         client = OpenAI(
             api_key=(self.section.get("api_key") or resolve_openai_audio_api_key()),
-            base_url=(self.section.get("base_url") or get_env_value("OPENAI_BASE_URL") or None))
+            base_url=route["base_url"] or None)
         from tools.tts_tool_openai import _openai_extra_body
         extra = {"extra_body": body} if (body := _openai_extra_body(self.section)) else {}
         with client.audio.speech.with_streaming_response.create(
@@ -326,9 +347,11 @@ class GeminiStreamer(StreamingTTSProvider):
 
     @staticmethod
     def available() -> bool:
+        deny_gemini_outbound(canonical_provider="gemini")
         return bool(_gemini_key())
 
     def stream(self, text: str) -> Iterator[bytes]:
+        deny_gemini_outbound(canonical_provider="gemini")
         import base64
         import json as _json
         import requests
