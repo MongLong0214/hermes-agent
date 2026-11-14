@@ -58,6 +58,16 @@ class _NotSent(str):
     """A refusal for a call that never reached the server: no circuit-breaker bookkeeping."""
 
 
+def _peer_scoped() -> bool:
+    """A peer turn's call, or one whose principal cannot be read: either way it needs a pin (fail closed)."""
+    from tools.approval_context import is_peer_turn
+    try:
+        return is_peer_turn()
+    except Exception:
+        logger.warning("MCP call: turn principal unreadable; handling the call as a peer turn's", exc_info=True)
+        return True
+
+
 def _tool_is_read_only(server_name: str, tool_name: str) -> bool:
     """True only when discovery captured ``readOnlyHint=True`` for the tool. Missing or malformed
     metadata fails safe to False (treated as write-capable). readOnlyHint is a property of the
@@ -737,12 +747,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
 
     def _handler(args: dict, **kwargs) -> Any:
         from tools.mcp_call_provenance import PROVENANCE_META_KEY, build_call_provenance, strip_caller_provenance
-        from tools.approval_context import is_peer_turn
         # Host-derived provenance, read here on the turn's thread, whatever context the MCP loop runs _call in.
         args = strip_caller_provenance(args)
         call_meta = {PROVENANCE_META_KEY: build_call_provenance()}
         claim = None
-        if is_peer_turn():
+        if _peer_scoped():
             # A canonical peer turn sends only the exact call its batch pinned to this handler, as the
             # pinned deep snapshot (agent.canonical_peer_tools); anything else never reaches the server.
             from agent.canonical_peer_tools import claim_pinned_call
@@ -819,8 +828,7 @@ def _make_utility_handler(op: str, log_label: str, rpc, render, required: Option
     def _factory(server_name: str, tool_timeout: float):
         def _handler(args: dict, **kwargs) -> str:
             from tools import mcp_tool_discovery as _discovery  # lazy: import cycle
-            from tools.approval_context import is_peer_turn
-            if is_peer_turn():  # never a peer tool: no pin can name it (mcp_tool_origin)
+            if _peer_scoped():  # never a peer tool: no pin can name it (mcp_tool_origin)
                 return tool_error(_PEER_REFUSAL.format(tool=log_label))
             server = _discovery._get_connected_server_for_call(server_name)
             if not server or not server.session:

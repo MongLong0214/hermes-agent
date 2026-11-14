@@ -1,6 +1,7 @@
 """MCP call provenance: every outbound ``tools/call`` carries a host-derived ``_meta`` block naming the
 turn's principal and its delegation depth, read from the turn's own context and never from the call's
-arguments. Calls go through the real handler and the real MCP loop thread."""
+arguments. Calls go through the real handler and the real MCP loop thread. A peer-scoped call is sent only
+under a pin (agent.canonical_peer_tools), so each call carries the pin its admitted batch would hold."""
 from __future__ import annotations
 
 import contextvars
@@ -37,9 +38,29 @@ def call_mcp():
     server._tools = []
     _servers["prov_srv"] = server
 
-    def _call(args=None):
+    def _call(args=None, pinned=True):
+        """Send one call through a fresh real handler; return what reached the server. With ``pinned`` the
+        call holds the pin of the call as admitted (a caller's later ``_meta`` is the handler's to strip);
+        without it, return the refusal and check that nothing was sent."""
+        from agent.canonical_peer_tools import PeerToolGrant, PinnedCall, _canonical, bind_grant, reset_grant
+        from tools.mcp_call_provenance import strip_caller_provenance
+        from tools.mcp_tool_schema import mcp_prefixed_tool_name
+
+        args = dict(args or {"q": 1})
+        handler, tool = _make_tool_handler("prov_srv", "probe", 30), mcp_prefixed_tool_name("prov_srv", "probe")
+        admitted = strip_caller_provenance(args)
+        pin = PinnedCall(tool, handler, admitted, _canonical(admitted), "sha256:test")
+        grant = PeerToolGrant(binding="prov", agent=None, verify=lambda: None, pins={(tool, pin.canonical): [pin]})
+        token = bind_grant(grant) if pinned else None
         before = len(session.calls)
-        _make_tool_handler("prov_srv", "probe", 30)(dict(args or {"q": 1}))
+        try:
+            result = handler(args)
+        finally:
+            if token is not None:
+                reset_grant(token)
+        if not pinned:
+            assert len(session.calls) == before, "an unpinned peer-scoped call reached the server"
+            return result
         assert len(session.calls) == before + 1, "the call never reached the server"
         return session.calls[-1]
 
@@ -96,14 +117,30 @@ def test_a_missing_or_corrupt_principal_fails_closed_to_peer(call_mcp, principal
     assert _provenance(_as(principal, call_mcp))["principal"] == "peer"
 
 
+def _broken():
+    raise RuntimeError("approval context unavailable")
+
+
 def test_an_unreadable_approval_context_fails_closed_to_peer(call_mcp, monkeypatch):
     from tools import approval_context
 
-    def _broken():
-        raise RuntimeError("approval context unavailable")
-
     monkeypatch.setattr(approval_context, "get_turn_principal", _broken)
     assert _provenance(contextvars.copy_context().run(call_mcp))["principal"] == "peer"
+
+
+@pytest.mark.parametrize("unreadable", ["eq-raises", "approval-context-raises"])
+def test_an_unreadable_principal_is_a_peer_so_its_unpinned_call_is_refused_not_raised(
+        call_mcp, monkeypatch, unreadable):
+    """A principal the handler cannot read is handled as a peer's (fail closed): without a pin the call is
+    refused, never raised to the caller and never sent."""
+    from tools import approval_context
+
+    if unreadable == "eq-raises":
+        result = _as(_EqRaises(), call_mcp, None, False)
+    else:
+        monkeypatch.setattr(approval_context, "get_turn_principal", _broken)
+        result = contextvars.copy_context().run(call_mcp, None, False)
+    assert "was NOT run: in a canonical peer turn" in result
 
 
 def test_a_delegate_child_runs_one_hop_deeper_and_stays_peer_scoped(call_mcp):
