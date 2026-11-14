@@ -81,6 +81,23 @@ def test_run_one_job_agent_declared_failure_uses_failure_bookkeeping(monkeypatch
     assert calls[-1] == ("mark", "declared-failure", False)
 
 
+def test_run_one_job_failure_notice_is_closed_while_the_run_keeps_the_raw_error(monkeypatch):
+    """The chat notice carries the closed cause; the raw text reaches only the private stores."""
+    raw = "RuntimeError: open('https://u:hunter2@leakcanary.example/v1') failed: sk-leakcanary0123"
+    delivered, finished = [], []
+    _patch_pipeline(monkeypatch, success=False, final="", error=raw)
+    monkeypatch.setattr(
+        "cron.delivery_queue.enqueue",
+        lambda execution_id, job, content, **kw: delivered.append(content) or {"status": "pending"})
+    monkeypatch.setattr(s, "finish_execution", lambda *a, **kw: finished.append(kw.get("error")))
+
+    s.run_one_job({"id": "closed", "name": "scout", "deliver": "telegram"})
+
+    assert len(delivered) == 1 and delivered[0].startswith("⚠️ Cron 'scout' failed: ")
+    assert "leakcanary" not in delivered[0] and "hunter2" not in delivered[0]
+    assert raw in finished, "the executions row keeps the raw error"
+
+
 def test_run_one_job_agent_declared_failure_is_delivered_verbatim(monkeypatch):
     """The agent's own evidence reaches the operator as written, not re-diagnosed by the
     provider-error heuristics (a child that "timed out" is not a model-service timeout)."""
@@ -249,7 +266,7 @@ def test_escaped_failure_delivery_carries_the_streak_nudge(monkeypatch):
 
     assert ok is False
     assert len(delivered) == 1
-    assert "cannot import name X" in delivered[0]
+    assert "failed:" in delivered[0] and "cannot import name X" not in delivered[0]
     assert "hermes cron pause scout" in delivered[0]
 
 
@@ -272,7 +289,8 @@ def test_escaped_failure_delivery_stays_quiet_below_the_threshold(monkeypatch):
 
     assert ok is False
     assert len(delivered) == 1
-    assert "provider failed" in delivered[0]
+    assert delivered[0].startswith("⚠️ Cron 'scout' failed: ")
+    assert "provider failed" not in delivered[0]
     assert "hermes cron pause scout" not in delivered[0]
 
 
