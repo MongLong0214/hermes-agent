@@ -260,16 +260,20 @@ def test_partial_result_reports_its_own_flush(real_agent, site, writes_ok):
 
 # --- The main path: finalize_turn after its own _persist_session() ------------------------------------
 
+def _chat(agent, *responses):
+    """The real loop on ``agent`` with a scripted chat-completions client."""
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = list(responses)
+    agent._cached_system_prompt, agent._use_prompt_caching, agent._skip_mcp_refresh = "You are helpful.", False, True
+    agent.compression_enabled = agent.save_trajectories = False
+    return agent
+
 @pytest.mark.parametrize(("appends_that_land", "persisted", "stored"), [
     (None, True, ["write an essay", "An essay."]), (1, False, ["write an essay"]), (0, False, [])])
 def test_finalize_turn_reports_this_turns_flush(real_agent, appends_that_land, persisted, stored):
     """A plain text turn: the turn-start flush writes the ask, finalize_turn's flush the answer. Either
     failing reports False; a turn whose writes all land reports True."""
-    agent = real_agent
-    agent.client = MagicMock()
-    agent.client.chat.completions.create.side_effect = [_mock_response(content="An essay.", finish_reason="stop")]
-    agent._cached_system_prompt, agent._use_prompt_caching, agent._skip_mcp_refresh = "You are helpful.", False, True
-    agent.compression_enabled = agent.save_trajectories = False
+    agent = _chat(real_agent, _mock_response(content="An essay.", finish_reason="stop"))
     if appends_that_land is not None:
         _break_writes(agent, after=appends_that_land)
     with patch.object(agent, "_cleanup_task_resources"):
@@ -278,3 +282,51 @@ def test_finalize_turn_reports_this_turns_flush(real_agent, appends_that_land, p
     assert result["final_response"] == "An essay." and result["completed"] is True
     assert [r["content"] for r in agent._session_db.get_messages(agent.session_id)] == stored  # reach
     assert result["agent_persisted"] is persisted
+
+
+# --- The remaining early exits -------------------------------------------------------------------------
+
+@pytest.mark.parametrize(("appends_that_land", "persisted"), [(None, True), (0, False)])
+def test_the_repetition_stop_reports_its_own_flush(real_agent, appends_that_land, persisted):
+    """A completed runaway-repetition reply ends the turn in finish_text_response, past finalize_turn."""
+    from agent.turn_final_response import _REPETITION_STOPPED
+
+    agent = _chat(real_agent, _mock_response(content="I will check the file again. " * 600, finish_reason="stop"))
+    if appends_that_land is not None:
+        _break_writes(agent, after=appends_that_land)
+    with patch.object(agent, "_cleanup_task_resources"):
+        result = agent.run_conversation("write an essay")
+
+    assert result["final_response"] == _REPETITION_STOPPED[1]  # reach
+    assert result["agent_persisted"] is persisted
+
+@pytest.mark.parametrize("writes_ok", [True, False])
+def test_provider_overflow_exhaustion_reports_its_own_flush(real_agent, writes_ok):
+    from agent.conversation_loop import _provider_overflow_exhausted_result
+
+    if not writes_ok:
+        _break_writes(real_agent)
+    result = _provider_overflow_exhausted_result(real_agent, [{"role": "user", "content": "write an essay"}], None,
+                                                 1, 300_000, 3)
+    assert result["compression_exhausted"] is True and result["agent_persisted"] is writes_ok
+
+@pytest.mark.parametrize("writes_ok", [True, False])
+def test_a_deferred_compression_reports_the_flush_before_it(real_agent, writes_ok):
+    """turn_preflight persists, then builds the deferred result from the list it persisted."""
+    from agent.conversation_loop import _compression_deferred_result
+
+    messages = [{"role": "user", "content": "write an essay"}]
+    if not writes_ok:
+        _break_writes(real_agent)
+    real_agent._persist_session(messages, None)
+    result = _compression_deferred_result(real_agent, messages, 1)
+    assert result["compression_deferred"] is True and result["agent_persisted"] is writes_ok
+
+def test_a_preflight_timeout_stored_no_row_of_this_turn(real_agent):
+    """The envelope carries the earlier history, all durable; this turn's own row was never written."""
+    from agent.conversation_loop import _preflight_timeout_result
+
+    history = [{"role": "user", "content": "earlier"}, {"role": "assistant", "content": "answered"}]
+    assert real_agent._flush_messages_to_session_db(history) is True
+    result = _preflight_timeout_result(real_agent, RuntimeError("preflight compression timed out"), history)
+    assert result["messages"] == history and result["agent_persisted"] is False
