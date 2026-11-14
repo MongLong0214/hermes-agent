@@ -231,37 +231,6 @@ class TestStreamingAccumulator:
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
-    def test_native_gemini_endpoint_omits_stream_options(self, mock_close, mock_create):
-        """Google's native Gemini REST endpoint rejects OpenAI-only stream_options."""
-        from run_agent import AIAgent
-
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = iter([
-            _make_stream_chunk(content="Paris", finish_reason="stop", model="gemini"),
-        ])
-        mock_create.return_value = mock_client
-
-        agent = AIAgent(
-            api_key="test-key",
-            base_url="https://generativelanguage.googleapis.com/v1beta",
-            model="gemini-3-flash-preview",
-            provider="gemini",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
-        agent.api_mode = "chat_completions"
-        agent._interrupt_requested = False
-
-        response = agent._interruptible_streaming_api_call({})
-
-        assert response.choices[0].message.content == "Paris"
-        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
-        assert call_kwargs["stream"] is True
-        assert "stream_options" not in call_kwargs
-
-    @patch("run_agent.AIAgent._create_request_openai_client")
-    @patch("run_agent.AIAgent._close_request_openai_client")
     def test_endpoint_rejecting_stream_options_is_retried_without_it(self, mock_close, mock_create, monkeypatch):
         """Strict OpenAI-compatible endpoints (Azure AI Foundry MaaS) 422 on
         ``stream_options.include_usage``; the call is retried once without the field and
@@ -2024,3 +1993,61 @@ class TestBedrockReasoningStaleFloor:
         expected = get_reasoning_stale_timeout_floor(table_key)
         assert expected is not None
         assert _bedrock_reasoning_stale_floor(model_id) == expected
+
+
+# ── a Google outbound denial is not swallowed by the client-rebuild excepts ─────────────────
+
+
+def _denying_lifecycle_shell(**fields):
+    from agent.client_lifecycle import ClientLifecycleMixin
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    class _Shell(ClientLifecycleMixin):
+        def _create_openai_client(self, *_a, **_k):
+            raise GeminiOutboundDenied()
+
+    shell = _Shell.__new__(_Shell)
+    shell.provider, shell.model, shell.api_mode = "custom", "ordinary-model", "chat_completions"
+    shell._client_kwargs = {"base_url": "https://us-central1-aiplatform.googleapis.com/v1", "api_key": "k"}
+    shell._client_log_context = lambda: "test"
+    for name, value in fields.items():
+        setattr(shell, name, value)
+    return shell
+
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda shell: shell._replace_primary_openai_client(reason="test"), id="replace-shared-client"),
+    pytest.param(lambda shell: shell._ensure_primary_openai_client(reason="test"), id="recreate-closed-client"),
+])
+def test_client_rebuild_re_raises_the_google_outbound_denial(call):
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    shell = _denying_lifecycle_shell(client=None)
+    with pytest.raises(GeminiOutboundDenied):
+        call(shell)
+    assert shell.client is None
+
+
+def test_vertex_credential_refresh_re_raises_the_google_outbound_denial(monkeypatch):
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    def _deny(*_a, **_k):
+        raise GeminiOutboundDenied()
+
+    monkeypatch.setattr("agent.vertex_adapter.get_vertex_config", _deny)
+    shell = _denying_lifecycle_shell(provider="vertex", client=None)
+    with pytest.raises(GeminiOutboundDenied):
+        shell._try_refresh_vertex_client_credentials()
+
+
+def test_an_ordinary_rebuild_failure_is_still_swallowed():
+    from agent.client_lifecycle import ClientLifecycleMixin
+
+    class _Shell(ClientLifecycleMixin):
+        def _create_openai_client(self, *_a, **_k):
+            raise RuntimeError("transport down")
+
+    shell = _Shell.__new__(_Shell)
+    shell.provider, shell.model, shell.client = "custom", "ordinary-model", None
+    shell._client_kwargs, shell._client_log_context = {"base_url": "https://ordinary.example.test/v1"}, lambda: "t"
+    assert shell._replace_primary_openai_client(reason="test") is False

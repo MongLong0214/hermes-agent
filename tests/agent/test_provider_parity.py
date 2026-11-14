@@ -254,21 +254,6 @@ class TestBuildApiKwargsOpenRouter:
             "google": {"thought_signature": "signed-call"}
         }
 
-    def test_gemini_native_passes_base_url_for_top_level_thinking_config(self, monkeypatch):
-        agent = _make_agent(
-            monkeypatch,
-            "gemini",
-            base_url="https://generativelanguage.googleapis.com/v1beta",
-            model="gemini-3-flash-preview",
-        )
-        agent.reasoning_config = {"enabled": True, "effort": "high"}
-        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
-        assert kwargs["extra_body"]["thinking_config"] == {
-            "includeThoughts": True,
-            "thinkingLevel": "high",
-        }
-        assert "extra_body" not in kwargs["extra_body"]
-
 
 
 
@@ -875,3 +860,79 @@ class TestCodexReasoningPreflight:
         reasoning_items = [i for i in items if isinstance(i, dict) and i.get("type") == "reasoning"]
         assert len(reasoning_items) == 1
         assert reasoning_items[0]["encrypted_content"] == "enc123"
+
+
+# ── Google outbound denial at client construction, model switch and agent init ───────────────
+
+_STUDIO = "https://generativelanguage.googleapis.com/v1beta"
+_VERTEX = "https://us-central1-aiplatform.googleapis.com/v1"
+
+
+class _Tripwire:
+    """Stands in for a client constructor or agent: any use is recorded."""
+
+    def __init__(self, name, touched):
+        self._name, self._touched = name, touched
+
+    def __call__(self, *_args, **_kwargs):
+        self._touched.append(self._name)
+        raise AssertionError(f"{self._name} was reached before the refusal")
+
+    def __getattr__(self, attr):
+        self._touched.append(f"{self._name}.{attr}")
+        raise AssertionError(f"{self._name}.{attr} was read before the refusal")
+
+
+def _route_agent(provider, base_url, model="ordinary-model"):
+    return SimpleNamespace(provider=provider, model=model, base_url=base_url, api_mode="chat_completions",
+                           requested_provider=provider, _client_log_context=lambda: "test",
+                           _build_keepalive_http_client=lambda *a, **k: None)
+
+
+class TestGoogleOutboundDenial:
+    def test_client_construction_on_a_google_host_is_refused_before_any_client(self, monkeypatch):
+        from agent import agent_runtime_helpers
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        touched = []
+        monkeypatch.setattr("agent.process_bootstrap.OpenAI", _Tripwire("OpenAI", touched))
+        monkeypatch.setattr(agent_runtime_helpers, "_gemini_native_client", _Tripwire("native", touched))
+
+        with pytest.raises(GeminiOutboundDenied):
+            agent_runtime_helpers.create_openai_client(
+                _route_agent("custom", _VERTEX), {"base_url": _VERTEX, "api_key": "k"}, reason="test", shared=False)
+        assert touched == []
+
+    def test_a_google_model_on_a_relay_endpoint_still_gets_its_client(self, monkeypatch):
+        from agent import agent_runtime_helpers
+        from hermes_constants import OPENROUTER_BASE_URL
+
+        monkeypatch.setattr("agent.process_bootstrap.OpenAI", _FakeOpenAI)
+        client = agent_runtime_helpers.create_openai_client(
+            _route_agent("openrouter", OPENROUTER_BASE_URL, model="google/gemini-2.5-flash"),
+            {"base_url": OPENROUTER_BASE_URL, "api_key": "k"}, reason="test", shared=False)
+
+        assert str(client.base_url).rstrip("/") == OPENROUTER_BASE_URL.rstrip("/")
+
+    def test_switch_model_to_a_google_route_is_refused_before_any_agent_state(self):
+        from agent import agent_runtime_helpers
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        touched = []
+        with pytest.raises(GeminiOutboundDenied):
+            agent_runtime_helpers.switch_model(
+                _Tripwire("agent", touched), "gemini-2.5-flash", "gemini", api_key="k", base_url=_STUDIO)
+        assert touched == []
+
+    def test_init_agent_refuses_a_google_route(self, monkeypatch):
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        touched = []
+        monkeypatch.setitem(globals(), "_FakeOpenAI", _Tripwire("OpenAI", touched))  # _make_agent's client
+        with pytest.raises(GeminiOutboundDenied):
+            _make_agent(monkeypatch, "custom", base_url=_VERTEX, model="ordinary-model")
+        assert touched == []
+
+    def test_init_agent_keeps_a_google_model_on_openrouter(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter", model="google/gemini-3-pro-preview")
+        assert agent.provider == "openrouter" and agent.model == "google/gemini-3-pro-preview"

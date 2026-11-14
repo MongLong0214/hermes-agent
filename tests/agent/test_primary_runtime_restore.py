@@ -12,6 +12,8 @@ Verifies that:
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 from run_agent import AIAgent
 
@@ -433,7 +435,7 @@ class TestRestorePrimaryRuntime:
             "providers": {
                 "gemini-no-filter": {
                     "name": "Gemini Display",
-                    "api": "https://generativelanguage.googleapis.com/v1beta",
+                    "api": "https://custom.example/v1",
                 }
             },
         }
@@ -441,7 +443,7 @@ class TestRestorePrimaryRuntime:
         with patch("agent.credential_pool._load_config_safe", return_value=config):
             agent = _make_agent(
                 provider="custom:gemini-no-filter",
-                base_url="https://generativelanguage.googleapis.com/v1beta",
+                base_url="https://custom.example/v1",
             )
         agent._fallback_activated = True
         agent._credential_pool = fallback_pool
@@ -755,3 +757,34 @@ class TestSwitchModelRequestOverridesSnapshot:
             result = agent._restore_primary_runtime()
         assert result is True
         assert agent.request_overrides == overrides
+
+
+class TestGoogleOutboundDenialOnRestore:
+    def test_restore_of_a_google_primary_is_refused_before_its_pool(self):
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        agent = _make_agent()
+        agent._fallback_activated = True
+        agent._primary_runtime = {
+            **(agent._primary_runtime or {}), "provider": "custom", "model": "ordinary-model",
+            "base_url": "https://generativelanguage.googleapis.com/v1beta", "requested_provider": "custom",
+        }
+        with (
+            patch("agent.custom_entry_pool.load_runtime_pool", side_effect=AssertionError("pool loaded")),
+            patch("agent.agent_runtime_helpers.credential_pool_matches_provider",
+                  side_effect=AssertionError("pool matched")),
+            patch("agent.process_bootstrap.OpenAI", side_effect=AssertionError("client built")),
+        ):
+            with pytest.raises(GeminiOutboundDenied):
+                agent._restore_primary_runtime()
+        assert agent._fallback_activated is True
+
+    def test_transport_recovery_re_raises_the_google_outbound_denial(self):
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        agent = _make_agent(provider="custom")
+        with patch("agent.agent_runtime_helpers._rebuild_primary_client", side_effect=GeminiOutboundDenied()), \
+             patch("time.sleep"):
+            with pytest.raises(GeminiOutboundDenied):
+                agent._try_recover_primary_transport(
+                    _make_transport_error("ReadTimeout"), retry_count=3, max_retries=3)
