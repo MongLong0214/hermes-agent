@@ -170,6 +170,362 @@ class TestResolveAutoMainFirst:
         mock_main_chain.assert_not_called()
         mock_openrouter.assert_not_called()
 
+    def test_main_fallback_skips_google_static_and_dynamic_routes_before_key_resolution(self):
+        """Blocked Gemini/Vertex routes consume neither a fallback key nor client slot.
+
+        Both provider aliases and dynamically named entries resolved to Google's inference
+        URLs are rejected locally; the next benign main-fallback remains available.
+        """
+        benign_client = MagicMock()
+        entries = [
+            {"provider": "gemini", "model": "gemini-3-flash"},
+            {"provider": "vertex", "model": "gemini-3-flash"},
+            {
+                "provider": "permitted-name", "model": "ordinary-model",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+            },
+            {
+                "provider": "another-permitted-name", "model": "ordinary-model",
+                "base_url": "https://aiplatform.googleapis.com/v1beta1/publishers/google",
+            },
+            {"provider": "nous", "model": "hermes-4"},
+        ]
+        key_reads = []
+        resolve_calls = []
+
+        def resolve_key(entry):
+            key_reads.append(entry["provider"])
+            return "safe-key"
+
+        def resolve_client(provider, model, **_kwargs):
+            resolve_calls.append((provider, model))
+            return benign_client, model
+
+        with patch(
+            "hermes_cli.config.load_config_readonly", return_value={}
+        ), patch(
+            "hermes_cli.fallback_config.get_fallback_chain", return_value=entries
+        ), patch(
+            "hermes_cli.fallback_config.resolve_entry_api_key", side_effect=resolve_key
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client", side_effect=resolve_client
+        ), patch(
+            "agent.auxiliary_client._is_provider_unhealthy", return_value=False
+        ):
+            from agent.auxiliary_client import _try_main_fallback_chain
+
+            client, model, provider = _try_main_fallback_chain("title_generation")
+
+        assert (client, model, provider) == (benign_client, "hermes-4", "nous")
+        assert key_reads == ["nous"]
+        assert resolve_calls == [("nous", "hermes-4")]
+
+    def test_main_fallback_skips_ambiguous_custom_routes_before_key_client_or_health_cache(self):
+        """An unconfigured custom route cannot consume state before an explicit route wins."""
+        benign_client = MagicMock()
+        entries = [
+            {"provider": "custom:unconfigured-route", "model": "unknown-model"},
+            {"provider": "custom", "model": "unknown-model"},
+            {"provider": "custom:uncertain-url", "model": "unknown-model", "base_url": "https://["},
+            {"provider": "custom:invalid-port", "model": "unknown-model", "base_url": "https://relay.example.test:invalid/v1"},
+            {"provider": "custom:out-of-range-port", "model": "unknown-model", "base_url": "https://relay.example.test:65536/v1"},
+            {
+                "provider": "custom:google-url",
+                "model": "ordinary-model",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+            },
+            {
+                "provider": "custom:relay",
+                "model": "relay-model",
+                "base_url": "https://relay.example.test/v1",
+            },
+        ]
+        key_reads = []
+        resolve_calls = []
+        health_calls = []
+
+        def resolve_key(entry):
+            key_reads.append(entry["provider"])
+            return "safe-key"
+
+        def resolve_client(provider, model, **_kwargs):
+            resolve_calls.append((provider, model))
+            if provider == "custom:relay":
+                return benign_client, model
+            return None, None
+
+        def health_base_url(provider, explicit_base_url=None):
+            health_calls.append((provider, explicit_base_url))
+            return str(explicit_base_url or "")
+
+        with patch(
+            "hermes_cli.config.load_config_readonly", return_value={}
+        ), patch(
+            "hermes_cli.fallback_config.get_fallback_chain", return_value=entries
+        ), patch(
+            "hermes_cli.fallback_config.resolve_entry_api_key", side_effect=resolve_key
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client", side_effect=resolve_client
+        ), patch(
+            "agent.auxiliary_client._custom_health_base_url", side_effect=health_base_url
+        ), patch(
+            "agent.auxiliary_client._is_provider_unhealthy", return_value=False
+        ):
+            from agent.auxiliary_client import _try_main_fallback_chain
+
+            client, model, provider = _try_main_fallback_chain("title_generation")
+
+        assert (client, model, provider) == (benign_client, "relay-model", "custom:relay")
+        assert key_reads == ["custom:relay"]
+        assert resolve_calls == [("custom:relay", "relay-model")]
+        assert health_calls == [
+            ("custom:relay", "https://relay.example.test/v1"),
+        ]
+
+    def test_unconfigured_named_custom_route_is_not_admitted_by_either_fallback_chain(self):
+        """Absent route facts for custom aliases cannot consume health, key, or client state."""
+        route_reads = []
+        health_calls = []
+        key_reads = []
+        resolve_calls = []
+        entries = [{"provider": "custom:unconfigured-route", "model": "ordinary-model"}]
+
+        def route_fact(provider):
+            route_reads.append(provider)
+            return None
+
+        def health_base_url(provider, explicit_base_url=None):
+            health_calls.append((provider, explicit_base_url))
+            return str(explicit_base_url or "")
+
+        def resolve_key(entry):
+            key_reads.append(entry["provider"])
+            return "safe-key"
+
+        def resolve_client(provider, model, **_kwargs):
+            resolve_calls.append((provider, model))
+            return MagicMock(), model
+
+        with patch(
+            "hermes_cli.config.load_config_readonly", return_value={}
+        ), patch(
+            "hermes_cli.fallback_config.get_fallback_chain", return_value=entries
+        ), patch(
+            "agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": entries}
+        ), patch(
+            "hermes_cli.runtime_provider_custom.peek_named_custom_provider_route", side_effect=route_fact
+        ), patch(
+            "agent.auxiliary_client._custom_health_base_url", side_effect=health_base_url
+        ), patch(
+            "hermes_cli.fallback_config.resolve_entry_api_key", side_effect=resolve_key
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client", side_effect=resolve_client
+        ), patch(
+            "agent.auxiliary_client._is_provider_unhealthy", return_value=False
+        ):
+            from agent.auxiliary_client import _try_configured_fallback_chain, _try_main_fallback_chain
+
+            assert _try_main_fallback_chain("title_generation") == (None, None, "")
+            assert _try_configured_fallback_chain("title_generation", "primary") == (None, None, "")
+
+        assert route_reads == ["custom:unconfigured-route", "custom:unconfigured-route"]
+        assert health_calls == []
+        assert key_reads == []
+        assert resolve_calls == []
+
+    def test_main_fallback_rejects_named_custom_google_route_before_key_resolution(self):
+        """A named custom alias is denied before health, key, or client resolution."""
+        benign_client = MagicMock()
+        key_reads = []
+        resolve_calls = []
+        route_reads = []
+        health_calls = []
+
+        def route_fact(provider):
+            route_reads.append(provider)
+            if provider == "google-relay":
+                return {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai"}
+            return None
+
+        def resolve_key(entry):
+            key_reads.append(entry["provider"])
+            return "safe-key"
+
+        def resolve_client(provider, model, **_kwargs):
+            resolve_calls.append((provider, model))
+            return benign_client, model
+
+        def health_base_url(provider, explicit_base_url=None):
+            health_calls.append((provider, explicit_base_url))
+            return str(explicit_base_url or "")
+
+        with patch(
+            "hermes_cli.config.load_config_readonly", return_value={}
+        ), patch(
+            "hermes_cli.fallback_config.get_fallback_chain", return_value=[
+                {"provider": "google-relay", "model": "ordinary-model"},
+                {"provider": "nous", "model": "hermes-4"},
+            ]
+        ), patch(
+            "hermes_cli.runtime_provider_custom.peek_named_custom_provider_route", side_effect=route_fact
+        ), patch(
+            "hermes_cli.fallback_config.resolve_entry_api_key", side_effect=resolve_key
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client", side_effect=resolve_client
+        ), patch(
+            "agent.auxiliary_client._custom_health_base_url", side_effect=health_base_url
+        ), patch(
+            "agent.auxiliary_client._is_provider_unhealthy", return_value=False
+        ):
+            from agent.auxiliary_client import _try_main_fallback_chain
+
+            client, model, provider = _try_main_fallback_chain("title_generation")
+
+        assert (client, model, provider) == (benign_client, "hermes-4", "nous")
+        assert route_reads == ["google-relay", "nous"]
+        assert key_reads == ["nous"]
+        assert resolve_calls == [("nous", "hermes-4")]
+        assert health_calls == [("nous", None)]
+
+    def test_configured_fallback_rejects_named_custom_google_route_before_key_resolution(self):
+        """Task fallback admission denies named Google routes before health lookup."""
+        benign_client = MagicMock()
+        key_reads = []
+        resolve_calls = []
+        route_reads = []
+        health_calls = []
+
+        def route_fact(provider):
+            route_reads.append(provider)
+            if provider == "google-relay":
+                return {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai"}
+            return None
+
+        def resolve_key(entry):
+            key_reads.append(entry["provider"])
+            return "safe-key"
+
+        def resolve_client(provider, model, **_kwargs):
+            resolve_calls.append((provider, model))
+            return benign_client, model
+
+        def health_base_url(provider, explicit_base_url=None):
+            health_calls.append((provider, explicit_base_url))
+            return str(explicit_base_url or "")
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": [
+                {"provider": "google-relay", "model": "ordinary-model"},
+                {"provider": "nous", "model": "hermes-4"},
+            ]}
+        ), patch(
+            "hermes_cli.runtime_provider_custom.peek_named_custom_provider_route", side_effect=route_fact
+        ), patch(
+            "hermes_cli.fallback_config.resolve_entry_api_key", side_effect=resolve_key
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client", side_effect=resolve_client
+        ), patch(
+            "agent.auxiliary_client._custom_health_base_url", side_effect=health_base_url
+        ), patch(
+            "agent.auxiliary_client._is_provider_unhealthy", return_value=False
+        ):
+            from agent.auxiliary_client import _try_configured_fallback_chain
+
+            client, model, provider = _try_configured_fallback_chain("title_generation", "primary")
+
+        assert (client, model, provider) == (benign_client, "hermes-4", "fallback_chain[1](nous)")
+        assert route_reads == ["google-relay", "nous"]
+        assert key_reads == ["nous"]
+        assert resolve_calls == [("nous", "hermes-4")]
+        assert health_calls == [("nous", None)]
+
+    def test_main_fallback_rejects_named_malformed_port_before_health_key_or_client(self):
+        """A named endpoint fact with an invalid port is rejected before resolution."""
+        health_calls = []
+        key_reads = []
+        resolve_calls = []
+
+        def health_base_url(provider, explicit_base_url=None):
+            health_calls.append((provider, explicit_base_url))
+            return str(explicit_base_url or "")
+
+        def resolve_key(entry):
+            key_reads.append(entry["provider"])
+            return "safe-key"
+
+        def resolve_client(provider, model, **_kwargs):
+            resolve_calls.append((provider, model))
+            return MagicMock(), model
+
+        with patch(
+            "hermes_cli.config.load_config_readonly", return_value={}
+        ), patch(
+            "hermes_cli.fallback_config.get_fallback_chain", return_value=[
+                {"provider": "malformed-relay", "model": "ordinary-model"},
+            ]
+        ), patch(
+            "hermes_cli.runtime_provider_custom.peek_named_custom_provider_route",
+            return_value={"base_url": "https://relay.example.test:not-a-port/v1"},
+        ), patch(
+            "hermes_cli.fallback_config.resolve_entry_api_key", side_effect=resolve_key
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client", side_effect=resolve_client
+        ), patch(
+            "agent.auxiliary_client._custom_health_base_url", side_effect=health_base_url
+        ), patch(
+            "agent.auxiliary_client._is_provider_unhealthy", return_value=False
+        ):
+            from agent.auxiliary_client import _try_main_fallback_chain
+
+            assert _try_main_fallback_chain("title_generation") == (None, None, "")
+
+        assert health_calls == []
+        assert key_reads == []
+        assert resolve_calls == []
+
+    def test_configured_fallback_rejects_named_malformed_port_before_health_key_or_client(self):
+        """A task fallback rejects malformed named endpoints before resolution."""
+        health_calls = []
+        key_reads = []
+        resolve_calls = []
+
+        def health_base_url(provider, explicit_base_url=None):
+            health_calls.append((provider, explicit_base_url))
+            return str(explicit_base_url or "")
+
+        def resolve_key(entry):
+            key_reads.append(entry["provider"])
+            return "safe-key"
+
+        def resolve_client(provider, model, **_kwargs):
+            resolve_calls.append((provider, model))
+            return MagicMock(), model
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": [
+                {"provider": "custom", "model": "no-endpoint-model"},
+                {"provider": "malformed-relay", "model": "ordinary-model"},
+            ]}
+        ), patch(
+            "hermes_cli.runtime_provider_custom.peek_named_custom_provider_route",
+            return_value={"base_url": "https://relay.example.test:65536/v1"},
+        ), patch(
+            "hermes_cli.fallback_config.resolve_entry_api_key", side_effect=resolve_key
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client", side_effect=resolve_client
+        ), patch(
+            "agent.auxiliary_client._custom_health_base_url", side_effect=health_base_url
+        ), patch(
+            "agent.auxiliary_client._is_provider_unhealthy", return_value=False
+        ):
+            from agent.auxiliary_client import _try_configured_fallback_chain
+
+            assert _try_configured_fallback_chain("title_generation", "primary") == (None, None, "")
+
+        assert health_calls == []
+        assert key_reads == []
+        assert resolve_calls == []
+
     def test_resolve_provider_auto_returns_runtime_model_not_stale_config_default(self):
         """Blank auto aux requests must not pair a stale config model with live fallback provider."""
         runtime_client = MagicMock()
@@ -493,3 +849,95 @@ class TestResolveVisionCustomProvider:
         assert kwargs.get("explicit_api_key") == "sk-configured"
 
 # ── Constant cleanup ────────────────────────────────────────────────────────
+
+
+# ── the agent's own main fallback chain (runtime failover and init-time recovery) ────────────
+
+_GOOGLE_STUDIO = "https://generativelanguage.googleapis.com/v1beta/openai"
+_ORDINARY = "https://relay.example.test/v1"
+
+
+def _main_chain_entries():
+    return [
+        {"provider": "gemini", "model": "gemini-3-flash"},
+        {"provider": "auto", "model": "ordinary-model"},
+        {"provider": "custom", "model": "ordinary-model"},  # bare custom, no route fact
+        {"provider": "custom", "model": "ordinary-model", "base_url": _GOOGLE_STUDIO},
+        {"provider": "custom", "model": "ordinary-model", "base_url": "https://relay.example.test:99999/v1"},
+        {"provider": "google-relay", "model": "ordinary-model"},
+        {"provider": "openrouter", "model": "google/gemini-2.5-pro"},
+        {"provider": "custom", "model": "relay-model", "base_url": _ORDINARY},
+        {"provider": "nous", "model": "hermes-4"},
+    ]
+
+
+def _route_fact(provider):
+    return {"base_url": _GOOGLE_STUDIO} if provider == "google-relay" else None
+
+
+class TestAgentMainFallbackGoogleGuard:
+    def test_runtime_failover_skips_google_auto_and_unverifiable_routes_before_any_effect(self):
+        from types import SimpleNamespace
+
+        from agent import chat_completion_helpers
+
+        considered = []
+        agent = SimpleNamespace(_fallback_index=0, _fallback_chain=_main_chain_entries())
+
+        def consider(agent, fb, fb_key, fb_provider, fb_model, unavailable):
+            considered.append((fb_provider, fb_model))
+            return True  # skip: the guard order is what is under test
+
+        with patch("agent.fallback_cooldown.switch_deferred_by_reset", return_value=False), \
+             patch("agent.fallback_cooldown._arm_rate_limit_cooldown", return_value=None), \
+             patch.object(chat_completion_helpers, "_fallback_chain_exhausted", return_value=False), \
+             patch.object(chat_completion_helpers, "_should_skip_fallback_candidate", side_effect=consider), \
+             patch("hermes_cli.runtime_provider._get_model_config", return_value={}), \
+             patch("agent.secret_scope.get_secret_str", return_value=""), \
+             patch("hermes_cli.runtime_provider_custom.peek_named_custom_provider_route", side_effect=_route_fact):
+            assert chat_completion_helpers.try_activate_fallback(agent) is False
+
+        assert considered == [("custom", "relay-model"), ("nous", "hermes-4")]
+        assert getattr(agent, "_unavailable_fallback_keys", set()) == set()
+
+    def test_a_bare_custom_fallback_uses_the_configured_route_fact(self):
+        from agent.chat_completion_helpers import _main_fallback_google_route
+
+        bare = {"provider": "custom", "model": "ordinary-model"}
+        with patch("hermes_cli.runtime_provider._get_model_config",
+                   return_value={"provider": "custom", "base_url": _ORDINARY}):
+            assert _main_fallback_google_route("custom", "ordinary-model", bare) is False
+        with patch("hermes_cli.runtime_provider._get_model_config",
+                   return_value={"provider": "custom", "base_url": _GOOGLE_STUDIO}):
+            assert _main_fallback_google_route("custom", "ordinary-model", bare) is True
+
+    def test_init_time_recovery_skips_google_routes_before_their_key_is_read(self):
+        from types import SimpleNamespace
+
+        from agent import agent_init
+
+        key_reads, resolve_calls = [], []
+        agent = SimpleNamespace(provider="openrouter", requested_provider="openrouter", model="ordinary-model",
+                                _fallback_activated=False)
+        routed = SimpleNamespace(api_key="k", base_url=_ORDINARY)
+
+        def resolve_client(provider, model=None, **_kwargs):
+            resolve_calls.append(provider)
+            if provider == "openrouter":
+                return None, None  # the primary is unavailable
+            return routed, model
+
+        with patch("agent.auxiliary_client.resolve_provider_client", side_effect=resolve_client), \
+             patch("hermes_cli.fallback_config.resolve_entry_api_key",
+                   side_effect=lambda entry: key_reads.append(entry["provider"]) or "k"), \
+             patch("hermes_cli.runtime_provider._get_model_config", return_value={}), \
+             patch("agent.secret_scope.get_secret_str", return_value=""), \
+             patch("hermes_cli.runtime_provider_custom.peek_named_custom_provider_route", side_effect=_route_fact), \
+             patch.object(agent_init, "recompute_init_fallback_api_mode", lambda *a: None), \
+             patch.object(agent_init, "_client_kwargs_from_routed", lambda client, timeout: {"base_url": client.base_url}):
+            kwargs = agent_init._routed_client_kwargs(agent, _main_chain_entries(), None)
+
+        assert kwargs == {"base_url": _ORDINARY}
+        assert key_reads == ["custom"]
+        assert resolve_calls == ["openrouter", "custom"]
+        assert (agent.provider, agent.model) == ("custom", "relay-model")

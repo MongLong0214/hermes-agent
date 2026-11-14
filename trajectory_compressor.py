@@ -30,6 +30,7 @@ import fire
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.console import Console
 from hermes_constants import OPENROUTER_BASE_URL, get_hermes_home
+from agent.gemini_outbound_policy import GeminiOutboundDenied, deny_gemini_outbound
 from agent.compression_marker import elide_middle
 from agent.retry_utils import jittered_backoff
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -314,6 +315,7 @@ class TrajectoryCompressor:
             self.client = self.async_client = None  # Not used directly
         else:
             # Custom endpoint — use config's raw base_url + api_key_env
+            deny_gemini_outbound(model=self.config.summarization_model, base_url=self.config.base_url)
             api_key = os.getenv(self.config.api_key_env)
             if not api_key:
                 raise RuntimeError(f"Missing API key. Set {self.config.api_key_env} environment variable.")
@@ -330,6 +332,7 @@ class TrajectoryCompressor:
 
     def _get_async_client(self):
         """Return a fresh AsyncOpenAI client bound to the running event loop."""
+        deny_gemini_outbound(model=self.config.summarization_model, base_url=self.config.base_url)
         from openai import AsyncOpenAI
         from agent.auxiliary_client import _to_openai_base_url
         self.async_client = AsyncOpenAI(api_key=self._async_client_api_key, base_url=_to_openai_base_url(self.config.base_url))
@@ -465,6 +468,8 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                 else:
                     response = self.client.chat.completions.create(**kwargs)
                 return self._finish_summary(response)
+            except GeminiOutboundDenied:
+                raise
             except Exception as e:
                 delay = self._summary_attempt_failed(metrics, attempt, e)
                 if delay is None:
@@ -484,6 +489,8 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                 else:
                     response = await self._get_async_client().chat.completions.create(**kwargs)
                 return self._finish_summary(response)
+            except GeminiOutboundDenied:
+                raise
             except Exception as e:
                 delay = self._summary_attempt_failed(metrics, attempt, e)
                 if delay is None:

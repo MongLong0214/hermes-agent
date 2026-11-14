@@ -773,6 +773,15 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
     _refused_entries = []
     for _fb in _fallback_entries(fallback_model):
         _fb_provider = str(_fb["provider"])
+        # Init-time recovery follows the same fail-closed Google route policy as runtime
+        # failover, before fallback-key resolution and client construction.
+        from agent.chat_completion_helpers import _main_fallback_google_route
+        if _main_fallback_google_route(_fb_provider.strip().lower(), str(_fb.get("model") or "").strip(), _fb):
+            _skip_reason = ("automatic route cannot be verified before resolver effects"
+                            if _fb_provider.strip().lower() == "auto" else "unverifiable or Google inference route")
+            logger.warning("Init-time fallback skip: %s/%s %s", _fb_provider, _fb.get("model"), _skip_reason)
+            _refused_entries.append((_fb_provider, _skip_reason))
+            continue
         try:
             from hermes_cli.fallback_config import resolve_entry_api_key
             _fb_explicit_key = resolve_entry_api_key(_fb)

@@ -9,6 +9,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 
+import agent.auxiliary_client as _aux_module
 from agent.auxiliary_client import (
     _NOUS_MODEL,
     CodexAuxiliaryClient,
@@ -2846,12 +2847,6 @@ class TestAuxiliaryAuthRefreshRetry:
             assert _refresh_provider_credentials("vertex") is False
 
 
-    def test_resolve_provider_client_vertex_none_when_no_credentials(self):
-        with patch("agent.vertex_adapter.has_vertex_credentials", return_value=False):
-            client, model = resolve_provider_client("vertex", "google/gemini-3-flash-preview")
-
-        assert client is None
-        assert model is None
 
 
 class TestAuxiliaryPoolRotationRetry:
@@ -5476,3 +5471,176 @@ class TestPreserveNamedCustomProviderWithBaseUrl:
             )
 
         assert resolved_provider == "xai-oauth"
+
+
+# ── Google outbound denial: auxiliary routes and the trajectory compressor ──────────────────
+
+_GOOGLE_STUDIO = "https://generativelanguage.googleapis.com/v1beta"
+_GOOGLE_VERTEX = "https://us-central1-aiplatform.googleapis.com/v1"
+
+
+class _Tripwire:
+    """Stands in for a credential read, pool, client constructor or resolver: any use is recorded."""
+
+    def __init__(self, name, touched):
+        self._name, self._touched = name, touched
+
+    def __call__(self, *_args, **_kwargs):
+        self._touched.append(self._name)
+        raise AssertionError(f"{self._name} was reached before the refusal")
+
+
+def _trajectory(model, base_url):
+    from trajectory_compressor import CompressionConfig, TrajectoryCompressor
+
+    compressor = TrajectoryCompressor.__new__(TrajectoryCompressor)
+    compressor.config = CompressionConfig(summarization_model=model, base_url=base_url,
+                                          api_key_env="TRAJECTORY_TEST_KEY")
+    compressor._async_client_api_key = "k"
+    return compressor
+
+
+class TestGoogleOutboundDenial:
+    @pytest.mark.parametrize(("seams", "call"), [
+        pytest.param(("agent.auxiliary_client.load_pool", "agent.auxiliary_client.OpenAI",
+                      "hermes_cli.auth.resolve_api_key_provider_credentials"),
+                     lambda: resolve_provider_client("gemini", "gemini-2.5-flash"), id="provider-gemini"),
+        pytest.param(("agent.auxiliary_client.load_pool", "agent.auxiliary_client.OpenAI"),
+                     lambda: resolve_provider_client("vertex", "google/gemini-3-flash-preview"), id="provider-vertex"),
+        pytest.param(("agent.auxiliary_client.load_pool", "agent.auxiliary_client.OpenAI"),
+                     lambda: resolve_provider_client("custom", "ordinary-model", explicit_base_url=_GOOGLE_STUDIO,
+                                                     explicit_api_key="k"), id="explicit-google-endpoint"),
+        pytest.param(("agent.auxiliary_client.load_pool", "agent.auxiliary_client._peek_pool_entry",
+                      "agent.auxiliary_client.resolve_provider_client"),
+                     lambda: _aux_module._get_cached_client("custom", "ordinary-model", base_url=_GOOGLE_VERTEX, api_key="k"),
+                     id="client-cache"),
+        pytest.param(("agent.auxiliary_client.OpenAI", "agent.auxiliary_client._AuxProbeClientStub"),
+                     lambda: _aux_module._create_openai_client(
+                         api_key="k", base_url=_GOOGLE_STUDIO), id="client-construction"),
+        pytest.param(("agent.auxiliary_client.load_pool", "agent.auxiliary_client.OpenAI"),
+                     lambda: resolve_provider_client("auto", main_runtime={
+                         "provider": "custom", "model": "ordinary-model", "base_url": _GOOGLE_STUDIO}),
+                     id="auto-on-a-google-main-runtime"),
+    ])
+    def test_a_google_bound_aux_route_is_refused_before_credentials_or_client(self, monkeypatch, seams, call):
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        touched = []
+        for seam in seams:
+            monkeypatch.setattr(seam, _Tripwire(seam, touched))
+        with pytest.raises(GeminiOutboundDenied):
+            call()
+        assert touched == []
+
+    def test_a_named_custom_aux_route_on_a_google_host_is_refused_before_its_key(self, monkeypatch):
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        touched = []
+        monkeypatch.setattr("hermes_cli.runtime_provider.load_config",
+                            lambda: {"providers": {"relay": {"base_url": _GOOGLE_STUDIO, "key_env": "RELAY_KEY"}}})
+        monkeypatch.setattr("hermes_cli.runtime_provider_custom.get_secret_str", _Tripwire("get_secret_str", touched))
+        monkeypatch.setattr("agent.auxiliary_client.OpenAI", _Tripwire("OpenAI", touched))
+        with pytest.raises(GeminiOutboundDenied):
+            resolve_provider_client("custom:relay", "ordinary-model")
+        assert touched == []
+
+    def test_a_named_custom_aux_route_whose_url_has_no_scheme_is_still_refused_before_its_key(self, monkeypatch):
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        touched = []
+        monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda: {
+            "providers": {"relay": {"base_url": "generativelanguage.googleapis.com/v1beta", "api_key": "k"}}})
+        monkeypatch.setattr("agent.auxiliary_client._named_custom_api_key", _Tripwire("_named_custom_api_key", touched))
+        monkeypatch.setattr("agent.auxiliary_client.OpenAI", _Tripwire("OpenAI", touched))
+        with pytest.raises(GeminiOutboundDenied):
+            resolve_provider_client("custom:relay", "ordinary-model")
+        assert touched == []
+
+    def test_auto_on_a_google_main_runtime_is_refused_before_the_auto_branch_runs(self, monkeypatch):
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        touched = []
+        monkeypatch.setitem(_aux_module._EXPLICIT_PROVIDER_BRANCHES, "auto", _Tripwire("auto-branch", touched))
+        with pytest.raises(GeminiOutboundDenied):
+            resolve_provider_client("auto", main_runtime={
+                "provider": "custom", "model": "ordinary-model", "base_url": _GOOGLE_VERTEX})
+        assert touched == []
+
+    def test_a_moa_preset_with_a_google_aggregator_is_refused(self, monkeypatch):
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        touched = []
+        monkeypatch.setattr("agent.auxiliary_client._resolve_moa_aggregator",
+                            lambda model: ("gemini", "gemini-2.5-flash"))
+        monkeypatch.setattr("agent.auxiliary_client.OpenAI", _Tripwire("OpenAI", touched))
+        with pytest.raises(GeminiOutboundDenied):
+            resolve_provider_client("moa", "preset")
+        assert touched == []
+
+    def test_the_auto_api_key_scan_never_considers_a_google_provider(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from agent import auxiliary_client
+
+        considered = []
+        rows = [("gemini", SimpleNamespace(auth_type="api_key", inference_base_url=_GOOGLE_STUDIO)),
+                ("relay-on-google", SimpleNamespace(auth_type="api_key", inference_base_url=_GOOGLE_VERTEX))]
+        monkeypatch.setattr("hermes_cli.auth_plugin_providers.canonical_registry_rows", lambda: rows)
+        monkeypatch.setattr(auxiliary_client, "_is_provider_unhealthy",
+                            lambda provider_id, *a, **k: considered.append(provider_id) or True)
+
+        assert auxiliary_client._resolve_api_key_provider() == (None, None)
+        assert considered == []
+
+    def test_a_google_model_on_a_relay_endpoint_keeps_its_aux_client_and_the_google_twin_is_refused(self):
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        relay = "https://safe-relay.example/v1"
+        client, _model = resolve_provider_client("custom", "google/gemini-2.5-flash",
+                                                 explicit_base_url=relay, explicit_api_key="k")
+        assert str(client.base_url).rstrip("/") == relay
+        with pytest.raises(GeminiOutboundDenied):
+            resolve_provider_client("custom", "google/gemini-2.5-flash",
+                                    explicit_base_url=_GOOGLE_STUDIO, explicit_api_key="k")
+
+    def test_trajectory_custom_endpoint_is_refused_before_its_key_is_read(self, monkeypatch):
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        touched = []
+        monkeypatch.setattr("trajectory_compressor.os", _Tripwire("os", touched))
+        monkeypatch.setattr("openai.OpenAI", _Tripwire("OpenAI", touched))
+        with pytest.raises(GeminiOutboundDenied):
+            _trajectory("gemini-2.5-flash", "https://ordinary.example.test/v1")._init_summarizer()
+        assert touched == []
+
+    def test_trajectory_async_client_on_a_google_host_is_refused_before_construction(self, monkeypatch):
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        touched = []
+        monkeypatch.setattr("openai.AsyncOpenAI", _Tripwire("AsyncOpenAI", touched))
+        with pytest.raises(GeminiOutboundDenied):
+            _trajectory("ordinary-model", _GOOGLE_STUDIO)._get_async_client()
+        assert touched == []
+
+    def test_trajectory_summary_loops_re_raise_the_denial_instead_of_a_fallback_summary(self):
+        import asyncio
+
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+        from trajectory_compressor import TrajectoryMetrics
+
+        def _deny(**_kwargs):
+            raise GeminiOutboundDenied()
+
+        compressor = _trajectory("ordinary-model", "https://ordinary.example.test/v1")
+        compressor._use_call_llm = False
+        compressor.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=_deny)))
+        with pytest.raises(GeminiOutboundDenied):
+            compressor._generate_summary("turns", TrajectoryMetrics())
+
+        async def _adeny(**_kwargs):
+            raise GeminiOutboundDenied()
+
+        compressor._get_async_client = lambda: SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=_adeny)))
+        with pytest.raises(GeminiOutboundDenied):
+            asyncio.run(compressor._generate_summary_async("turns", TrajectoryMetrics()))
