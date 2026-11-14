@@ -190,6 +190,19 @@ def public_fire_error(value: Any) -> Optional[dict[str, Any]]:
     return {"at": at if isinstance(at, str) else None, "detail": FIRE_FORWARD_FAILED}
 
 
+_QUEUED_ENTRY = re.compile(r"queued delivery (\S+?): ")
+QUEUED_UNVERIFIED_NOTE = "(send began, not confirmed; not resent)"
+
+
+def public_delivery_unverified(value: Any) -> Optional[list]:
+    """The persisted/public ``last_delivery_unverified``: target names and the fixed send notes stay;
+    an older build's ``queued delivery <id>: <queue error>`` entry keeps only its id."""
+    if not isinstance(value, list) or not value:
+        return None
+    return [f"queued delivery {m.group(1)} {QUEUED_UNVERIFIED_NOTE}"
+            if (m := _QUEUED_ENTRY.match(str(entry))) else entry for entry in value]
+
+
 def closed_status_fields(job: dict[str, Any]) -> dict[str, Any]:
     """*job*'s failure fields as served anywhere off the host, including records written raw
     before the store closed them."""
@@ -197,6 +210,7 @@ def closed_status_fields(job: dict[str, Any]) -> dict[str, Any]:
         "last_error": public_run_error(job.get("last_error"), no_agent=bool(job.get("no_agent"))),
         "last_delivery_error": public_delivery_error(job.get("last_delivery_error")),
         "last_fire_error": public_fire_error(job.get("last_fire_error")),
+        "last_delivery_unverified": public_delivery_unverified(job.get("last_delivery_unverified")),
     }
 
 

@@ -42,7 +42,9 @@ def finish_interrupted_run(job, execution_id, delivery_error):
     if delivery_error:
         try:
             from cron.jobs import update_job
-            update_job(job['id'], {'last_delivery_error': delivery_error})
+            from cron.jobs_public_status import public_delivery_error
+            logger.warning("Job '%s': result not delivered: %s", job['id'], delivery_error)
+            update_job(job['id'], {'last_delivery_error': public_delivery_error(delivery_error)})
         except Exception as exc:
             logger.debug('Failed recording delivery_error for interrupted job %s: %s', job['id'], exc, exc_info=True)
     if delivery_outcome == "queued":
@@ -123,9 +125,12 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
         mark_kwargs["expected_fire_owner"] = fire_owner
     if d.blocked_config:
         mark_kwargs["status"] = "blocked_config"
+    # The agent's [CRON_FAILURE] prose went to chat as its report; the record gets only its kind.
+    from cron.jobs_public_status import public_run_error
+    recorded_error = public_run_error(d.error, agent_declared=True) if d.agent_declared else d.error
     # A run that removed its own record has nothing left to mark; the delivery above is its result.
     marked = scheduler.self_removal_delivery_allowed(job["id"]) or scheduler.mark_job_run(
-        job["id"], d.success, d.error, **mark_kwargs)
+        job["id"], d.success, recorded_error, **mark_kwargs)
     if fire_owner is not None and not marked:
         scheduler.finish_execution(
             execution_id, success=False,

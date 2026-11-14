@@ -499,7 +499,7 @@ def _format_job(job: dict[str, Any]) -> dict[str, Any]:
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
         "last_delivery_error": closed["last_delivery_error"],
-        "last_delivery_unverified": job.get("last_delivery_unverified"),
+        "last_delivery_unverified": closed["last_delivery_unverified"],
         "last_fire_error": closed["last_fire_error"],
         "last_error": closed["last_error"],
         "enabled": job.get("enabled", True),

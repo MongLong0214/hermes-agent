@@ -131,3 +131,64 @@ def test_projection_keeps_only_listed_fields():
     assert set(projected) == {"id", "last_error", "skills"}
     projected["skills"].append("t")
     assert record["skills"] == ["s"], "the projection is a copy"
+
+
+# ---- writers outside mark_job_run --------------------------------------------------------
+
+
+def test_interrupted_run_notice_failure_is_stored_closed_and_logged(home, caplog):
+    from cron.executions import create_execution
+    from cron.jobs import create_job, get_job
+    from cron.jobs_public_status import DELIVERY_FAILED
+    from cron.scheduler_bookkeeping import finish_interrupted_run
+
+    job = create_job(prompt="x", schedule="every 5m", name="interrupted")
+    execution = create_execution(job["id"], source="builtin")
+    with caplog.at_level("WARNING", logger="cron.scheduler"):
+        finish_interrupted_run(job, execution["id"], _DELIVERY_ERROR)
+    assert get_job(job["id"])["last_delivery_error"] == DELIVERY_FAILED
+    assert _DELIVERY_ERROR in caplog.text, "the adapter's reason survives in the log"
+
+
+def test_agent_declared_failure_gets_its_own_label_while_the_ledger_keeps_the_prose(home):
+    import cron.scheduler as sched
+    from cron.executions import create_execution, get_execution
+    from cron.jobs import claim_job_for_fire, create_job, get_job
+    from cron.jobs_public_status import failure_cause, public_run_error
+    from cron.scheduler_bookkeeping import finish_completed_run
+
+    prose = f"The export child could not sign in: HTTP 401 {_TOKEN} at {_URL}"
+    job = create_job(prompt="x", schedule="every 5m", name="declared")
+    claimed = claim_job_for_fire(job["id"], return_job=True)
+    execution = create_execution(job["id"], source="builtin")
+    delivery = sched._RunDelivery(job=claimed, success=False, error=prose, agent_declared=True)
+    assert finish_completed_run(delivery, claimed["fire_claim"]["by"], execution["id"])
+
+    record = get_job(job["id"])
+    assert record["last_error"] == public_run_error(prose, agent_declared=True)
+    assert failure_cause("agent_declared") in record["last_error"].lower()
+    assert prose in get_execution(execution["id"])["error"]
+
+
+_LEGACY_UNVERIFIED = ["telegram:42", f"queued delivery exec-9: HTTP 401 {_TOKEN} at {_URL}"]
+
+
+def test_unverified_delivery_note_keeps_targets_and_drops_the_queue_error(home):
+    from cron.jobs import create_job, get_job
+    from cron.scheduler_delivery import _record_delivery_verification
+
+    job = create_job(prompt="x", schedule="every 5m", name="unverified")
+    _record_delivery_verification(job, list(_LEGACY_UNVERIFIED))
+    stored = get_job(job["id"])["last_delivery_unverified"]
+    assert stored == ["telegram:42", "queued delivery exec-9 (send began, not confirmed; not resent)"]
+
+
+def test_listing_closes_an_unverified_note_written_raw_by_an_older_build(home):
+    from cron.jobs import create_job, get_job, update_job
+    from tools.cronjob_tools import _format_job
+
+    job = create_job(prompt="x", schedule="every 5m", name="legacy-unverified")
+    update_job(job["id"], {"last_delivery_unverified": list(_LEGACY_UNVERIFIED)})
+    listed = _format_job(get_job(job["id"]))["last_delivery_unverified"]
+    assert listed[0] == "telegram:42" and listed[1].startswith("queued delivery exec-9 ")
+    _assert_no_raw(json.dumps(listed))

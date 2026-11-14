@@ -33,9 +33,13 @@ def _settle_job_record(job_id: str, execution_id: str, delivery_error: Optional[
     from cron.executions import latest_execution
     from cron.jobs import _with_job, save_jobs
 
+    from cron.jobs_public_status import public_delivery_error
+
     latest = latest_execution(job_id)
     if latest is None or latest.get("id") != execution_id:
         return False
+    # The record gets the closed label; the queue row keeps the adapter's reason.
+    closed = public_delivery_error(delivery_error)
 
     def apply(jobs, _i, job):
         completions = job.get("canonical_completions") or []
@@ -44,10 +48,10 @@ def _settle_job_record(job_id: str, execution_id: str, delivery_error: Optional[
         status = job.get("last_status")
         if status == "delivery_queued":
             status = "delivery_failed" if delivery_error else "ok"
-        if (status, delivery_error) == (job.get("last_status"), job.get("last_delivery_error")):
+        if (status, closed) == (job.get("last_status"), job.get("last_delivery_error")):
             return True
         job["last_status"] = status
-        job["last_delivery_error"] = delivery_error
+        job["last_delivery_error"] = closed
         save_jobs(jobs)
         return True
 

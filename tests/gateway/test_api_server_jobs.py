@@ -10,6 +10,7 @@ Covers:
 - Cron module unavailability (501 when _CRON_AVAILABLE is False)
 """
 
+import json
 import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -324,7 +325,7 @@ class TestRunJob:
     async def test_run_job(self, adapter):
         """POST /api/jobs/{id}/run returns triggered job."""
         app = _create_app(adapter)
-        triggered_job = {**SAMPLE_JOB, "last_run": "2025-01-01T00:00:00Z"}
+        triggered_job = {**SAMPLE_JOB, "last_run_at": "2025-01-01T00:00:00Z"}
         mock_trigger = MagicMock(return_value=triggered_job)
         async with TestClient(TestServer(app)) as cli:
             with patch(
@@ -557,3 +558,37 @@ class TestCronPromptScanParity:
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_create.assert_not_called()
 
+
+
+class TestJobsAreServedClosed:
+    """The bearer-token /api/jobs routes serve the closed projection: no fire/run claim, no
+    origin, no workdir or model routing, and only the closed failure labels."""
+
+    _RAW = "HTTP 401: key sk-leakcanary0123 rejected by https://u:hunter2@leakcanary.example/v1"
+    _RECORD = {**SAMPLE_JOB, "origin": {"platform": "telegram", "chat_id": "424242"},
+               "fire_claim": {"by": "host-a:4242"}, "run_claim": {"by": "host-a:4242"},
+               "workdir": "/Users/alice/private", "model": "m", "last_status": "error",
+               "last_error": _RAW, "last_delivery_error": f"telegram: 400 at {_RAW}"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route, patched", [
+        ("/api/jobs", "_cron_list"), (f"/api/jobs/{VALID_JOB_ID}", "_cron_get"),
+        (f"/api/jobs/{VALID_JOB_ID}/pause", "_cron_pause")])
+    async def test_job_routes_serve_the_closed_projection(self, adapter, route, patched):
+        from cron.jobs_public_status import PUBLIC_CRON_JOB_FIELDS, public_delivery_error
+
+        app = _create_app(adapter)
+        payload = [dict(self._RECORD)] if patched == "_cron_list" else dict(self._RECORD)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), \
+                 patch(f"{_MOD}.{patched}", return_value=payload), \
+                 patch(f"{_MOD}._notify_cron_provider_jobs_changed", lambda: None):
+                call = cli.get if "pause" not in route else cli.post
+                resp = await call(route)
+                assert resp.status == 200
+                body = await resp.text()
+        served = (json.loads(body).get("jobs") or [json.loads(body).get("job")])[0]
+        assert set(served) <= set(PUBLIC_CRON_JOB_FIELDS)
+        assert served["last_delivery_error"] == public_delivery_error(self._RECORD["last_delivery_error"])
+        for private in ("leakcanary", "hunter2", "424242", "host-a", "/Users/alice"):
+            assert private not in body, body
