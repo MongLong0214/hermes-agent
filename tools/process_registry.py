@@ -1169,12 +1169,43 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         pty_env.setdefault("GIT_PAGER", "cat")
         pty_env.setdefault("PAGER", "cat")
         pty_proc = _PtyProcessCls.spawn(pty_argv, cwd=session.cwd, env=pty_env, dimensions=(30, 120))
+        # The child runs from here on: hold its handle first, so a failure in any later step
+        # reaches spawn_local with a child to reap before the pipe fallback starts another copy.
+        session._pty, session.pid = pty_proc, pty_proc.pid
         self._own_pty_job(session, pty_proc)
-        session.pid = pty_proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
-        session._pty = pty_proc
         self._track_started(session, self._pty_reader_loop, f"proc-pty-reader-{session.id}")
         return session
+
+    def _reap_untracked_pty(self, session: ProcessSession) -> bool:
+        """A PTY child started but a later setup step failed: stop and reap it before the pipe
+        fallback runs the same command again. True only when ``isalive`` (which waits on the child)
+        confirms it exited; then the handle is closed and cleared, so a later kill reaches the
+        fallback process, and its group leaves the owner-death supervisor. Otherwise the handle and
+        the supervised group stay, so the orphan can still be killed and still dies with us."""
+        pty_proc = session._pty
+        with suppress(Exception):
+            pty_proc.terminate(force=True)
+        try:
+            reaped = not pty_proc.isalive()
+        except Exception:
+            reaped = False
+        if not reaped:
+            return False
+        session._pty = None
+        with suppress(Exception):
+            pty_proc.close()
+        self._release_job_group(session)
+        return True
+
+    def _track_unreaped_pty(self, session: ProcessSession) -> None:
+        """Register a PTY session whose child could not be reaped, so ``get``/``kill_process``
+        still reach it after spawn_local raises. No reader backs it: only a kill or restart
+        recovery resolves it."""
+        with self._lock:
+            self._prune_if_needed()
+            self._running[session.id] = session
+        self._write_checkpoint()
 
     def spawn_local(
         self, command: str, cwd: str | None = None, task_id: str = "", session_key: str = "",
@@ -1202,14 +1233,25 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             except Exception as e:
                 session.pty_fallback = f"the PTY spawn failed ({e})"
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
+                pty_reaped = session._pty is None or self._reap_untracked_pty(session)
+                if not pty_reaped:
+                    # The caller drops this session when we raise: keep it reachable by kill/list.
+                    self._track_unreaped_pty(session)
                 if session.systemd_unit:
                     pty_scope_attempted = True
-                    if not _stop_systemd_unit(session.systemd_unit):
+                    # Stopped even when the PTY refused: systemd can still reap the scope's cgroup.
+                    if _stop_systemd_unit(session.systemd_unit):
+                        session.systemd_unit = ""
+                    elif pty_reaped:
                         raise RuntimeError(
                             "PTY scope could not be reaped; refusing pipe fallback "
                             "to avoid duplicate command execution"
                         ) from e
-                    session.systemd_unit = ""
+                if not pty_reaped:
+                    raise RuntimeError(
+                        "PTY child could not be reaped; refusing pipe fallback "
+                        "to avoid duplicate command execution"
+                    ) from e
         # Pipe path (non-PTY or PTY fallback).
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
         unit_suffix = f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id

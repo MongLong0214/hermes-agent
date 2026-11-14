@@ -19,7 +19,7 @@ from pathlib import Path
 
 from hermes_constants import get_process_hermes_home
 from tools.environments.base import BaseEnvironment
-from tools.environments.base_output import _pipe_stdin
+from tools.environments.base_output import PostSpawnExecutionError, _pipe_stdin, _stop_unwaited_spawn
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.process_identity import own_process_groups, release_process_groups
 from tools.environments.local_env_policy import (
@@ -1047,6 +1047,15 @@ def _kill_process_windows(proc) -> None:
         proc.wait(timeout=2.0)
 
 
+def _kill_process_tree(proc) -> None:
+    """Kill the entire process group (all children); the process alone if the group kill fails."""
+    try:
+        (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
+    except OSError:  # ProcessLookupError / PermissionError included
+        with contextlib.suppress(Exception):
+            proc.kill()
+
+
 class LocalEnvironment(BaseEnvironment):
     """Run commands directly on the host: every execute() spawns a fresh bash;
     the session snapshot preserves exported env vars across calls (unless
@@ -1181,7 +1190,13 @@ class LocalEnvironment(BaseEnvironment):
                 from gateway.status import get_process_start_time
                 proc._hermes_pgid_start = get_process_start_time(proc.pid)
         if stdin_data is not None:
-            _pipe_stdin(proc, stdin_data)
+            try:
+                _pipe_stdin(proc, stdin_data)
+            except Exception as exc:
+                # Popen already succeeded, so the shell exists and may already be running: a caller
+                # must not retry this as a pre-spawn failure. Nothing will wait on it, so stop it here.
+                _stop_unwaited_spawn(proc, self._kill_process)
+                raise PostSpawnExecutionError(str(exc)) from exc
         return proc
 
     def _wait_for_process(self, proc, *args, **kwargs) -> dict:
@@ -1198,11 +1213,7 @@ class LocalEnvironment(BaseEnvironment):
 
     def _kill_process(self, proc):
         """Kill the entire process group (all children)."""
-        try:
-            (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
-        except OSError:  # ProcessLookupError / PermissionError included
-            with contextlib.suppress(Exception):
-                proc.kill()
+        _kill_process_tree(proc)
 
     def _force_kill_process(self, proc):
         """SIGKILL the whole group with no TERM grace or wait: the caller os._exit()s next."""
