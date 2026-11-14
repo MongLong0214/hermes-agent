@@ -840,17 +840,19 @@ class GatewayStartupMixin:
 
     async def _consume_if_answered(self, record: dict) -> bool:
         """When the record's message already has its final reply in the transcript, owe that reply
-        through the delivery ledger (the crash-left row the boot sweep claims and redelivers, a no-op
-        when the same reply was ledgered since the message was asked) and then delete the record.
-        False, keeping the record to be re-admitted, when there is no answer, it cannot be matched, or
-        no ledger can owe it."""
+        through the delivery ledger and then delete the record. The reply is owed under the record the
+        user row names (``inbound:<recovery id>``), the identity normal delivery ledgers it under
+        (platforms/base.py, _record_delivery_obligation): the crash-left row the boot sweep claims and
+        redelivers is a no-op when that reply was already ledgered or delivered, and every record folded
+        into the row's message owes the same one row. False, keeping the record to be re-admitted, when
+        there is no answer, it cannot be matched, or no ledger can owe it."""
         from gateway import shutdown_flush
         from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
         from hermes_cli.timefmt import coerce_epoch
         found = await self._inbound_record_answer(record)
         if found is None:
             return False
-        history, asked_at, origin = found
+        history, asked_at, origin, answered_as = found
         text = self._crash_left_reply(history, 0.0, origin)
         if text is None:
             return False
@@ -859,10 +861,11 @@ class GatewayStartupMixin:
             if not await asyncio.to_thread(ledger_enabled):
                 return False  # nothing could owe the answer: the message runs again instead
             source = shutdown_flush.inbound_event_from_record(record).source
-            # Keyed by the record alone: another message answered with the same text is its own delivery.
+            # Keyed by the answered record alone: another message answered with the same text is its own
+            # delivery.
             await asyncio.to_thread(
                 record_crash_left_reply,
-                obligation_id=compute_obligation_id(key, f"inbound:{recovery_id}", text), session_key=key,
+                obligation_id=compute_obligation_id(key, f"inbound:{answered_as}", text), session_key=key,
                 platform=str(getattr(source.platform, "value", source.platform)), chat_id=source.chat_id,
                 thread_id=source.thread_id, content=text, since=coerce_epoch(asked_at) or 0.0,
                 adapter_profile=record.get("transport_profile"), same_reply_dedupe=False)
@@ -872,13 +875,18 @@ class GatewayStartupMixin:
         return True
 
     async def _inbound_record_answer(self, record: dict):
-        """``(history up to the answer, asked-at timestamp, origin)`` when the record's message already
-        has its final, completed answer in the transcript, else None. The user row is the one that
-        names the record (``display_metadata.inbound_recovery_id``, written when the turn persists it);
-        the answer is the next assistant row before another user row that ended the model's turn
-        (``finish_reason`` "stop", no tool calls, text, not the failed-turn notice). A fragment, a
-        truncated ("length") or interrupted reply does not count: the message runs again."""
+        """``(history up to the answer, asked-at timestamp, origin, answered record id)`` when the
+        record's message already has its final, completed answer in the transcript, else None. The user
+        row is the one that names the record, as its own (``display_metadata.inbound_recovery_id``,
+        written when the turn persists it, the answered record id) or as a message folded into it
+        (``inbound_absorbed_ids``). The answer is the next assistant row before another user row that
+        completed the turn: no tool calls, text, not the failed-turn notice, and either the model ended
+        its turn there (``finish_reason`` "stop") or the finalizer closed a completed turn with it
+        (``display_metadata.turn_completed``, agent/turn_finalizer.py, a recovery or fallback reply). A
+        fragment, a truncated ("length"), interrupted or failed reply does not count: the message runs
+        again."""
         from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND
+        from agent.message_metadata import TURN_COMPLETED_METADATA_KEY
         recovery_id = record["recovery_id"]
         entry = self.session_store.lookup_by_session_key_existing(record["session_key"])
         if entry is None:
@@ -887,14 +895,18 @@ class GatewayStartupMixin:
             history = await self.async_session_store.load_transcript(entry.session_id)
         except Exception:
             return None
-        answer = asked_at = None
+        answer = asked_at = answered_as = None
         asking = False
         for index, row in enumerate(history):
+            meta = row.get("display_metadata") if isinstance(row.get("display_metadata"), dict) else {}
             if row.get("role") == "user":
-                asking = (row.get("display_metadata") or {}).get("inbound_recovery_id") == recovery_id
-                if asking:
-                    answer, asked_at = None, row.get("timestamp")  # a later copy of the message is asked anew
-            elif (asking and row.get("role") == "assistant" and row.get("finish_reason") == "stop"
+                absorbed = meta.get("inbound_absorbed_ids")
+                asking = meta.get("inbound_recovery_id") == recovery_id or (
+                    isinstance(absorbed, list) and recovery_id in absorbed)
+                if asking:  # a later copy of the message is asked anew
+                    answer, asked_at, answered_as = None, row.get("timestamp"), meta.get("inbound_recovery_id")
+            elif (asking and row.get("role") == "assistant"
+                  and (row.get("finish_reason") == "stop" or meta.get(TURN_COMPLETED_METADATA_KEY) is True)
                   and not row.get("tool_calls") and isinstance(row.get("content"), str) and row["content"].strip()
                   and row.get("display_kind") != FAILED_TURN_DISPLAY_KIND):
                 answer, asking = index, False
@@ -907,7 +919,7 @@ class GatewayStartupMixin:
         else:
             from gateway import shutdown_flush
             origin = shutdown_flush.inbound_event_from_record(record).source
-        return history[:answer + 1], asked_at, origin
+        return history[:answer + 1], asked_at, origin, answered_as or recovery_id
 
     def _event_is_queued(self, session_key: str, event: MessageEvent) -> bool:
         """*event* waits in the session's queue: the pending slot, the FIFO overflow, or a busy-text

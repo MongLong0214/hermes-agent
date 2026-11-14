@@ -22,6 +22,13 @@ PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset({
     "_peer_sidecar_verified",
 })
 
+# ``display_metadata`` key the turn finalizer sets on the closing assistant row it writes for a
+# completed turn (a recovery or fallback reply that had no row of its own; agent/turn_finalizer.py,
+# _close_transcript_tail). Such a row has no provider ``finish_reason``, so this is what tells it
+# apart from an interrupted or failed close when a restart judges whether a message was answered
+# (gateway/run_startup.py, _inbound_record_answer).
+TURN_COMPLETED_METADATA_KEY = "turn_completed"
+
 _Message = TypeVar("_Message", bound=MutableMapping[str, Any])
 
 

@@ -747,7 +747,8 @@ def _crash_now(h, monkeypatch):
     store = h.runner.session_store
     for name in ("clear_turn_active", "mark_resume_pending", "clear_resume_pending", "mark_turn_active"):
         monkeypatch.setattr(store, name, lambda *args, **kwargs: False)
-    monkeypatch.setattr(h.runner, "_settle_inbound_record", lambda *args, **kwargs: None, raising=False)
+    for name in ("_settle_inbound_record", "_consume_inbound_record_id", "_discard_inbound_records"):
+        monkeypatch.setattr(h.runner, name, lambda *args, **kwargs: None, raising=False)
 
 
 def _persisting_agents(monkeypatch, fragment=None):
@@ -770,9 +771,11 @@ def _persisting_agents(monkeypatch, fragment=None):
             flusher = SimpleNamespace(_persist_user_message_override=kw.get("persist_user_message"),
                                       _persist_user_message_timestamp=None)
             user = {"role": "user", "content": text, "platform_message_id": kw.get("persist_user_platform_id")}
-            recovery_id = (kw.get("persist_user_display_metadata") or {}).get("inbound_recovery_id")
+            metadata = kw.get("persist_user_display_metadata") or {}
+            recovery_id = metadata.get("inbound_recovery_id")
             if recovery_id:  # the agent writes the turn's display metadata on its user row
-                user["display_metadata"] = {"inbound_recovery_id": recovery_id}
+                user["display_metadata"] = {key: metadata[key] for key in (
+                    "inbound_recovery_id", "inbound_absorbed_ids") if key in metadata}
             answer = {"role": "assistant", "content": result["final_response"], "finish_reason": "stop"}
             if fragment is not None and recovery_id:  # an owner turn cut off with only a partial reply
                 answer = {"role": "assistant", "content": fragment, "finish_reason": "length"}
@@ -1778,3 +1781,170 @@ def test_a_message_steered_into_a_running_turn_keeps_its_record_until_that_turn_
     asyncio.run(cut_off())
     turns, _inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch))
     assert (sorted(turns), chats, left) == (sorted([_OWNER_TEXT, steered]), ["chat", "chat"], [])
+
+
+# ── Review r3 of 1524ad04 ─────────────────────────────────────────────────────────────────────────
+
+
+def _failing_marker_write(h, monkeypatch):
+    """The next turn's marker write fails (once ``armed`` is set); returns ``(armed, failed)``."""
+    store, failed, armed = h.runner.session_store, [], []
+    mark = store.mark_turn_active
+
+    def transiently_failing_mark(session_key):
+        if armed and not failed:
+            failed.append(session_key)
+            raise OSError("state.db is busy")
+        return mark(session_key)
+    monkeypatch.setattr(store, "mark_turn_active", transiently_failing_mark)
+    return armed, failed
+
+
+def test_a_turn_whose_marker_write_failed_and_whose_reply_never_reached_the_ledger_is_answered(
+        ingress, send, monkeypatch):
+    """Review r3 P1-1: the marker write fails, the agent writes its completed answer, the turn returns
+    the reply to the adapter, and the process dies before that reply is in the delivery ledger. With no
+    marker, the record is the only thing that can owe the answer, so it stays until the reply's
+    obligation exists: the next process delivers the answer once and runs no second turn."""
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    armed, failed = _failing_marker_write(h, monkeypatch)
+    _persisting_agents(monkeypatch)
+    returned, never = asyncio.Event(), asyncio.Event()
+
+    async def before_delivery(*args, **kwargs):
+        returned.set()
+        await never.wait()
+    monkeypatch.setattr(h.adapter, "_extract_response_content", before_delivery)
+
+    async def run_once():
+        await h.warm()
+        armed.append(True)
+        await h.adapter.handle_message(h.owner_event())
+        await h.wait(returned.is_set, "the owner turn to return its reply to the adapter")
+        _crash_now(h, monkeypatch)
+    asyncio.run(run_once())
+    entry = h.runner.session_store.lookup_by_session_key_existing(h.key)
+    assert failed and h.owner_replies() == [] and entry.active_turn_token is None
+    turns, _inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch, crashed=True))
+    assert (turns, chats, left, _owner_rows(ingress)) == ([], ["chat"], [], 1)
+
+
+def test_a_delivered_answer_whose_record_could_not_be_deleted_is_not_sent_again(ingress, send, monkeypatch):
+    """Review r3 P1-2: the turn completes and its answer is delivered, but deleting its inbound record
+    fails (unlink raises). The next process finds the record answered and owes the answer under the
+    record, the identity the delivered reply was ledgered under, so that obligation is the delivered
+    one: nothing is sent again, no second turn runs, and the record goes."""
+    import pathlib
+
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    _persisting_agents(monkeypatch)
+    unlink, refused = pathlib.Path.unlink, []
+
+    def failing_unlink(path, *args, **kwargs):
+        if path.name.startswith("inbound-"):
+            refused.append(path.name)
+            raise OSError("read-only file system")
+        return unlink(path, *args, **kwargs)
+
+    async def exercise():
+        await h.warm()
+        monkeypatch.setattr(pathlib.Path, "unlink", failing_unlink)
+        await h.adapter.handle_message(h.owner_event())
+        await h.settle()
+    asyncio.run(exercise())
+    monkeypatch.setattr(pathlib.Path, "unlink", unlink)
+    assert refused and len(_records(ingress)) == 1
+    assert [chat for chat, text in h.owner_replies() if _TERMINAL in text] == ["chat"]
+    turns, _inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch))
+    assert (turns, chats, left) == ([], [], [])
+
+
+def test_a_message_merged_into_another_is_answered_by_that_answer_across_a_restart(ingress, send, monkeypatch):
+    """Review r3 P1-3, the reviewer's reconstruction: a message merged into the queued head has no turn
+    of its own, and the head's turn answers both. The process dies after that answer is written and
+    before it is delivered, with both records on disk. The user row names both records, so the next
+    process delivers the one answer once and runs neither message again."""
+    from types import SimpleNamespace
+
+    from agent.session_persistence import _db_flush_row
+    from gateway import shutdown_flush
+    from gateway.platforms.base import merge_pending_message_event
+    from gateway.run_turn import _inbound_row_metadata
+
+    db, sid, key = ingress.runner.session_store._db, ingress.entry.session_id, ingress.entry.session_key
+    events = []
+    for index, text in enumerate((_OWNER_TEXT, "owner: and the logs"), start=1):
+        event = MessageEvent(text=text, message_type=MessageType.TEXT, source=ingress.source, message_id=f"m{index}")
+        shutdown_flush.store_inbound_record(event, session_key=key, transport_profile=None,
+                                            recovery_id=f"fold{index}", order=(1, index))
+        event._inbound_record_id = f"fold{index}"
+        events.append(event)
+    pending = {}
+    merge_pending_message_event(pending, key, events[0])
+    merge_pending_message_event(pending, key, events[1], merge_text=True)
+    head = pending[key]
+    flusher = SimpleNamespace(_persist_user_message_override=None, _persist_user_message_timestamp=None)
+    db.append_messages_batch(sid, [
+        _db_flush_row(flusher, {"role": "user", "content": head.text, "platform_message_id": "m1",
+                                "display_metadata": _inbound_row_metadata(head)}, True),
+        {"role": "assistant", "content": f"{_TERMINAL} / both", "finish_reason": "stop"}])
+    turns, _inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch))
+    assert (turns, chats, left) == ([], ["chat"], [])
+
+
+def _finalized_turn(ingress, monkeypatch, *, failed):
+    """The agent's own finalizer closes a turn whose reply had no row of its own (a fallback or
+    recovery exit), and the rows it persists (the user row naming the record, and the closing reply)
+    are what the next process reads. The record is on disk. Returns the reply text."""
+    from types import SimpleNamespace
+
+    from agent.session_persistence import _db_flush_row
+    from agent.turn_finalizer import finalize_turn
+    from gateway import shutdown_flush
+    from tests.agent.test_turn_finalizer_final_response_persistence import FakeAgent
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    db, sid, key = ingress.runner.session_store._db, ingress.entry.session_id, ingress.entry.session_key
+    event = MessageEvent(text=_OWNER_TEXT, message_type=MessageType.TEXT, source=ingress.source, message_id="m1")
+    shutdown_flush.store_inbound_record(event, session_key=key, transport_profile=None,
+                                        recovery_id="fallback", order=(1, 1))
+    reply = f"{_TERMINAL} / " + ("the provider failed" if failed else "recovered from the earlier text")
+    agent = FakeAgent()
+    finalize_turn(
+        agent, final_response=reply, api_call_count=1, interrupted=False, failed=failed,
+        messages=[{"role": "user", "content": _OWNER_TEXT, "display_metadata": {"inbound_recovery_id": "fallback"}}],
+        conversation_history=[], effective_task_id="task", turn_id="turn", user_message=_OWNER_TEXT,
+        original_user_message=_OWNER_TEXT, _should_review_memory=False,
+        _turn_exit_reason="fallback_prior_turn_content")
+    user, closing = agent.persisted_messages
+    assert closing["role"] == "assistant" and closing["content"] == reply and "finish_reason" not in closing
+    flusher = SimpleNamespace(_persist_user_message_override=None, _persist_user_message_timestamp=None)
+    db.append_messages_batch(sid, [_db_flush_row(flusher, user, True), _db_flush_row(flusher, closing, False)])
+    return reply
+
+
+def test_a_fallback_reply_the_finalizer_closed_a_completed_turn_with_is_answered_once(
+        ingress, send, monkeypatch):
+    """Review r3 P1-4: a completed turn whose reply came from a fallback exit is closed by the finalizer
+    with a row that has no finish_reason. A crash leaves the record and the turn marker. The finalizer
+    marked that row as the completed turn's answer, so the record recognises it: the answer is
+    delivered once (the marker's recovery finds it already owed) and the message runs no second turn."""
+    ingress.runner.session_store.mark_turn_active(ingress.entry.session_key)  # held from the turn's start
+    reply = _finalized_turn(ingress, monkeypatch, failed=False)
+    entry = ingress.runner.session_store.lookup_by_session_key_existing(ingress.entry.session_key)
+    assert entry.active_turn_token is not None
+    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    turns, _inputs, chats, left = _answered(ingress, nxt)
+    assert (turns, chats, left) == ([], ["chat"], [])
+    assert [text for _chat, text, _meta in nxt.adapter.sent_calls if reply in text] != []
+
+
+def test_a_failed_turn_the_finalizer_closed_is_not_taken_as_the_answer(ingress, send, monkeypatch):
+    """The other side of review r3 P1-4: a failed turn's reply is closed by the same finalizer branch,
+    unmarked. It is not a completed answer: the next process runs the message again and never sends
+    the failed reply as its answer."""
+    reply = _finalized_turn(ingress, monkeypatch, failed=True)
+    nxt = _next_process(ingress, send, monkeypatch)
+    turns, _inputs, chats, left = _answered(ingress, nxt)
+    assert (turns, chats, left) == ([_OWNER_TEXT], ["chat"], [])
+    assert not any(reply in text for _chat, text, _meta in nxt.adapter.sent_calls)

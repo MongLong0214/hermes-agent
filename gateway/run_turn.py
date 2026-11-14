@@ -164,10 +164,19 @@ def hygiene_no_commit_reason(agent) -> str:
 
 
 def _inbound_row_metadata(event: Any) -> dict:
-    """``{"inbound_recovery_id": ...}`` for the user row of a turn whose message has an inbound record
-    (gateway/shutdown_flush.py), else ``{}``."""
-    recovery_id = getattr(event, "_inbound_row_id", None) or getattr(event, "_inbound_record_id", None)
-    return {"inbound_recovery_id": recovery_id} if isinstance(recovery_id, str) and recovery_id else {}
+    """``{"inbound_recovery_id": ..., "inbound_absorbed_ids": [...]}`` for the user row of a turn whose
+    message has an inbound record (gateway/shutdown_flush.py), else ``{}``: the message's own record
+    and the records of the messages merged into it or replaced by it before the turn, whose answer is
+    this row's answer. A restart finds each of them answered on this row (gateway/run_startup.py,
+    _inbound_record_answer)."""
+    if getattr(event, "_inbound_row_id", None):
+        recovery_id, absorbed = event._inbound_row_id, getattr(event, "_inbound_row_absorbed", ())
+    else:
+        recovery_id, absorbed = getattr(event, "_inbound_record_id", None), getattr(event, "_inbound_carried", ())
+    if not (isinstance(recovery_id, str) and recovery_id):
+        return {}
+    absorbed = [rid for rid in absorbed or () if isinstance(rid, str) and rid and rid != recovery_id]
+    return {"inbound_recovery_id": recovery_id, **({"inbound_absorbed_ids": absorbed} if absorbed else {})}
 
 
 class GatewayTurnMixin:
@@ -2325,6 +2334,9 @@ class GatewayTurnMixin:
         _terminal_inbound = agent_result.get("queued_terminal_inbound_id")
         if _terminal_inbound:
             event.ledger_message_id = str(_terminal_inbound)
+        if "queued_terminal_inbound_id" in agent_result:
+            # The chain's final is owed under its last message's inbound record, when it has one.
+            event._inbound_answer_ref = agent_result.get("queued_terminal_inbound_record")
         if "queued_terminal_inbound_id" in agent_result and getattr(event, "_acp_admission", None) is not None:
             # A follow-up ran (with or without a platform id: a leftover steer has none), so the outer
             # final answers that follow-up, not the managed /acp task. It must never carry, and so
@@ -4013,6 +4025,9 @@ class GatewayTurnMixin:
                 _already_streamed = False
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
+        # A message with an inbound record is owed under that record (platforms/base.py,
+        # _record_delivery_obligation), the identity a restart owes its answer under.
+        _row_record = (turn_ctx.persist_user_display_metadata or {}).get("inbound_recovery_id")
         if first_response:
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
@@ -4028,7 +4043,8 @@ class GatewayTurnMixin:
                     deliver_media=_deliver_media, stream_consumer=_sc,
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
-                    session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                    session_key=session_key,
+                    inbound_message_id=f"inbound:{_row_record}" if _row_record else turn_ctx.inbound_message_id,
                     acp_admission=await self._acp_first_response_admission(turn_ctx, _delivery_result),
                 )
             except Exception as e:
@@ -4091,9 +4107,10 @@ class GatewayTurnMixin:
         if not result.get("interrupted"):
             await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
             # This level's message has its answer handed to the delivery ledger (or delivered): its
-            # inbound record is done, before the follow-up runs.
-            self._consume_inbound_record_id(
-                (turn_ctx.persist_user_display_metadata or {}).get("inbound_recovery_id"))
+            # inbound record, and those of the messages folded into it, are done before the follow-up runs.
+            _row = turn_ctx.persist_user_display_metadata or {}
+            for _done in (_row.get("inbound_recovery_id"), *(_row.get("inbound_absorbed_ids") or ())):
+                self._consume_inbound_record_id(_done)
 
         updated_history = result.get("messages", history)
         next_source, next_message, next_session_key = source, pending, session_key
@@ -4202,11 +4219,18 @@ class GatewayTurnMixin:
             raise
         await _run_followup_processing_hook(
             _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
-        # The drained message's own turn has ended: its record goes, unless a restart cut that turn
-        # short (it stays for the next process, as the outer turn's would).
+        # The drained message's own turn has ended, unless a restart cut that turn short (its record then
+        # stays for the next process, as the outer turn's would). Its answer is the final the adapter
+        # sends once the outer turn returns, so its records ride the outer turn's event and go with
+        # them, once that reply is in the delivery ledger (run_inbound.py, _settle_inbound_record).
         from gateway.run import _should_clear_resume_pending_after_turn
+        from gateway.shutdown_flush import carry_inbound_records
         if not (self._draining and not _should_clear_resume_pending_after_turn(followup_result)):
-            self._discard_inbound_records(pending_event)
+            _outer = getattr(getattr(self._peek_session_state(session_key), "turn", None), "event", None)
+            if _outer is not None and _outer is not pending_event:
+                carry_inbound_records(_outer, pending_event)
+            else:
+                self._discard_inbound_records(pending_event)
         merged = _preserve_queued_followup_history_offset(result, followup_result)
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal
@@ -4218,6 +4242,7 @@ class GatewayTurnMixin:
             merged = {
                 **merged,
                 "queued_terminal_inbound_id": next_inbound_id,
+                "queued_terminal_inbound_record": _inbound_row_metadata(pending_event).get("inbound_recovery_id"),
                 "queued_terminal_display_kind": next_display_kind,
                 "queued_terminal_notification_category": (
                     (pending_event.metadata or {}).get("notification_category", "result")

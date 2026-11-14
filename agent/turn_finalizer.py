@@ -16,7 +16,7 @@ from agent.delegation_context import is_dispatcher_owned_worker_context
 from agent.turn_failure_copy import exit_reason_failure, stamp_failure
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
-from agent.message_metadata import append_message, stamp_message_timestamp
+from agent.message_metadata import TURN_COMPLETED_METADATA_KEY, append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
 from agent.served_model import result_model_fields
 
@@ -227,9 +227,12 @@ def _recover_final_from_stream(agent, final_response, interrupted, failed) -> Tu
     return final_response, False
 
 
-def _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream) -> None:
+def _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream,
+                           completed: bool = False) -> None:
     """Shape the transcript tail before the durable snapshot (scaffolding already dropped
-    and ``final_response`` already stream-recovered by the caller)."""
+    and ``final_response`` already stream-recovered by the caller). ``completed``: the turn
+    completed (finalize_turn's verdict), so a closing row this appends is marked as the turn's
+    completed answer (``TURN_COMPLETED_METADATA_KEY``); a failed turn's close is not."""
     # An interrupt can leave a tool result as the tail; close the sequence so strict
     # providers don't see ``tool → user`` (placeholder: final_response is usually empty).
     if interrupted:
@@ -252,7 +255,10 @@ def _close_transcript_tail(agent, messages, final_response, interrupted, _recove
         # (#65919 §7)
         _tail = messages[-1] if messages else None
         if not isinstance(_tail, dict) or _tail.get("role") != "assistant":
-            append_message(messages, {"role": "assistant", "content": final_response})
+            _closing = {"role": "assistant", "content": final_response}
+            if completed:  # no provider finish_reason on this row: a restart reads the mark instead
+                _closing["display_metadata"] = {TURN_COMPLETED_METADATA_KEY: True}
+            append_message(messages, _closing)
         elif (
             _tail.get("content") != final_response
             and _assistant_row_missing_visible_text(_tail)
@@ -580,7 +586,8 @@ def finalize_turn(
         # user will see, never the raw model text (#44239).
         if final_response and not interrupted:
             final_response, _, _ = apply_llm_output_transform(agent, final_response, turn_id=turn_id, logger=logger)
-        _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
+        _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream,
+                               completed=completed)
         if not interrupted and not failed:
             _micro_compact_after_turn(agent, messages, final_response, logger, effective_task_id)
         agent._persist_session(messages, conversation_history)

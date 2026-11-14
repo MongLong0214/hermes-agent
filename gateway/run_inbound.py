@@ -1413,7 +1413,7 @@ class GatewayInboundMixin:
             if _acp_managed:
                 # The receipt is claimed but the turn will not run: record the definite non-run.
                 acp_managed_ingress.abort_claimed(event._acp_admission)
-            self._settle_inbound_record(_incoming, _quick_key, completed=True)
+            self._settle_inbound_record(_incoming, _quick_key, completed=True, delivery=_incoming)
             return _limit_message
 
         _settled_event = _incoming  # whose inbound record this turn settles when it ends
@@ -1429,9 +1429,13 @@ class GatewayInboundMixin:
                 _settled_event = event
                 if getattr(event, "_inbound_record_id", None):
                     event._inbound_record_claimed = True
-        # The transcript's user row for this turn names its record, which is how a restart tells it
-        # answered (gateway/run_startup.py, _inbound_record_answer).
+        # The transcript's user row for this turn names its record and the records folded into it before
+        # the turn, which is how a restart tells them answered (gateway/run_startup.py,
+        # _inbound_record_answer). The turn's reply is owed under the record the row names, or under a
+        # chained follow-up's when the turn ends on one (run_turn.py, _adopt_queued_terminal).
         event._inbound_row_id = getattr(_settled_event, "_inbound_record_id", None)
+        event._inbound_row_absorbed = list(getattr(_settled_event, "_inbound_carried", ()))
+        event._inbound_answer_ref = event._inbound_row_id
 
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:
@@ -1482,7 +1486,11 @@ class GatewayInboundMixin:
             try:
                 # Record before marker: a death between the two leaves the marker, whose recovery
                 # already covers a turn that ended (gateway/run_startup.py, _recover_unclean_sessions).
-                self._settle_inbound_record(_settled_event, _quick_key, completed=_turn_ended, also=event)
+                # The adapter ledgers the reply under the record it answers and deletes the records
+                # once that obligation exists (platforms/base.py, _release_turn_marker).
+                _incoming._inbound_ledger_ref = getattr(event, "_inbound_answer_ref", None)
+                self._settle_inbound_record(_settled_event, _quick_key, completed=_turn_ended, also=event,
+                                            delivery=_incoming)
                 # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean
                 # startup's recovery pass. A turn the adapter delivers hands its marker to that
                 # lifecycle, which clears it only once the reply is in the delivery ledger (else a
@@ -1592,12 +1600,17 @@ class GatewayInboundMixin:
             return None
 
     def _settle_inbound_record(self, event: Optional[MessageEvent], session_key: str, *, completed: bool,
-                               also: Optional[MessageEvent] = None) -> None:
+                               also: Optional[MessageEvent] = None,
+                               delivery: Optional[MessageEvent] = None) -> None:
         """The turn holding *event*'s inbound record (and the records folded into it or into *also*, the
         turn's own event) has ended. Cut short by a restart, the records stay for the next process: the
         turn raised or was cancelled while the gateway drains, or it returned while its session is
         still resume_pending (the drain marks a running session before it interrupts it, and only a
-        completed turn clears the mark). Any other end deletes them."""
+        completed turn clears the mark). A turn that returned to an adapter that delivers its reply
+        (*delivery*, the adapter's event, handed the turn marker) hands the records to that delivery:
+        they go only once the reply's obligation is in the delivery ledger or nothing is owed
+        (platforms/base.py, _release_turn_marker), so a death before then leaves the record for the next
+        start to deliver its answer or run it again. Any other end deletes them."""
         from gateway import shutdown_flush
         events = [e for e in (event, also) if e is not None and shutdown_flush.inbound_record_ids(e)]
         if not events or (also is event and len(events) > 1):
@@ -1608,6 +1621,14 @@ class GatewayInboundMixin:
             if self._draining and not (completed and not self._resume_still_pending(session_key)):
                 logger.info("A restart cut the turn on %s short; its inbound record stays for the next "
                             "process", session_key)
+                return
+            if completed and delivery is not None and getattr(delivery, "_turn_marker_handoff", False):
+                owed = [rid for each in events for rid in shutdown_flush.inbound_record_ids(each)]
+                for each in events:
+                    each._inbound_record_id = each._inbound_record_order = None
+                    each._inbound_carried = []
+                delivery._inbound_records_on_delivery = [
+                    *(getattr(delivery, "_inbound_records_on_delivery", None) or ()), *owed]
                 return
             for each in events:
                 self._discard_inbound_records(each)

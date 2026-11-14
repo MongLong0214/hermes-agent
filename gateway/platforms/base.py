@@ -4278,7 +4278,14 @@ class BasePlatformAdapter(ABC):
             _ledger_id = getattr(event, "ledger_message_id", None)
             if _ledger_id is None:
                 _ledger_id = getattr(event, "message_id", "")
-            if _handed_off:
+            _inbound_ref = getattr(event, "_inbound_ledger_ref", None)
+            if _inbound_ref:
+                # The reply to an owner message that has an inbound record is owed under that record,
+                # the identity startup recovery owes an answered record under (gateway/run_startup.py,
+                # _consume_if_answered), not the platform message id: a record still on disk after
+                # this obligation (its delete failed) is then recognised as owed, never sent again.
+                _ledger_id = f"inbound:{_inbound_ref}"
+            elif _handed_off:
                 # This reply answers something other than the managed task the event opened (a
                 # follow-up, an error notice). It must never share the managed answer's obligation id,
                 # or a same-text reply would overwrite that row and erase its ACP correlation.
@@ -4431,12 +4438,26 @@ class BasePlatformAdapter(ABC):
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
         return result, delivery_adapter
 
-    async def _release_turn_marker(self, event: MessageEvent) -> None:
-        """Clear the crash-recovery marker the runner handed to this delivery lifecycle
-        (``_turn_marker_handoff``): only once the final reply is ledgered or nothing more is owed,
-        so no kill leaves a persisted reply with neither marker nor ledger row. Idempotent."""
+    async def _release_turn_marker(self, event: MessageEvent, *, cut_short: bool = False) -> None:
+        """Clear the crash-recovery state the runner handed to this delivery lifecycle: the turn
+        marker (``_turn_marker_handoff``) and the turn's inbound records
+        (``_inbound_records_on_delivery``, gateway/run_inbound.py, _settle_inbound_record). Only once
+        the final reply is ledgered or nothing more is owed, so no kill leaves a persisted reply with
+        neither marker, record nor ledger row. ``cut_short``: the delivery ended early while the
+        gateway drains for a restart, so the records stay for the next process. Idempotent."""
         if getattr(event, "_turn_marker_handoff", False) and getattr(event, "_gateway_active_turn_token", None):
             await self.gateway_runner._clear_durable_active_turn(event)
+        records = getattr(event, "_inbound_records_on_delivery", None)
+        if records:
+            event._inbound_records_on_delivery = []
+            if cut_short:
+                return
+            try:
+                for recovery_id in records:
+                    self.gateway_runner._consume_inbound_record_id(recovery_id)
+            except Exception:
+                logger.warning("[%s] Deleting the inbound records of a delivered turn failed", self.name,
+                               exc_info=True)
 
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],
@@ -4734,8 +4755,11 @@ class BasePlatformAdapter(ABC):
                 raise
         finally:
             self._settle_unclaimed_inbound(event, ended=handler_returned)
-            await self._release_turn_marker(event)
+            # Records still handed over here were never ledgered (the delivery raised or was cancelled).
+            await self._release_turn_marker(
+                event, cut_short=getattr(self.gateway_runner, "_draining", False) is True)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
+            event._inbound_ledger_ref = None
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
