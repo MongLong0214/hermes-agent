@@ -512,15 +512,13 @@ def read_yaml_layers(home: Path) -> dict:
     # hermes_cli.config.load_config, so managed quick_commands / stt would otherwise be ignored).
     from hermes_cli import managed_scope
     # Canonical bindings are server-owned: when the managed layer declares them (either spelling, an
-    # explicit empty or null included) they replace the user's and never merge with them. The overlay
-    # reads the managed file again, so the user's are held out of it and come back only when neither
-    # read declared any: a rewrite between the reads, or an overlay that failed open, leaves none.
-    managed_declares = _declares_canonical_bindings(managed_scope.load_managed_config())
-    yaml_cfg, user_bindings = _hold_out_canonical_bindings(yaml_cfg)
-    merged = managed_scope.apply_managed_overlay(yaml_cfg)
-    if not managed_declares and not _declares_canonical_bindings(merged):
-        _restore_canonical_bindings(merged, user_bindings)
-    return merged
+    # explicit empty or null included) they replace the user's and never merge with them. One managed
+    # snapshot both decides that and is the one applied, so a rewrite of the file cannot split them,
+    # and an overlay that fails open after the user's were dropped leaves none.
+    managed_cfg = managed_scope.load_managed_config()
+    if _declares_canonical_bindings(managed_cfg):
+        yaml_cfg = _without_canonical_bindings(yaml_cfg)
+    return managed_scope.apply_managed_overlay(yaml_cfg, managed_config=managed_cfg)
 
 
 _CANONICAL_BINDINGS = "canonical_surface_bindings"
@@ -532,28 +530,17 @@ def _declares_canonical_bindings(cfg: Any) -> bool:
         _CANONICAL_BINDINGS in cfg or (isinstance(gateway, dict) and _CANONICAL_BINDINGS in gateway))
 
 
-def _hold_out_canonical_bindings(cfg: Any) -> tuple[Any, dict]:
-    """*cfg* without either binding spelling (copied only where one was removed), and what was removed."""
-    held: dict = {}
+def _without_canonical_bindings(cfg: Any) -> Any:
+    """*cfg* without either binding spelling, copied only where one is removed; gateway siblings stay."""
     if not _declares_canonical_bindings(cfg):
-        return cfg, held
+        return cfg
     cfg = dict(cfg)
-    if _CANONICAL_BINDINGS in cfg:
-        held["top"] = cfg.pop(_CANONICAL_BINDINGS)
+    cfg.pop(_CANONICAL_BINDINGS, None)
     gateway = cfg.get("gateway")
     if isinstance(gateway, dict) and _CANONICAL_BINDINGS in gateway:
         gateway = cfg["gateway"] = dict(gateway)
-        held["gateway"] = gateway.pop(_CANONICAL_BINDINGS)
-    return cfg, held
-
-
-def _restore_canonical_bindings(cfg: Any, held: dict) -> None:
-    if not isinstance(cfg, dict):
-        return
-    if "top" in held:
-        cfg[_CANONICAL_BINDINGS] = held["top"]
-    if "gateway" in held and isinstance(cfg.get("gateway"), dict):
-        cfg["gateway"][_CANONICAL_BINDINGS] = held["gateway"]
+        gateway.pop(_CANONICAL_BINDINGS)
+    return cfg
 
 
 def load_yaml_layer(home: Path, gw_data: dict) -> Any:
