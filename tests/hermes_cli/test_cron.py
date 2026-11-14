@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from cron.jobs import create_job, get_job, list_jobs, load_jobs, pause_job, save_jobs
+from cron.jobs_public_status import public_delivery_error
 from hermes_cli import cron as cron_cli
 from hermes_cli.cron import cron_command
 from hermes_cli.subcommands.cron import build_cron_parser
@@ -587,7 +588,10 @@ class TestSlashCronListLastStatus:
         save_jobs(jobs)
 
         out = self._run_list(tmp_cron_dir, capsys)
-        assert "Last run: 2026-09-01T07:00:00+00:00 (delivery_failed: telegram: 502 Bad Gateway)" in out
+        # The chat-facing list serves the closed label even for a record written raw by an older build.
+        closed = public_delivery_error("telegram: 502 Bad Gateway")
+        assert f"Last run: 2026-09-01T07:00:00+00:00 (delivery_failed: {closed})" in out
+        assert "502 Bad Gateway" not in out
 
 
 

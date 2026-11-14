@@ -131,10 +131,11 @@ def test_delivered_run_keeps_its_terminal_status_when_claim_sample_misses_after_
         assert "failed" in delivered[0], "the failure notice, not the (empty) report, was delivered"
     assert hb.missed == 1, "exactly the post-delivery sample missed"
     assert cancel.is_set() is False, "the run's loss latch must not cancel the caller's transport"
+    from cron.jobs_public_status import public_run_error
     record = get_job(job["id"])
     assert record["last_status"] == expected_status
-    assert record["last_error"] == expected_error
-    assert record["last_error"] != sched._OWNERSHIP_LOST_INTERRUPTED
+    assert record["last_error"] == public_run_error(expected_error)
+    assert record["last_error"] != public_run_error(sched._OWNERSHIP_LOST_INTERRUPTED)
     assert record["failure_streak"] == (0 if success else 1)
 
 
@@ -163,7 +164,8 @@ def test_transport_cancel_during_delivery_stays_fail_closed(temp_home, monkeypat
     assert hb.missed == 0, "the sampled claim never missed — only the transport event fired"
     record = get_job(job["id"])
     assert record["last_status"] == "error"
-    assert record["last_error"] == sched._OWNERSHIP_LOST_INTERRUPTED
+    from cron.jobs_public_status import public_run_error
+    assert record["last_error"] == public_run_error(sched._OWNERSHIP_LOST_INTERRUPTED)
 
 
 class _HeartbeatThreadMisses:
