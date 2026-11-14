@@ -1,23 +1,26 @@
 """Tests for Vertex AI runtime-provider resolution and profile registration.
 
-Covers: provider-profile registration + aliases, alias canonicalization,
-resolve_runtime_provider(vertex) minting an OAuth token, and the friendly
-AuthError when credentials can't be resolved. No network calls.
+Covers: provider-profile registration + aliases, and the Google outbound
+denial: resolve_runtime_provider(vertex) is refused before any credential is
+read or token minted. No network calls.
 """
 
 from __future__ import annotations
 
 import pytest
 
+from agent.gemini_outbound_policy import GeminiOutboundDenied
 
-def test_resolve_runtime_provider_raises_autherror_when_unresolved(monkeypatch):
+
+def test_resolve_runtime_provider_refuses_vertex_before_credentials(monkeypatch):
     import agent.vertex_adapter as va
     from hermes_cli import runtime_provider as rp
-    from hermes_cli.auth import AuthError
 
-    monkeypatch.setattr(va, "get_vertex_config", lambda: (None, None))
-    with pytest.raises(AuthError):
+    touched = []
+    monkeypatch.setattr(va, "get_vertex_config", lambda *a, **k: touched.append("get_vertex_config"))
+    with pytest.raises(GeminiOutboundDenied):
         rp.resolve_runtime_provider(requested="vertex")
+    assert touched == []
 
 
 def test_vertex_registered_in_provider_registry():
@@ -93,27 +96,12 @@ def _vertex_cli_shell(monkeypatch, tmp_path, *, loadable: bool):
     return shell, mints
 
 
-def test_gateway_backed_cli_resolves_vertex_route_without_minting(monkeypatch, tmp_path):
-    """The classic CLI is a thin client: the gateway session mints the Vertex token for the turn it
-    runs. Resolving the CLI's route must not run a second OAuth exchange per launch."""
+def test_gateway_backed_cli_refuses_vertex_route_before_minting(monkeypatch, tmp_path, capsys):
+    """A Vertex route is Google outbound: the CLI refuses it with the fixed denial copy and never
+    mints an OAuth token, even with loadable service-account credentials."""
     shell, mints = _vertex_cli_shell(monkeypatch, tmp_path, loadable=True)
 
-    assert shell._ensure_runtime_credentials() is True
-    assert mints == [], "the CLI process minted a Vertex token the gateway mints again"
-    assert shell.provider == "vertex"
-    assert shell.base_url == (
-        "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/sa-proj/locations/us-central1/endpoints/openapi")
-    assert callable(shell.api_key)
-    # A caller that really sends from this process still gets a token, minted once and reused.
-    assert shell.api_key() == shell.api_key() == "ya29.minted-1"
-    assert mints == [1]
-
-
-def test_gateway_backed_cli_keeps_vertex_credential_failure_copy(monkeypatch, tmp_path, capsys):
-    """Unloadable Vertex credentials still fail in the CLI with main's actionable copy."""
-    shell, mints = _vertex_cli_shell(monkeypatch, tmp_path, loadable=False)
-
     assert shell._ensure_runtime_credentials() is False
-    err = capsys.readouterr().err
-    assert "Vertex AI credentials could not be resolved" in err and "VERTEX_CREDENTIALS_PATH" in err, err
+    assert GeminiOutboundDenied.public_message in capsys.readouterr().err
     assert mints == []
+    assert shell.provider is None and shell.base_url is None

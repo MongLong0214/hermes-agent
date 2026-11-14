@@ -10,8 +10,10 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 from hermes_cli.providers import custom_provider_aliases, custom_provider_slug
+from agent.gemini_outbound_policy import deny_gemini_outbound
 from agent.custom_entry_pool import custom_entry_for_endpoint, entry_declares_credential, entry_scoped_pool
 from agent.secret_scope import get_secret_str
 from utils import base_url_hostname
@@ -77,6 +79,18 @@ def _model_cfg_key_env_for(model_cfg: dict[str, Any], base_url: str) -> str:
 
 def _entry_url(entry: dict[str, Any]) -> str:
     return entry.get("api") or entry.get("url") or entry.get("base_url") or ""
+
+
+def is_usable_custom_provider_url(value: Any) -> bool:
+    """Whether a configured custom endpoint is an HTTP(S) URL with a valid host/port."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        parsed = urlparse(value.strip())
+        parsed.port  # Access validates numeric range as well as syntax.
+    except ValueError:
+        return False
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.hostname)
 
 
 # ── field lifting shared by ``providers:`` and legacy ``custom_providers:`` entries ────────
@@ -268,6 +282,49 @@ def _compatible_entry_path(config: dict[str, Any], entry: dict[str, Any]) -> Opt
     legacy = config.get("custom_providers")
     return next((("custom_providers", i) for i, raw in enumerate(legacy if isinstance(legacy, list) else ())
                  if _normalize_custom_provider_entry(raw) == entry), None)
+
+
+def _route_fact(base_url: Any) -> dict[str, str]:
+    url = _clean(base_url)
+    return {"base_url": url if is_usable_custom_provider_url(url) else ""}
+
+
+def peek_named_custom_provider_route(
+    requested_provider: str, *, config: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, str]]:
+    """Return a named custom provider's non-secret route fact, if configured.
+
+    This follows :func:`_select_named_custom_provider`'s alias matching and ``providers:``-before-legacy
+    precedence, so ``base_url`` is the endpoint the resolver would use, but it deliberately stops before
+    ``key_env`` / ``key_cmd`` handling. An empty ``base_url`` marks a configured alias whose route is
+    unknown or is not an HTTP(S) URL; None means no configured alias matches.
+    """
+    requested_norm = _normalize_custom_provider_name(requested_provider or "")
+    if not requested_norm or requested_norm == "auto" or _shadowed_by_builtin(requested_norm):
+        return None
+    rp = _rp()
+    if config is None:
+        config = rp.load_config()
+    matched = False
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        from hermes_cli.config import is_provider_enabled
+        for ep_name, entry in providers.items():
+            if not isinstance(entry, dict) or not is_provider_enabled(entry):
+                continue
+            if requested_norm not in custom_provider_aliases(str(entry.get("name", "") or ep_name), str(ep_name)):
+                continue
+            matched = True
+            if _entry_url(entry):
+                return _route_fact(_entry_url(entry))
+    if not isinstance(config.get("custom_providers"), dict):
+        for entry in rp.get_compatible_custom_providers(config) or ():
+            name, base_url = (entry.get("name"), entry.get("base_url")) if isinstance(entry, dict) else (None, None)
+            if not isinstance(name, str) or not isinstance(base_url, str):
+                continue
+            if requested_norm in custom_provider_aliases(name, _clean(entry.get("provider_key", ""))):
+                return _route_fact(base_url)
+    return {"base_url": ""} if matched else None
 
 
 def has_named_custom_provider(requested_provider: str) -> bool:
@@ -724,6 +781,9 @@ def _resolve_named_custom_runtime(*, requested_provider: str, explicit_api_key: 
     # silently fall through to OpenRouter.
     requested_norm = (requested_provider or "").strip().lower()
     custom_provider = None
+    # Route facts only: a Google-hosted entry is refused before its key_env / key_cmd is touched.
+    if not explicit_base_url and (route := peek_named_custom_provider_route(requested_provider, config=config)) is not None:
+        deny_gemini_outbound(base_url=route.get("base_url"))
     if requested_norm in _LLAMACPP_ALIASES and not explicit_base_url:
         custom_provider = rp._get_named_custom_provider(requested_provider)
         if not custom_provider:
