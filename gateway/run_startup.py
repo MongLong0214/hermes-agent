@@ -872,7 +872,8 @@ class GatewayStartupMixin:
         with _log_suppressed(logging.WARNING, "Crash-left reply recovery on startup failed: %s"):
             ledgered += await self._ledger_crash_left_replies(max_age, held=held)
         with _log_suppressed(logging.WARNING, "Exact active-turn recovery on startup failed: %s"):
-            resumed = await self.async_session_store.recover_interrupted_turns(max_age_seconds=max_age)
+            resumed = await self.async_session_store.recover_interrupted_turns(
+                max_age_seconds=max_age, hold_tokens=frozenset(held))
         return resumed, ledgered
 
     async def _ledger_managed_chain_followup(self, key: str, token: str) -> bool:
