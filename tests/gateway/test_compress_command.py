@@ -579,3 +579,119 @@ def test_rotated_compress_keeps_atomically_published_foreign_tail(tmp_path, monk
         ]
     finally:
         store.close_all_db_handles()
+
+
+# A raw provider/summariser exception is never legitimate URL content, so every /compress reply that
+# echoes one gets the strict egress scrub: credential-bearing URL query params (no vendor prefix, not a
+# ``Bearer`` shape) are masked along with opaque ``Bearer`` values.
+_SIGNED_URL = "https://x/?sig=SECRET&X-Amz-Signature=S2"
+_OPAQUE_BEARER = "opaqueFixtureToken1234567890ABCDE"
+_PROVIDER_ERROR = (f"litellm.APIError: GET {_SIGNED_URL} failed; "
+                   f"request had Authorization: Bearer {_OPAQUE_BEARER}")
+_LEAKED_VALUES = ("SECRET", "S2", _OPAQUE_BEARER)
+
+
+def _assert_no_credential(reply: str) -> None:
+    for value in _LEAKED_VALUES:
+        assert value not in reply, f"raw credential {value!r} in the /compress reply: {reply!r}"
+
+
+async def _compress_reply_with_compressor_state(tmp_path, monkeypatch, *, aborted: bool,
+                                                summary_error=None, aux_model=None, aux_error=None) -> str:
+    import gateway.run as gateway_run
+    (tmp_path / "config.yaml").write_text("display: {warning_notifications: true}")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    history = _make_history()
+    # Aborted = no usable summary, messages unchanged; compress_now still reports "compressed".
+    compressed = list(history) if aborted else [
+        history[0], {"role": "assistant", "content": "summary"}, history[-1]]
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    compressor = agent_instance.context_compressor
+    compressor.has_content_to_compress.return_value = True
+    compressor._last_compress_aborted = aborted
+    compressor._last_summary_fallback_used = False
+    compressor._last_summary_dropped_count = 0
+    compressor._last_summary_error = summary_error
+    compressor._last_aux_model_failure_model = aux_model
+    compressor._last_aux_model_failure_error = aux_error
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (compressed, "")
+    agent_instance._compression_skipped_due_to_lock = False
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough",
+              side_effect=lambda messages, **_kw: 100 if (aborted or messages == history) else 60),
+    ):
+        return await runner._handle_compress_command(_make_event())
+
+
+@pytest.mark.asyncio
+async def test_compress_aborted_reply_scrubs_signed_url_and_bearer(tmp_path, monkeypatch):
+    """The summariser failed with a pre-signed URL in its exception: the aborted /compress reply keeps
+    the notice but carries neither ``sig`` nor ``X-Amz-Signature`` value, nor the Bearer value."""
+    reply = await _compress_reply_with_compressor_state(
+        tmp_path, monkeypatch, aborted=True, summary_error=_PROVIDER_ERROR)
+
+    assert "Compression aborted" in reply
+    assert "https://x/?" in reply  # the URL shape survives, only the credential values are masked
+    _assert_no_credential(reply)
+
+
+@pytest.mark.asyncio
+async def test_compress_aux_failure_reply_scrubs_signed_url_and_bearer(tmp_path, monkeypatch):
+    """A recovered aux-model failure is surfaced, but its provider error text is scrubbed."""
+    reply = await _compress_reply_with_compressor_state(
+        tmp_path, monkeypatch, aborted=False, aux_model="fixture-aux", aux_error=_PROVIDER_ERROR)
+
+    assert "Compressed:" in reply
+    assert "fixture-aux" in reply
+    _assert_no_credential(reply)
+
+
+@pytest.mark.asyncio
+async def test_compress_failure_reply_scrubs_signed_url_and_bearer(monkeypatch):
+    """The ordinary failure reply (``_handle_compress_command_inner``'s except branch)."""
+    from gateway.run import GatewayRunner
+
+    runner = _make_runner(_make_history())
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError(_PROVIDER_ERROR)
+
+    monkeypatch.setattr(GatewayRunner, "_run_manual_compression", _boom, raising=False)
+    reply = await runner._handle_compress_command_inner(_make_event())
+
+    assert "Compression failed" in reply
+    _assert_no_credential(reply)
+
+
+@pytest.mark.asyncio
+async def test_compress_codex_app_server_failure_reply_scrubs_signed_url_and_bearer(monkeypatch):
+    """The codex app-server compaction error path is scrubbed the same way."""
+    from gateway.run import GatewayRunner
+
+    runner = _make_runner(_make_history())
+    agent = MagicMock()
+    agent._codex_session = object()
+    agent.context_compressor.compression_count = 0
+
+    def _compress(*_args, **_kwargs):
+        raise RuntimeError(_PROVIDER_ERROR)
+
+    agent._compress_context = _compress
+    monkeypatch.setattr(GatewayRunner, "_cached_agent_for", lambda self, *a, **kw: agent, raising=False)
+
+    async def _run_sync(fn):
+        return fn()
+
+    monkeypatch.setattr(GatewayRunner, "_run_in_executor_with_context", lambda self, fn: _run_sync(fn), raising=False)
+    reply = await runner._compress_codex_app_server_session(session_key="k1", session_id="sess-1")
+
+    assert "Compression failed" in reply
+    _assert_no_credential(reply)

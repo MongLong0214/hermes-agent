@@ -369,3 +369,36 @@ def test_chat_gateways_redact_all_issue_23810_credential_shapes(platform, shape_
     # Prose around the secret is preserved — redaction is surgical.
     assert "here is the token you asked me to echo" in sanitized
     assert sanitized.endswith("done.")
+
+
+_SIGNED_URL = "https://x/?sig=SECRET&X-Amz-Signature=S2"
+
+
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+def test_automatic_compression_abort_warning_masks_url_credential_params(platform):
+    """The automatic-compression abort warning (agent/conversation_compression.py, "⚠ Compression
+    aborted: {err}. ...") is a visible carve-out from the noise filter and embeds the summariser's raw
+    provider exception, so it gets the strict URL-credential scrub, not the default one that leaves
+    magic-link/OAuth-callback query params alone."""
+    message = (
+        f"⚠ Compression aborted: litellm.APIError: GET {_SIGNED_URL} failed. "
+        "No messages were dropped — conversation continues unchanged. "
+        "Run /compress to retry, or /new to start a fresh session."
+    )
+
+    sanitized = _prepare_gateway_status_message(platform, "warn", message, "dm")
+
+    assert sanitized is not None
+    assert "Compression aborted" in sanitized
+    assert "https://x/?sig=" in sanitized
+    for value in ("SECRET", "S2"):
+        assert value not in sanitized, f"raw URL credential in the abort warning: {sanitized!r}"
+
+
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+def test_ordinary_status_keeps_default_url_scrub(platform):
+    """Only the abort warning opts into the strict URL scrub; any other status line keeps the default
+    egress scrub, which passes a credential-named query param through unchanged."""
+    message = f"🔗 Opening {_SIGNED_URL} for you now."
+
+    assert _prepare_gateway_status_message(platform, "lifecycle", message, "dm") == message
