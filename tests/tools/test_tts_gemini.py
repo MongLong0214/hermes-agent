@@ -1,8 +1,8 @@
-"""Tests for the Google Gemini TTS provider in tools/tts_tool.py."""
+"""The PCM-to-WAV wrapper used by the Gemini TTS provider, and the Google outbound denial on the
+TTS tool: a Gemini or Google-hosted speech route is refused before any key, client or output."""
 
-import base64
 import struct
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -16,36 +16,6 @@ def clean_env(monkeypatch):
         "HERMES_SESSION_PLATFORM",
     ):
         monkeypatch.delenv(key, raising=False)
-
-
-@pytest.fixture
-def fake_pcm_bytes():
-    # 0.1s of silence at 24kHz mono 16-bit = 4800 bytes
-    return b"\x00" * 4800
-
-
-@pytest.fixture
-def mock_gemini_response(fake_pcm_bytes):
-    """A successful Gemini generateContent response."""
-    resp = MagicMock()
-    resp.status_code = 200
-    resp.json.return_value = {
-        "candidates": [
-            {
-                "content": {
-                    "parts": [
-                        {
-                            "inlineData": {
-                                "mimeType": "audio/L16;codec=pcm;rate=24000",
-                                "data": base64.b64encode(fake_pcm_bytes).decode(),
-                            }
-                        }
-                    ]
-                }
-            }
-        ]
-    }
-    return resp
 
 
 class TestWrapPcmAsWav:
@@ -70,160 +40,161 @@ class TestWrapPcmAsWav:
         assert wav[44:] == pcm
 
 
+# ── Google outbound denial on the TTS tool ─────────────────────────────────────────────────
 
-class TestGenerateGeminiTts:
-    def test_missing_api_key_raises_value_error(self, tmp_path):
-        from tools.tts_tool import _generate_gemini_tts
-
-        output_path = str(tmp_path / "test.wav")
-        with pytest.raises(ValueError, match="GEMINI_API_KEY"):
-            _generate_gemini_tts("Hello", output_path, {})
-
-    def test_google_api_key_fallback(self, tmp_path, monkeypatch, mock_gemini_response):
-        from tools.tts_tool import _generate_gemini_tts
-
-        monkeypatch.setenv("GOOGLE_API_KEY", "from-google-env")
-        output_path = str(tmp_path / "test.wav")
-
-        with patch("requests.post", return_value=mock_gemini_response) as mock_post:
-            _generate_gemini_tts("Hi", output_path, {})
-
-        # Confirm it used the GOOGLE_API_KEY, sent via the auth header
-        _, kwargs = mock_post.call_args
-        assert kwargs["headers"]["x-goog-api-key"] == "from-google-env"
-
-    def test_api_key_rides_in_header_not_url(self, tmp_path, monkeypatch, mock_gemini_response):
-        """The key must not be a query parameter: ``requests`` echoes the
-        full prepared URL (query string included) into HTTPError messages,
-        so a ``key=`` param would land in logs on any 4xx/5xx."""
-        from tools.tts_tool import _generate_gemini_tts
-
-        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-        output_path = str(tmp_path / "test.wav")
-
-        with patch("requests.post", return_value=mock_gemini_response) as mock_post:
-            _generate_gemini_tts("Hi", output_path, {})
-
-        _, kwargs = mock_post.call_args
-        assert kwargs["headers"]["x-goog-api-key"] == "test-key"
-        assert "key" not in (kwargs.get("params") or {})
-        assert "test-key" not in mock_post.call_args[0][0]
-
-    def test_wav_output_fast_path(self, tmp_path, monkeypatch, mock_gemini_response, fake_pcm_bytes):
-        from tools.tts_tool import _generate_gemini_tts
-
-        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-        output_path = str(tmp_path / "test.wav")
-
-        with patch("requests.post", return_value=mock_gemini_response):
-            result = _generate_gemini_tts("Hi", output_path, {})
-
-        assert result == output_path
-        data = (tmp_path / "test.wav").read_bytes()
-        assert data[:4] == b"RIFF"
-        assert data[8:12] == b"WAVE"
-        # Audio payload should match the PCM we put in
-        assert data[44:] == fake_pcm_bytes
-
-    def test_x_goog_api_client_header_is_set(self, tmp_path, monkeypatch, mock_gemini_response):
-        """Gemini TTS requests should include Hermes client context."""
-        from hermes_cli.version_info import get_version_info
-        from tools.tts_tool import _generate_gemini_tts
-
-        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-
-        with patch("requests.post", return_value=mock_gemini_response) as mock_post:
-            _generate_gemini_tts("Hi", str(tmp_path / "test.wav"), {})
-
-        headers = mock_post.call_args[1]["headers"]
-        assert headers["X-Goog-Api-Client"] == f"hermes-agent/{get_version_info().base_version}"
-
-    def test_default_voice_and_model(self, tmp_path, monkeypatch, mock_gemini_response):
-        from tools.tts_tool import _generate_gemini_tts
-        from tools.tts_tool_providers import DEFAULT_GEMINI_TTS_MODEL, DEFAULT_GEMINI_TTS_VOICE
-
-        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-
-        with patch("requests.post", return_value=mock_gemini_response) as mock_post:
-            _generate_gemini_tts("Hi", str(tmp_path / "test.wav"), {})
-
-        args, kwargs = mock_post.call_args
-        assert DEFAULT_GEMINI_TTS_MODEL in args[0]
-        payload = kwargs["json"]
-        voice = (
-            payload["generationConfig"]["speechConfig"]["voiceConfig"]
-            ["prebuiltVoiceConfig"]["voiceName"]
-        )
-        assert voice == DEFAULT_GEMINI_TTS_VOICE
-
-    def test_custom_voice(self, tmp_path, monkeypatch, mock_gemini_response):
-        from tools.tts_tool import _generate_gemini_tts
-
-        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-        config = {"gemini": {"voice": "Puck"}}
-
-        with patch("requests.post", return_value=mock_gemini_response) as mock_post:
-            _generate_gemini_tts("Hi", str(tmp_path / "test.wav"), config)
-
-        payload = mock_post.call_args[1]["json"]
-        voice = (
-            payload["generationConfig"]["speechConfig"]["voiceConfig"]
-            ["prebuiltVoiceConfig"]["voiceName"]
-        )
-        assert voice == "Puck"
+_STUDIO = "https://generativelanguage.googleapis.com/v1beta/openai"
 
 
-    def test_audio_tag_rewrite_failure_falls_back_to_original_text(
-        self, tmp_path, monkeypatch, mock_gemini_response, caplog
-    ):
-        from tools.tts_tool import _generate_gemini_tts
+class _Tripwire:
+    def __init__(self, name, touched):
+        self._name, self._touched = name, touched
 
-        config = {
-            "gemini": {
-                "model": "gemini-3.1-flash-tts-preview",
-                "audio_tags": True,
-            }
-        }
-        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-
-        with patch("agent.auxiliary_client.call_llm", side_effect=RuntimeError("boom")), \
-             patch("requests.post", return_value=mock_gemini_response) as mock_post:
-            _generate_gemini_tts("Hi there.", str(tmp_path / "test.wav"), config)
-
-        prompt_text = mock_post.call_args[1]["json"]["contents"][0]["parts"][0]["text"]
-        assert prompt_text == "Hi there."
-        assert "audio tag rewrite failed" in caplog.text
+    def __call__(self, *_args, **_kwargs):
+        self._touched.append(self._name)
+        raise AssertionError(f"{self._name} was reached before the refusal")
 
 
-class TestGeminiInCheckRequirements:
-    def test_gemini_api_key_satisfies_requirements(self, monkeypatch):
-        from tools.tts_tool import check_tts_requirements
+def _deny_type():
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+    return GeminiOutboundDenied
 
-        # Strip everything else
-        for key in (
-            "ELEVENLABS_API_KEY",
-            "OPENAI_API_KEY",
-            "VOICE_TOOLS_OPENAI_KEY",
-            "MINIMAX_API_KEY",
-            "XAI_API_KEY",
-            "MISTRAL_API_KEY",
-            "GOOGLE_API_KEY",
-        ):
-            monkeypatch.delenv(key, raising=False)
-        monkeypatch.setenv("GEMINI_API_KEY", "k")
 
-        # Force edge_tts import to fail so we actually hit the gemini check
-        import builtins
+class TestGoogleOutboundDenial:
+    @pytest.mark.parametrize("config", [
+        pytest.param({"provider": "gemini"}, id="gemini-configured"),
+        pytest.param({"provider": "openai", "openai": {"base_url": _STUDIO}}, id="openai-on-google-host"),
+        pytest.param({"provider": "openai", "openai": {"model": "gemini-2.5-flash-preview-tts"}},
+                     id="openai-with-gemini-model"),
+        pytest.param({"provider": "deepinfra", "deepinfra": {"model": "gemini-tts"}}, id="deepinfra-pinned"),
+    ])
+    def test_a_google_bound_speech_route_is_refused_before_keys_clients_or_output(
+            self, monkeypatch, tmp_path, config):
+        from tools import tts_tool, tts_tool_openai
 
-        real_import = builtins.__import__
+        touched = []
+        monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: config)
+        monkeypatch.setattr(tts_tool, "_resolve_provider_key", _Tripwire("_resolve_provider_key", touched))
+        monkeypatch.setattr(tts_tool, "_import_openai_client", _Tripwire("_import_openai_client", touched))
+        monkeypatch.setattr(tts_tool_openai, "_resolve_openai_audio_client_config",
+                            _Tripwire("_resolve_openai_audio_client_config", touched))
+        out = tmp_path / "speech" / "a.mp3"
 
-        def fake_import(name, *args, **kwargs):
-            if name == "edge_tts":
-                raise ImportError("simulated")
-            return real_import(name, *args, **kwargs)
+        with pytest.raises(_deny_type()):
+            tts_tool.text_to_speech_tool("hello", output_path=str(out))
+        assert touched == []
+        assert not out.parent.exists()
 
-        with patch(
-            "tools.tts_tool._load_tts_config",
-            return_value={"provider": "gemini"},
-        ), patch("builtins.__import__", side_effect=fake_import):
-            assert check_tts_requirements() is True
+    def test_a_single_chunk_for_a_google_provider_is_refused_before_dispatch(self, monkeypatch, tmp_path):
+        from tools import tts_tool
+
+        touched = []
+        monkeypatch.setattr(tts_tool, "_select_builtin_engine", _Tripwire("_select_builtin_engine", touched))
+        with pytest.raises(_deny_type()):
+            tts_tool._text_to_speech_single(
+                "hello", str(tmp_path / "a.mp3"), provider="gemini", tts_config={},
+                command_provider_config=None, want_opus=False, instructions=None)
+        assert touched == []
+
+    def test_openai_tts_checks_the_configured_google_host_before_the_auth_chain(self, monkeypatch, tmp_path):
+        from tools import tts_tool_openai
+
+        touched = []
+        monkeypatch.setattr(tts_tool_openai, "_resolve_openai_audio_client_config",
+                            _Tripwire("_resolve_openai_audio_client_config", touched))
+        with pytest.raises(_deny_type()):
+            tts_tool_openai._generate_openai_tts("hello", str(tmp_path / "a.mp3"), {"openai": {"base_url": _STUDIO}})
+        assert touched == []
+
+    def test_openai_tts_refuses_an_auth_chain_fallback_on_a_google_host_before_the_client(self, monkeypatch, tmp_path):
+        from tools import tts_tool, tts_tool_openai
+
+        touched = []
+        monkeypatch.setattr(tts_tool_openai, "_resolve_openai_audio_client_config", lambda: ("k", _STUDIO, False))
+        monkeypatch.setattr(tts_tool, "_import_openai_client", _Tripwire("_import_openai_client", touched))
+        with pytest.raises(_deny_type()):
+            tts_tool_openai._generate_openai_tts("hello", str(tmp_path / "a.mp3"), {})
+        assert touched == []
+
+    def test_a_pinned_gemini_deepinfra_model_is_refused_before_the_catalog_or_key(self, monkeypatch, tmp_path):
+        from tools import tts_tool, tts_tool_openai
+
+        touched = []
+        monkeypatch.setattr("hermes_cli.models.deepinfra_model_ids", _Tripwire("deepinfra_model_ids", touched))
+        monkeypatch.setattr(tts_tool, "_resolve_provider_key", _Tripwire("_resolve_provider_key", touched))
+        with pytest.raises(_deny_type()):
+            tts_tool_openai._generate_deepinfra_tts("hello", str(tmp_path / "a.mp3"), {"deepinfra": {"model": "gemini-tts"}})
+        assert touched == []
+
+    def test_a_catalog_picked_gemini_deepinfra_model_is_refused_before_the_key(self, monkeypatch, tmp_path):
+        from tools import tts_tool, tts_tool_openai
+
+        touched = []
+        monkeypatch.setattr("hermes_cli.models.deepinfra_model_ids", lambda kind: ["gemini-tts-latest"])
+        monkeypatch.setattr(tts_tool, "_resolve_provider_key", _Tripwire("_resolve_provider_key", touched))
+        with pytest.raises(_deny_type()):
+            tts_tool_openai._generate_deepinfra_tts("hello", str(tmp_path / "a.mp3"), {"deepinfra": {}})
+        assert touched == []
+
+    def test_an_explicit_google_endpoint_is_refused_before_the_client(self, monkeypatch, tmp_path):
+        from tools import tts_tool, tts_tool_openai
+
+        touched = []
+        monkeypatch.setattr(tts_tool, "_import_openai_client", _Tripwire("_import_openai_client", touched))
+        with pytest.raises(_deny_type()):
+            tts_tool_openai._generate_openai_tts("hello", str(tmp_path / "a.mp3"), {}, api_key="k", base_url=_STUDIO)
+        assert touched == []
+
+    def test_the_gemini_generator_itself_refuses_before_its_key(self, monkeypatch, tmp_path):
+        from tools import tts_tool
+        from tools.tts_tool_providers import _generate_gemini_tts
+
+        touched = []
+        monkeypatch.setattr(tts_tool, "_resolve_provider_key", _Tripwire("_resolve_provider_key", touched))
+        with pytest.raises(_deny_type()):
+            _generate_gemini_tts("hello", str(tmp_path / "a.wav"), {})
+        assert touched == []
+
+    def test_gemini_is_never_available_and_reads_no_key(self, monkeypatch):
+        from tools import tts_tool
+
+        touched = []
+        monkeypatch.setattr(tts_tool, "_resolve_provider_key", _Tripwire("_resolve_provider_key", touched))
+        assert tts_tool._BUILTIN_REQUIREMENTS["gemini"]() is False
+        assert touched == []
+
+    def test_the_denial_is_not_turned_into_a_tool_failure_by_the_chunk_excepts(self, monkeypatch, tmp_path):
+        from tools import tts_tool
+
+        def _deny(*_a, **_k):
+            raise _deny_type()()
+
+        monkeypatch.setattr(tts_tool, "_preflight_tts_outbound_route", lambda provider, config: None)
+        monkeypatch.setattr(tts_tool, "_select_builtin_engine", lambda provider: (provider, None))
+        monkeypatch.setattr(tts_tool, "_synthesize_builtin", _deny)
+        monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "edge"})
+        with pytest.raises(_deny_type()):
+            tts_tool.text_to_speech_tool("hello", output_path=str(tmp_path / "a.mp3"))
+
+    def test_openai_tts_on_an_ordinary_host_still_speaks(self, monkeypatch, tmp_path):
+        from tools import tts_tool, tts_tool_openai
+
+        sent = []
+
+        class _Speech:
+            def create(self, **kwargs):
+                sent.append(kwargs)
+                return MagicMock(stream_to_file=lambda path: open(path, "wb").write(b"ID3audio"))
+
+        def _client(api_key, base_url):
+            sent.append(base_url)
+            return MagicMock(audio=MagicMock(speech=_Speech()))
+
+        monkeypatch.setattr(tts_tool, "_import_openai_client", lambda: _client)
+        monkeypatch.setattr(tts_tool_openai, "_resolve_openai_audio_client_config", lambda: ("k", None, False))
+        out = tmp_path / "a.mp3"
+
+        path = tts_tool_openai._generate_openai_tts(
+            "hello", str(out), {"openai": {"base_url": "https://ordinary.example.test/v1"}})
+
+        assert path == str(out) and out.read_bytes() == b"ID3audio"
+        assert sent[0] == "https://ordinary.example.test/v1"
