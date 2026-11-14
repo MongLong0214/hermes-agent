@@ -23,6 +23,9 @@ async def test_lazy_session_info_reports_frozen_reasoning_and_tier(tmp_path, mon
         'model: {default: gpt-5.4, provider: custom, base_url: "http://127.0.0.1:9/v1"}\n'
         'agent: {reasoning_effort: high, service_tier: fast}\nplatform_toolsets: {cli: []}\n')
     monkeypatch.setenv('HERMES_HOME', str(home))
+    # Once any earlier test imported hermes_state, conftest re-pins DEFAULT_DB_PATH to its own home and
+    # the store (so the profile config the session follows) would open there instead of here.
+    monkeypatch.setattr('hermes_state.DEFAULT_DB_PATH', home / 'state.db')
     monkeypatch.setattr(run, '_hermes_home', home)
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False,

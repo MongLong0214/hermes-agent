@@ -37,6 +37,9 @@ async def test_created_session_snapshot_carries_inventory_for_frozen_toolsets(tm
         'model: {default: gpt-5.4, provider: custom, base_url: "http://127.0.0.1:9/v1"}\n'
         'platform_toolsets: {cli: [file, terminal]}\n')
     monkeypatch.setenv('HERMES_HOME', str(home))
+    # Once any earlier test imported hermes_state, conftest re-pins DEFAULT_DB_PATH to its own home and
+    # the store (so the profile config the session follows) would open there instead of here.
+    monkeypatch.setattr('hermes_state.DEFAULT_DB_PATH', home / 'state.db')
     monkeypatch.setattr(run, '_hermes_home', home)
     monkeypatch.setattr(banner, '_available_skills_cache', None)
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
@@ -93,6 +96,7 @@ async def test_cli_surface_snapshot_carries_main_cli_toolsets_and_startup_warnin
     (home / 'config.yaml').write_text(
         'model: {default: gpt-5.4, provider: custom, base_url: "http://127.0.0.1:9/v1"}\n')
     monkeypatch.setenv('HERMES_HOME', str(home))
+    monkeypatch.setattr('hermes_state.DEFAULT_DB_PATH', home / 'state.db')
     monkeypatch.setattr(run, '_hermes_home', home)
     monkeypatch.setattr(banner, '_available_skills_cache', None)
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
@@ -137,6 +141,7 @@ async def test_cli_surface_counts_kanban_skills_like_main_cli_without_leaking(tm
     (home / 'config.yaml').write_text(
         'model: {default: gpt-5.4, provider: custom, base_url: "http://127.0.0.1:9/v1"}\n')
     monkeypatch.setenv('HERMES_HOME', str(home))
+    monkeypatch.setattr('hermes_state.DEFAULT_DB_PATH', home / 'state.db')
     monkeypatch.delenv('HERMES_KANBAN_BOARD', raising=False)
     monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
     monkeypatch.setattr(run, '_hermes_home', home)
