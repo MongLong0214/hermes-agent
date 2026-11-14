@@ -47,9 +47,9 @@ from hermes_constants import get_hermes_home, get_process_hermes_home
 from utils import atomic_replace, fast_safe_load, file_cache_version, file_signature, mkstemp_beside
 from hermes_cli.config_issues import ConfigIssue, _issue
 from hermes_cli.config_backend import (
-    ConfigWriteError, config_cache_version, config_destination, config_exists, config_version,
-    get_config_backend, probe_config_readable, read_config_doc, supports_file_tooling,
-    write_config_document)
+    EXPLICIT_NULL, ConfigWriteError, config_cache_version, config_destination, config_exists,
+    config_version, get_config_backend, probe_config_readable, read_config_doc,
+    supports_file_tooling, write_config_document)
 from hermes_cli.config_read_errors import (
     _CONFIG_PARSE_FAILURES, _FIX_PERMS, _FIX_YAML, FailedConfigRead, _backups_dir_display,
     _refuse_failed_read, _refuse_overwrite, _warn_config_parse_failure, _yaml_error_details,
@@ -446,7 +446,7 @@ def require_parseable_user_config(*, ignore_user_config: bool = False) -> None:
 
     config_path = get_config_path()
     try:
-        data = read_config_doc(config_path)
+        data = read_config_doc(config_path, explicit_null=True)
     except FileNotFoundError:
         return
     except Exception as exc:
@@ -454,7 +454,7 @@ def require_parseable_user_config(*, ignore_user_config: bool = False) -> None:
     else:
         if data is None or isinstance(data, dict):
             return
-        parse_error = TypeError(f"top-level YAML value must be a mapping, got {type(data).__name__}")
+        parse_error = TypeError(f"top-level YAML value must be a mapping, got {_root_type_name(data)}")
 
     from hermes_cli.config_backups import backup_config
     backup_path = backup_config(config_path, "corrupt")
@@ -1760,6 +1760,23 @@ def cfg_get(cfg: Optional[dict[str, Any]], *keys: str, default: Any = None) -> A
     return node
 
 
+def _root_type_name(data: Any) -> str:
+    return "NoneType (explicit null)" if data is EXPLICIT_NULL else type(data).__name__
+
+
+def _load_user_mapping(config_path: Path) -> dict[str, Any]:
+    """The user config's root mapping for a cache or ``good``-backup publisher: ``{}`` for an
+    empty or comment-only file. Any other root raises ``TypeError``. ``read_config_doc() or {}``
+    served ``false``/``[]``/``0`` and an explicit ``null`` as a successful empty parse, so the
+    load published that file as the last good one instead of falling back to it."""
+    data = read_config_doc(config_path, explicit_null=True)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise TypeError(f"top-level YAML must be a mapping, got {_root_type_name(data)}")
+    return data
+
+
 def _raw_config_cache_hit(path_key: str, cache_key: tuple[Any, ...]) -> Optional[dict[str, Any]]:
     """Pure lookup: the cached raw config for ``path_key`` if its signature equals ``cache_key``,
     else ``None``. Shared by the lock-free fast path and the locked re-check of
@@ -1823,13 +1840,11 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
             return copy.deepcopy(hit) if want_deepcopy else hit
 
         try:
-            data = read_config_doc(config_path) or {}
+            data = _load_user_mapping(config_path)
         except Exception as e:
             _warn_config_parse_failure(config_path, e)
             return FailedConfigRead(error=e)
 
-        if not isinstance(data, dict):
-            return FailedConfigRead(error=TypeError(f"top-level YAML must be a mapping, got {type(data).__name__}"))
         _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
         # The cache stores its own deepcopy. The readonly path returns THAT object (identity
         # invariant: later cache hits return the same dict); the mutable path returns the parse.
@@ -2249,7 +2264,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
 
         if user_sig is not None:
             try:
-                user_config = read_config_doc(config_path) or {}
+                user_config = _load_user_mapping(config_path)
                 _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
 
                 if "max_turns" in user_config:
