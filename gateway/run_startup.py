@@ -841,13 +841,14 @@ class GatewayStartupMixin:
     async def _consume_if_answered(self, record: dict) -> bool:
         """When the record's message already has its final reply in the transcript, owe that reply
         through the delivery ledger and then delete the record. The reply is owed under the record the
-        user row names (``inbound:<recovery id>``), the identity normal delivery ledgers it under
-        (platforms/base.py, _record_delivery_obligation): the crash-left row the boot sweep claims and
-        redelivers is a no-op when that reply was already ledgered or delivered, and every record folded
-        into the row's message owes the same one row. False, keeping the record to be re-admitted, when
-        there is no answer, it cannot be matched, or no ledger can owe it."""
+        user row names and its destination (delivery_ledger.inbound_obligation_id), the identity normal
+        delivery ledgers it under (platforms/base.py, _record_delivery_obligation), never its text: the
+        crash-left row the boot sweep claims and redelivers is a no-op when that reply was already
+        ledgered or delivered, even with text the transcript lacks (a runtime footer), and every record
+        folded into the row's message owes the same one row. False, keeping the record to be
+        re-admitted, when there is no answer, it cannot be matched, or no ledger can owe it."""
         from gateway import shutdown_flush
-        from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
+        from gateway.delivery_ledger import inbound_obligation_id, ledger_enabled, record_crash_left_reply
         from hermes_cli.timefmt import coerce_epoch
         found = await self._inbound_record_answer(record)
         if found is None:
@@ -861,12 +862,14 @@ class GatewayStartupMixin:
             if not await asyncio.to_thread(ledger_enabled):
                 return False  # nothing could owe the answer: the message runs again instead
             source = shutdown_flush.inbound_event_from_record(record).source
+            platform = str(getattr(source.platform, "value", source.platform))
             # Keyed by the answered record alone: another message answered with the same text is its own
             # delivery.
             await asyncio.to_thread(
                 record_crash_left_reply,
-                obligation_id=compute_obligation_id(key, f"inbound:{answered_as}", text), session_key=key,
-                platform=str(getattr(source.platform, "value", source.platform)), chat_id=source.chat_id,
+                obligation_id=inbound_obligation_id(key, answered_as, platform=platform, chat_id=source.chat_id,
+                                                    thread_id=source.thread_id),
+                session_key=key, platform=platform, chat_id=source.chat_id,
                 thread_id=source.thread_id, content=text, since=coerce_epoch(asked_at) or 0.0,
                 adapter_profile=record.get("transport_profile"), same_reply_dedupe=False)
         logger.info("Stored owner message %s on %s was answered before the restart; its answer is owed "

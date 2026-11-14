@@ -27,11 +27,14 @@ def resolve_and_repair_transcript_batch(
     messages: List[Dict[str, Any]],
     encode_content_fn: Callable[[Any], Any],
     decode_content_fn: Callable[[Any], Any],
+    encode_display_metadata_fn: Callable[[Any], Any] | None = None,
 ) -> List[Dict[str, Any]]:
     """Partition a message batch within an active write transaction. An assistant message carrying an
     existing integer ``_row_id`` targets its active SQLite row (or the active clone a watermark compaction
-    made of it): a blank row is updated in place; a non-blank one (concurrent winner) has its canonical
-    content adopted without overwrite. Returns the messages that must be inserted as fresh rows."""
+    made of it): a blank row is updated in place, its content and the display metadata the message
+    carries (the finalizer's completed-turn mark on the reply it filled in, agent/turn_finalizer.py); a
+    non-blank one (concurrent winner) has its canonical content adopted without overwrite. Returns the
+    messages that must be inserted as fresh rows."""
     inserted_rows: List[Dict[str, Any]] = []
     for msg in messages:
         existing_row_id = msg.get("_row_id") if isinstance(msg, dict) else None
@@ -45,10 +48,11 @@ def resolve_and_repair_transcript_batch(
         decoded = decode_content_fn(target_row["content"])
         msg["_row_id"] = target_id
         if is_content_blank(decoded):
+            meta = encode_display_metadata_fn(msg.get("display_metadata")) if encode_display_metadata_fn else None
             conn.execute(
-                "UPDATE messages SET content = ? "
+                "UPDATE messages SET content = ?, display_metadata = COALESCE(?, display_metadata) "
                 "WHERE id = ? AND session_id = ? AND active = 1",
-                (encode_content_fn(msg.get("content")), target_id, session_id),
+                (encode_content_fn(msg.get("content")), meta, target_id, session_id),
             )
         else:
             msg["_canonical_content"] = decoded  # concurrent winner: adopt, don't overwrite

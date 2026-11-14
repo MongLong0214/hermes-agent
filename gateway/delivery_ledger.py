@@ -284,6 +284,16 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
     return hashlib.sha256(f"{session_key}|{message_ref}|{content}".encode("utf-8", "replace")).hexdigest()[:24]
 
 
+def inbound_obligation_id(session_key: str, recovery_id: str, *, platform: str, chat_id: Any,
+                          thread_id: Any) -> str:
+    """Id of the reply owed to the owner message whose inbound record is *recovery_id*
+    (gateway/shutdown_flush.py): that record and where the reply goes, never the reply's text. Normal
+    delivery (platforms/base.py, _record_delivery_obligation) and startup recovery of an answered record
+    (gateway/run_startup.py, _consume_if_answered) agree on it even when the delivered text is not the
+    transcript's (a runtime footer added at delivery), and two records answered alike stay two."""
+    return compute_obligation_id(session_key, f"inbound:{recovery_id}|{platform}|{chat_id}|{thread_id or ''}", "")
+
+
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
                       thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
                       acp_update_id: Optional[str] = None) -> None:

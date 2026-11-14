@@ -231,8 +231,8 @@ def _close_transcript_tail(agent, messages, final_response, interrupted, _recove
                            completed: bool = False) -> None:
     """Shape the transcript tail before the durable snapshot (scaffolding already dropped
     and ``final_response`` already stream-recovered by the caller). ``completed``: the turn
-    completed (finalize_turn's verdict), so a closing row this appends is marked as the turn's
-    completed answer (``TURN_COMPLETED_METADATA_KEY``); a failed turn's close is not."""
+    completed (finalize_turn's verdict), so a closing row this appends or fills is marked as the
+    turn's completed answer (``TURN_COMPLETED_METADATA_KEY``); a failed turn's close is not."""
     # An interrupt can leave a tool result as the tail; close the sequence so strict
     # providers don't see ``tool → user`` (placeholder: final_response is usually empty).
     if interrupted:
@@ -265,8 +265,12 @@ def _close_transcript_tail(agent, messages, final_response, interrupted, _recove
             and (_tail.get("tool_calls") or _recovered_from_stream)
         ):
             # Pure tool-call turn or stream-recovered blank (#95514): fill the persisted
-            # blank row's content rather than append a second row.
+            # blank row's content rather than append a second row, marked as the append
+            # branch marks its row (the flush's in-place update of the blank row writes it).
             _tail["content"] = final_response
+            if completed:
+                _tail["display_metadata"] = {**(_tail.get("display_metadata") or {}),
+                                             TURN_COMPLETED_METADATA_KEY: True}
             stamp_message_timestamp(_tail)
             _tail.pop(_DB_PERSISTED_MARKER, None)
             agent._db_flush_scan_prefix = None

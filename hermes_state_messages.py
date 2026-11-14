@@ -434,7 +434,8 @@ class SessionMessagesMixin:
                 turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
             from agent.transcript_repair import resolve_and_repair_transcript_batch
             inserted_rows = resolve_and_repair_transcript_batch(conn, session_id, messages,
-                encode_content_fn=self._encode_content, decode_content_fn=self._decode_content)
+                encode_content_fn=self._encode_content, decode_content_fn=self._decode_content,
+                encode_display_metadata_fn=self._encode_display_metadata)
             inserted, tool_calls_total = self._insert_message_rows(conn, session_id, inserted_rows)
             self._bump_session_counters(conn, session_id, inserted, tool_calls_total, unit=False)
             return inserted
