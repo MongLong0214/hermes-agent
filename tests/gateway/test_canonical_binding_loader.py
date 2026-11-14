@@ -60,8 +60,11 @@ def _write(path, document) -> None:
         ({"canonical_surface_bindings": _binding("user")}, {"gateway": {"canonical_surface_bindings": {}}}, []),
         ({"gateway": {"canonical_surface_bindings": _binding("user")}}, {"canonical_surface_bindings": {}}, []),
         ({"canonical_surface_bindings": _binding("user")}, {"canonical_surface_bindings": None}, []),
+        ({"canonical_surface_bindings": _binding("user"), "gateway": {"loop_watchdog": False}},
+         {"canonical_surface_bindings": _binding("managed")}, ["managed"]),
     ),
-    ids=["top-user-nested-managed", "nested-user-top-managed", "nested-empty", "top-empty", "null"],
+    ids=["top-user-nested-managed", "nested-user-top-managed", "nested-empty", "top-empty", "null",
+         "top-user-gateway-without-bindings"],
 )
 def test_user_binding_is_ignored_when_managed_overlay_declares_bindings(
     managed_home, user_document, managed_document, expected
@@ -123,33 +126,65 @@ def test_managed_overlay_failure_cannot_restore_user_bindings(managed_home, monk
     assert config.loop_watchdog is False
 
 
+def _binding_names(yaml_cfg: dict) -> dict:
+    return {
+        "top": sorted(yaml_cfg.get("canonical_surface_bindings") or {}),
+        "gateway": sorted((yaml_cfg.get("gateway") or {}).get("canonical_surface_bindings") or {}),
+    }
+
+
 @pytest.mark.parametrize(
-    "snapshots",
+    ("first_snapshot", "expected_names"),
     (
-        ({"canonical_surface_bindings": _binding("first")},
-         {"gateway": {"canonical_surface_bindings": _binding("second")}}),
-        ({}, {"canonical_surface_bindings": _binding("second")}),
-        ({"canonical_surface_bindings": _binding("first")}, {}),
+        ({"canonical_surface_bindings": _binding("first"), "quick_commands": {"snapshot": "A"}},
+         {"top": ["first"], "gateway": []}),
+        ({"gateway": {"canonical_surface_bindings": _binding("first")}, "quick_commands": {"snapshot": "A"}},
+         {"top": [], "gateway": ["first"]}),
+        ({"quick_commands": {"snapshot": "A"}},
+         {"top": ["top-user"], "gateway": ["nested-user"]}),
     ),
-    ids=["both-declare", "only-overlay-read-declares", "only-first-read-declares"],
+    ids=["snapshot-declares-top", "snapshot-declares-nested", "snapshot-declares-none"],
 )
-def test_managed_file_rewritten_between_reads_never_merges_user_and_managed_bindings(
-    managed_home, monkeypatch, snapshots
+def test_managed_canonical_bindings_use_one_snapshot_for_overlay_and_authority(
+    managed_home, monkeypatch, first_snapshot, expected_names
 ):
-    """The overlay re-reads the managed file; whichever read declares bindings, the user's stay out."""
+    """The managed snapshot that decides whether the user's bindings count is the one the overlay
+    applies: a second read of a rewritten file can neither add its bindings nor its other values."""
     from hermes_cli import managed_scope
 
     home, _managed = managed_home
-    _write(home / "config.yaml", {"canonical_surface_bindings": _binding("user")})
-    reads = iter(snapshots)
-    monkeypatch.setattr(managed_scope, "load_managed_config", lambda: next(reads, {}))
+    _write(home / "config.yaml", {
+        "canonical_surface_bindings": _binding("top-user"),
+        "gateway": {"canonical_surface_bindings": _binding("nested-user"), "loop_watchdog": False},
+    })
+    snapshots = iter((
+        first_snapshot,
+        {"canonical_surface_bindings": _binding("second"),
+         "gateway": {"canonical_surface_bindings": _binding("second")}, "quick_commands": {"snapshot": "B"}},
+    ))
+    calls = 0
+
+    def rewritten_after_first_read():
+        nonlocal calls
+        calls += 1
+        return next(snapshots)
+
+    monkeypatch.setattr(managed_scope, "load_managed_config", rewritten_after_first_read)
 
     yaml_cfg = config_loader.read_yaml_layers(home)
 
-    names = set(yaml_cfg.get("canonical_surface_bindings") or {}) | set(
-        (yaml_cfg.get("gateway") or {}).get("canonical_surface_bindings") or {})
-    assert "user" not in names
-    assert names <= {"second"}
+    assert calls == 1
+    assert _binding_names(yaml_cfg) == expected_names
+    assert yaml_cfg["quick_commands"] == {"snapshot": "A"}
+    assert yaml_cfg["gateway"]["loop_watchdog"] is False
+
+
+def test_a_non_mapping_user_layer_is_not_reshaped_by_a_managed_binding_declaration(managed_home):
+    home, managed = managed_home
+    (home / "config.yaml").write_text("- one\n- two\n", encoding="utf-8")
+    _write(managed / "config.yaml", {"canonical_surface_bindings": {}})
+
+    assert config_loader.read_yaml_layers(home) == ["one", "two"]
 
 
 def test_managed_bindings_replace_legacy_gateway_json_authority(managed_home):
