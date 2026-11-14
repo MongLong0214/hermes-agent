@@ -1243,14 +1243,11 @@ def _has_replayable_sidecar(role: Any, content: Any, msg: dict[str, Any]) -> boo
 def _build_gateway_agent_history(
     history: list[dict[str, Any]], *, channel_prompt: Optional[str] = None,
     inject_timestamps: bool = False) -> tuple[list[dict[str, Any]], Optional[str]]:
-    """Convert stored gateway transcript rows into agent replay messages.
-
-    Observed context stays out of ``conversation_history`` so consecutive-user repair can't merge it in."""
+    """Convert stored gateway transcript rows into agent replay messages. Observed context stays out of
+    ``conversation_history`` so consecutive-user repair can't merge it in; a canonical peer row replays as stored."""
     from hermes_time import get_timezone as _get_msg_tz
-    from gateway.message_timestamps import (
-        render_user_content_with_timestamp as _render_msg_ts,
-        strip_leading_message_timestamps as _strip_msg_ts,
-    )
+    from gateway.message_timestamps import render_user_content_with_timestamp as _render_msg_ts
+    from gateway.message_timestamps import strip_leading_message_timestamps as _strip_msg_ts
 
     _msg_tz = _get_msg_tz()
     agent_history: list[dict[str, Any]] = []
@@ -1262,7 +1259,9 @@ def _build_gateway_agent_history(
         # session_meta rows are transcript logging, not LLM input; the agent rebuilds its own system prompt.
         if not role or role in {"session_meta", "system"}:
             continue
-
+        if (peer_row := peer_replay_row(msg)) is not None:  # never plain owner text (gateway.run_canonical_turn)
+            agent_history.append(peer_row)
+            continue
         content = msg.get("content")
         if separate_observed_context and msg.get("observed") and role == "user" and content:
             if inject_timestamps and isinstance(content, str):
@@ -2190,6 +2189,7 @@ from gateway.run_goals import GatewayGoalsMixin
 from gateway.run_agent_cache import GatewayAgentCacheMixin
 from gateway.run_profile_reconcile import GatewayProfileReconcileMixin
 from gateway.run_plugin_rewire import GatewayPluginRewireMixin
+from gateway.run_canonical_turn import GatewayCanonicalTurnMixin, peer_replay_row
 from gateway.platforms.base import (
     BasePlatformAdapter,
     _reply_anchor_for_event,
@@ -3314,11 +3314,11 @@ from gateway.run_runtime_init import GatewayRuntimeInitMixin
 
 
 class GatewayRunner(
-    GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin,
-    GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin,
-    GatewayShutdownMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
-    GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
-    GatewayAgentCacheMixin, GatewayRuntimeInitMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin):
+    GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin, GatewayVoiceMixin,
+    GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin, GatewayShutdownMixin,
+    GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin, GatewaySessionWatchersMixin,
+    GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin, GatewayAgentCacheMixin,
+    GatewayRuntimeInitMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin, GatewayCanonicalTurnMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 
     def _adapter_for_source(self, source):
