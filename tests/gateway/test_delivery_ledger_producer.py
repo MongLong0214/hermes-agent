@@ -125,6 +125,28 @@ class TestProducerHook:
         assert rows[0][1] == "failed"
 
     @pytest.mark.asyncio
+    async def test_late_send_result_cannot_overwrite_a_redelivered_row(self):
+        """The producer's send outlives its claim: another process claims the row and delivers it,
+        then the producer's own send reports a failure. The row must stay delivered."""
+        adapter = _Adapter()
+        claims = []
+
+        async def _send(chat_id, content, reply_to=None, metadata=None):
+            if not claims:
+                with dl._connect() as conn:
+                    conn.execute(
+                        "UPDATE delivery_obligations SET owner_pid=999999999, owner_started_at=1")
+                claims.extend(dl.sweep_recoverable())
+                dl.mark_delivered(claims[0]["obligation_id"])  # the newer claim's send landed
+            return SendResult(success=False, error="chat_not_found")
+
+        adapter.send = _send
+        await _run(adapter, _event())
+
+        assert len(claims) == 1
+        assert [row[1] for row in _rows()] == ["delivered"]
+
+    @pytest.mark.asyncio
     async def test_late_transient_failure_signals_reconnected_runner(self):
         """A replacement installed mid-send must trigger another ledger sweep."""
         adapter = _Adapter()

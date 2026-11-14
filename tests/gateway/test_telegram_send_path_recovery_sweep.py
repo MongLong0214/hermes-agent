@@ -95,7 +95,7 @@ async def test_a_refusal_whose_failed_row_lands_after_recovery_is_still_swept(mo
     runner = _Runner()
     adapter, generation = _degraded_adapter(runner)
     marked = []
-    monkeypatch.setattr(ledger, "mark_failed", lambda oid, error: marked.append((oid, error)))
+    monkeypatch.setattr(ledger, "mark_failed", lambda oid, error, **_kw: marked.append((oid, error)))
     notice_open, release_notice = asyncio.Event(), asyncio.Event()
 
     async def _send_with_retry(**_kw):
