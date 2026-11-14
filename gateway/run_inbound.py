@@ -1246,7 +1246,10 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             # behind them, so arrival order (#28503) holds: oldest orphan runs as this turn, the rest drain
             # in order, the new message last.
             _orphan_adapter = self._delivery_adapter_for(source)
-            if _orphan_adapter is None or getattr(event, "internal", False) or event.get_command():
+            # An admitted /acp task must run as THIS turn: parked behind an orphan it would later drain
+            # as an ordinary turn without its admission.
+            if (_orphan_adapter is None or getattr(event, "internal", False) or event.get_command()
+                    or getattr(event, "_acp_admission", None) is not None):
                 return event, source, is_internal
             _rescued = self._rescue_orphaned_overflow(_quick_key, _orphan_adapter)
             if _rescued is None:
@@ -1317,6 +1320,58 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         note_busy_admitting(event)
         return True, await admit_message(authority, event)
 
+    def _hm_acp_classify(
+        self, event: MessageEvent, source: SessionSource, is_internal: bool,
+    ) -> tuple[bool, Optional[str]]:
+        """``(managed, refusal)``: an ``/acp`` task on the bound chat (never an internal event), refused when
+        ``gateway.acp_managed_admission`` is closed or the task is empty — before the ACP request, the
+        receipt, the turn marker or any ACP-correlated ledger row, so it goes out as an ordinary reply."""
+        from gateway import acp_managed_ingress
+        if is_internal or not acp_managed_ingress.is_managed(self, event, source):
+            return False, None
+        return True, acp_managed_ingress.refusal_before_admission(self, event, source)
+
+    async def _hm_new_turn_gate(
+        self, event: MessageEvent, source: SessionSource, _quick_key: str, is_internal: bool, acp_managed: bool,
+    ) -> tuple[bool, Optional[str]]:
+        """The last gates before a new turn is claimed: ``(True, reply)`` when this message must not start
+        one (the Telegram topic-root lobby, an external drain, an ``/acp`` task ACP did not admit). An
+        admitted task runs on its task text; ``send_final_ledgered`` settles its claimed receipt."""
+        # Pending exec approvals go through /approve and /deny only — no bare-text matching, or a
+        # conversational "yes" would execute a dangerous command.
+        if not is_internal:
+            if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
+                # Debounced so a user who forgets about topic mode doesn't get ten reminders.
+                if self._should_send_telegram_lobby_reminder(source):
+                    return True, self._telegram_topic_root_lobby_message()
+                return True, None
+            # External-drain new-turn gate: when NAS engaged an external drain (.drain_request.json,
+            # seen by _drain_control_watcher), refuse to START new turns so the in-flight set can
+            # only fall to zero. Reversible.
+            if self._external_drain_active:
+                logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
+                return True, t("gateway.busy.draining_maintenance")
+        if acp_managed:
+            from gateway import acp_managed_ingress
+            _acp = await acp_managed_ingress.admit(self, event, source, _quick_key)
+            if _acp.reply is not None:
+                return True, _acp.reply
+            event._acp_admission = _acp.admission
+            event.text = _acp.admission.task_text
+        return False, None
+
+    @staticmethod
+    def _hm_acp_not_run(event: MessageEvent) -> None:
+        """An admitted ``/acp`` task a gate past its admission refused: record the definite non-run and drop
+        the admission, so the notice sent instead is an ordinary reply that never certifies the receipt."""
+        admission = getattr(event, "_acp_admission", None)
+        if admission is None:
+            return
+        from gateway import acp_managed_ingress
+        acp_managed_ingress.abort_claimed(admission)
+        event._acp_admission = None
+        event._acp_handed_off = True
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
@@ -1342,7 +1397,13 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return _paused_notice
 
         _quick_key = self._session_key_for_source(source)
-        _reply = None if is_internal else await self._hm_pending_reply_intercepts(event, source, _quick_key)
+        # U4 H2 (CEO 36ade192): an explicit ``/acp <task>`` on the bound Telegram chat runs only after
+        # ACP admits it. It never answers a pending prompt, never queues behind a busy turn (a queued
+        # message would later run without admission) and never dispatches as a command — whatever
+        # follows the ``/acp`` token (newline, tab, ``@this_bot``, nothing at all).
+        _acp_managed, _acp_refusal = self._hm_acp_classify(event, source, is_internal)
+        _reply = _acp_refusal if is_internal or _acp_managed else await self._hm_pending_reply_intercepts(
+            event, source, _quick_key)
         if _reply is not None:
             return _reply
 
@@ -1355,26 +1416,17 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if self._is_session_running(_quick_key):
             self._hm_evict_reaped_agent(_quick_key)
         if self._is_session_running(_quick_key):
-            return await self._hm_handle_running_session_message(event, source, _quick_key)
+            from gateway.acp_managed_ingress import BUSY
+            return BUSY if _acp_managed else await self._hm_handle_running_session_message(event, source, _quick_key)
 
-        _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
+        _handled, _result = (False, None) if _acp_managed else await self._hm_dispatch_idle_commands(
+            event, source, _quick_key)
         if _handled:
             return _result
 
-        # Pending exec approvals go through /approve and /deny only — no bare-text matching, or a
-        # conversational "yes" would execute a dangerous command.
-        if not is_internal:
-            if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
-                # Debounced so a user who forgets about topic mode doesn't get ten reminders.
-                if self._should_send_telegram_lobby_reminder(source):
-                    return self._telegram_topic_root_lobby_message()
-                return None
-            # External-drain new-turn gate: when NAS engaged an external drain (.drain_request.json,
-            # seen by _drain_control_watcher), refuse to START new turns so the in-flight set can
-            # only fall to zero. Reversible.
-            if self._external_drain_active:
-                logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
-                return t("gateway.busy.draining_maintenance")
+        _refused, _refusal = await self._hm_new_turn_gate(event, source, _quick_key, is_internal, _acp_managed)
+        if _refused:
+            return _refusal
 
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
@@ -1382,6 +1434,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
         if _limit_message is not None:
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
+            self._hm_acp_not_run(event)
             return _limit_message
 
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
@@ -1402,12 +1455,14 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             if not is_internal:
                 _consumed, _consumer_reply = await self._hm_post_admission_consume(event, source, _quick_key)
                 if _consumed:
+                    self._hm_acp_not_run(event)  # a plugin took the admitted task: it never runs
                     return _consumer_reply
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
                 # A rejected message, not a completed turn: return before the /goal judge so it
                 # cannot consume the resend notice and enqueue a synthetic continuation loop.
+                self._hm_acp_not_run(event)  # the resend notice must not certify the receipt either
                 logger.error(
                     "Rejecting turn for routing key %s on session %s after "
                     "turn-lease timeout; transcript load was not started and "
