@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- canonical-surface port: create_session_strict (the strict, titled create behind the API fork's 409/400) reuses insert_session_row_in_transaction; offset by a split in a packet that owns a sibling
 """Session lifecycle mixin for SessionDB: row upsert/inheritance, lifecycle
 flags (end/reopen/archive/pin/hide/read), model_config patching, listing and
 counting, delete cascades, and the auto-archive sweep."""
@@ -419,6 +420,21 @@ class SessionSessionsMixin:
         """Create (upsert) a session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def create_session_strict(self, session_id: str, source: str, *, title: Optional[str] = None, **kwargs) -> bool:
+        """Create a NEW row: False when ``session_id`` is taken (nothing written), else True. ``title`` (user
+        provenance) lands in the same transaction, so a refused title (ValueError) leaves no row behind."""
+        from hermes_state_worker_lifecycle import insert_session_row_in_transaction
+        title = self.sanitize_title(title)
+
+        def _do(conn):  # one BEGIN IMMEDIATE: no writer can take the id between this check and the insert
+            if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone():
+                return False
+            insert_session_row_in_transaction(self, conn, session_id, source, **kwargs)
+            if title:
+                self._set_session_title_in_transaction(conn, session_id, title, source=self.TITLE_SOURCE_USER)
+            return True
+        return bool(self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S))
 
     def ensure_session(self, session_id: str, source: str = "unknown", model: str | None = None, **kwargs) -> str:
         """Ensure a session row exists (upsert). Accepts optional kwargs."""

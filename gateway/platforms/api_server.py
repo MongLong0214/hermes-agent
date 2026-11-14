@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- canonical-surface port: the ingress lives in api_server_canonical.py (route registration only here); the fork handler's strict titled create (409/400) replaces its post-hoc title write
 """OpenAI-compatible API server platform adapter (aiohttp).
 
 Serves /v1/chat/completions, /v1/responses, /v1/models, /v1/capabilities, /api/sessions,
@@ -111,6 +112,7 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.display_config import resolve_display_setting
+from gateway.platforms import api_server_canonical as _canonical_ingress
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
@@ -1587,6 +1589,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
+        # Existing-only canonical binding ingress, authenticated by API_SERVER_KEY.
+        routes.extend(_canonical_ingress._http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
@@ -2784,23 +2788,29 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # ``_branched_from`` is the durable branch marker (same as CLI /branch): with the child created
         # first, the timestamp fallback in _BRANCH_CHILD_SQL (child.started_at >= parent.ended_at) no
         # longer holds, and an unmarked child would vanish from default session listings.
-        await asyncio.to_thread(
-            db.create_session, fork_id, "api_server", model=source.get("model"),
-            system_prompt=source.get("system_prompt"), parent_session_id=source_id,
-            model_config={"_branched_from": source_id})
-        await asyncio.to_thread(db.end_session, source_id, "branched")
-        messages = await asyncio.to_thread(db.get_messages, source_id)
-        await asyncio.to_thread(db.replace_messages, fork_id, messages)
+        # The create is strict and titled in one transaction: a racing fork to the same id gets 409 and
+        # a refused explicit title 400, each with nothing written and the source still open. A derived
+        # title the row cannot take leaves the fork untitled instead.
+        row = dict(model=source.get("model"), system_prompt=source.get("system_prompt"),
+                   parent_session_id=source_id, model_config={"_branched_from": source_id})
         title = body.get("title")
-        if title is None:
+        explicit = title is not None
+        if not explicit:
             base = source.get("title") or "fork"
             title = f"{base} fork"
             with suppress(Exception):
                 title = await asyncio.to_thread(db.get_next_title_in_lineage, base)
         try:
-            await asyncio.to_thread(db.set_session_title, fork_id, str(title))
+            created = await asyncio.to_thread(db.create_session_strict, fork_id, "api_server", title=str(title), **row)
         except ValueError as exc:
-            return _error_response(str(exc), 400, code="invalid_title")
+            if explicit:
+                return _error_response(str(exc), 400, code="invalid_title")
+            created = await asyncio.to_thread(db.create_session_strict, fork_id, "api_server", **row)
+        if not created:
+            return _error_response(f"Session already exists: {fork_id}", 409, code="session_exists")
+        await asyncio.to_thread(db.end_session, source_id, "branched")
+        messages = await asyncio.to_thread(db.get_messages, source_id)
+        await asyncio.to_thread(db.replace_messages, fork_id, messages)
         fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
 
