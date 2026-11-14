@@ -503,7 +503,8 @@ async def _track_inflight_rpc(server: Any, server_name: str, op: str, *, retry_s
             inflight.discard(task)
 
 
-async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str, args: dict, progress_callback=None):
+async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str, args: dict, progress_callback=None,
+                                        *, meta: Optional[dict] = None):
     """``session.call_tool`` that fails fast when the stdio child is/gets dead: pre-call (a dead
     child must not hold the slot for the full timeout) and mid-call (race against
     ``_watch_stdio_children``). Both raise :class:`_StdioChildExited` for the respawn path, which
@@ -520,6 +521,8 @@ async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str
     # A progress callback makes the SDK send ``_meta.progressToken``, the spec's opt-in for
     # ``notifications/progress``; without one the server must stay silent.
     extra = {"progress_callback": progress_callback} if progress_callback is not None else {}
+    if meta is not None:
+        extra["meta"] = meta
     _call_coro = server.session.call_tool(tool_name, arguments=args, **extra)
     _watch_children = getattr(server, "_watch_stdio_children", None)
     if not (inspect.iscoroutinefunction(_watch_children) and asyncio.iscoroutine(_call_coro)):
@@ -698,6 +701,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
     op = f"tools/call {tool_name}"
 
     def _handler(args: dict, **kwargs) -> Any:
+        from tools.mcp_call_provenance import PROVENANCE_META_KEY, build_call_provenance, strip_caller_provenance
+        # Host-derived provenance, read here on the turn's thread, whatever context the MCP loop runs _call in.
+        args = strip_caller_provenance(args)
+        call_meta = {PROVENANCE_META_KEY: build_call_provenance()}
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
         booked: list = []  # a costed call's charge; refunded when the call never reaches the server
         error = _trust_gate_check(server_name, tool_name, booked, args)
@@ -727,7 +734,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
                 try:
                     result = await _call_tool_racing_stdio_death(
-                        server, server_name, tool_name, args, _on_progress if report is not None else None)
+                        server, server_name, tool_name, args, _on_progress if report is not None else None,
+                        meta=call_meta)
                 finally:
                     server._pending_call_context = None
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy

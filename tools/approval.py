@@ -579,7 +579,10 @@ def save_permanent_allowlist(patterns: set):
 def is_approval_bypass_active_for_session(session_key: str) -> bool:
     """Canonical three-source bypass check: process ``--yolo`` (frozen at import), the
     session-scoped gateway ``/yolo`` toggle, ``approvals.mode: off``. Pure bypass
-    sub-expression only — hardline blocklist / permanent allowlist are the caller's job."""
+    sub-expression only — hardline blocklist / permanent allowlist are the caller's job.
+    A canonical peer turn never inherits the owner's bypass: authority follows the turn principal."""
+    if approval_context.is_peer_turn():
+        return False
     return (_YOLO_MODE_FROZEN or is_session_yolo_enabled(session_key) or approval_context._get_approval_mode() == "off")
 
 
@@ -623,6 +626,14 @@ def _denied(message: str, *, pattern_key: str, description: str, outcome: str, n
 def _blocked(message: str, *, pattern_key: str, description: str) -> dict:
     """Non-interactive block (cron / -q / unattended / no-human): no consent keys."""
     return {"approved": False, "message": message, "pattern_key": pattern_key, "description": description}
+
+
+def _peer_turn_block(pattern_key: str = "canonical_peer", description: str = "canonical peer turn") -> dict | None:
+    """A canonical peer turn gets no approval decision at all: no bypass, no prompt, no allowlist."""
+    if not approval_context.is_peer_turn():
+        return None
+    return _blocked("BLOCKED: this turn came from a canonical peer, not the owner; it has no tool or approval "
+                    "authority. Do not retry.", pattern_key=pattern_key, description=description)
 
 
 def _user_approved(session_key: str, description: str) -> dict:
@@ -1103,6 +1114,8 @@ def _run_approval_gate(
     an explicit ``*_deny_message`` (the file-tool write gates word their own). ``pattern_keys``
     (default ``[pattern_key]``) are what a session/always answer persists.
     """
+    if (peer_block := _peer_turn_block(pattern_key, description)) is not None:
+        return peer_block
     # Hardline blocks are the caller's job BEFORE this gate, so yolo here only skips the recoverable approval layer.
     # ``approvals.mode: off`` is the third bypass source (the Desktop "Approvals: off" toggle writes it); the shell
     # guards honour it, so every action routed through this gate (computer_use, plugin rules, SSH-config writes,
@@ -1218,6 +1231,8 @@ def check_dangerous_command(command: str, env_type: str,
     """Detect a dangerous command and handle approval (pattern layer only). ``has_host_access``:
     a Docker sandbox that bind-mounts host paths must not skip approval.
     Returns ``{"approved": True/False, "message": str or None, ...}``."""
+    if (peer_block := _peer_turn_block()) is not None:
+        return peer_block
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _user_deny_block(command) or _approved()
     blocked = _floor_block(command)
@@ -1279,6 +1294,8 @@ def check_all_command_guards(command: str, env_type: str,
     """Run all pre-exec security checks and return a single approval decision. Plugins that
     want to veto or escalate a command do it from ``pre_tool_call``.
     ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow."""
+    if (peer_block := _peer_turn_block()) is not None:
+        return peer_block
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _user_deny_block(command) or _approved()
 
@@ -1359,6 +1376,8 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     """
     pattern_key = "execute_code"
     description = _EXECUTE_CODE_DESCRIPTION
+    if (peer_block := _peer_turn_block(pattern_key, description)) is not None:
+        return peer_block
 
     # Isolated backends already sandbox the child. vercel_sandbox has no host-bind concept so it stays always-skipped.
     if env_type == "vercel_sandbox":

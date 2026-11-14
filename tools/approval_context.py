@@ -35,6 +35,66 @@ _approval_session_id: contextvars.ContextVar[str] = _ctx("approval_session_id")
 _hermes_interactive_ctx: contextvars.ContextVar[str | None] = _ctx("hermes_interactive", None)
 
 
+# Principal of the turn running in this context. Unbound (the default) is an ordinary owner turn, unchanged. The
+# canonical peer surface binds ``"peer"`` for a turn another agent relayed through a verified binding: that turn never
+# inherits the owner's approval bypass and every approval gate refuses it. Any bound value other than exactly
+# ``"owner"`` (``"peer"``, ``None``, ``""``, a typo, a non-string) reads as a peer, so a principal that is missing or
+# corrupt fails closed. Context copies (``propagate_context_to_thread``, ``copy_context().run``) carry it into tool
+# workers and delegate children, so a child a peer turn spawns stays peer-scoped.
+_UNBOUND_PRINCIPAL = object()
+_turn_principal_ctx: contextvars.ContextVar[object] = contextvars.ContextVar("turn_principal",
+                                                                             default=_UNBOUND_PRINCIPAL)
+
+
+def set_turn_principal(principal: object) -> contextvars.Token:
+    """Bind the current turn's principal; pair with :func:`reset_turn_principal`."""
+    return _turn_principal_ctx.set(principal)
+
+
+def reset_turn_principal(token: contextvars.Token) -> None:
+    _turn_principal_ctx.reset(token)
+
+
+def get_turn_principal() -> str:
+    """``"owner"`` for an ordinary turn (nothing bound, or exactly ``"owner"``), else ``"peer"``: the value MCP call
+    provenance reports."""
+    value = _turn_principal_ctx.get()
+    return "owner" if value is _UNBOUND_PRINCIPAL or value == "owner" else "peer"
+
+
+def is_peer_turn() -> bool:
+    """True while a canonical peer turn, or a turn whose principal is unreadable, runs in this context."""
+    return get_turn_principal() == "peer"
+
+
+# How many delegation hops deep this context runs: 0 for a top-level turn, N for an Nth-generation subagent. A
+# delegated worker runs in a copy of its PARENT's context, so without the bump in :func:`as_delegation_hop` a
+# subagent's MCP call would be indistinguishable from the turn that dispatched it.
+_delegation_depth_ctx: contextvars.ContextVar[int] = contextvars.ContextVar("delegation_depth", default=0)
+
+
+def get_delegation_depth() -> int:
+    """0 for an ordinary turn; >0 while running inside a delegated subagent (the value MCP call provenance reports)."""
+    return _delegation_depth_ctx.get()
+
+
+def as_delegation_hop(fn):
+    """Run *fn* one delegation hop deeper, restoring the caller's depth on every exit path.
+
+    A synchronous child runs on its parent's own thread and context, so an unrestored bump would leave the parent
+    (and every later sibling) reporting the child's depth."""
+    import functools
+
+    @functools.wraps(fn)
+    def _hop(*args, **kwargs):
+        token = _delegation_depth_ctx.set(_delegation_depth_ctx.get() + 1)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _delegation_depth_ctx.reset(token)
+    return _hop
+
+
 def set_hermes_interactive_context(interactive: bool) -> contextvars.Token:
     """Bind interactive mode for the current context instead of mutating os.environ."""
     return _hermes_interactive_ctx.set("1" if interactive else "")

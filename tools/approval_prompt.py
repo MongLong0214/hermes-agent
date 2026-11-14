@@ -308,6 +308,9 @@ def request_elicitation_consent(message: str, description: str, *,
     once/deny. With it, the session and always choices are offered and recorded under
     that approval key; the caller checks ``tools.approval.is_approved`` before asking."""
     from tools import approval as _a
+    if _ctx.is_peer_turn():
+        # A canonical peer turn asks nobody: no prompt reaches the owner on a peer's behalf.
+        return "decline"
     try:
         session_key = _ctx.get_current_session_key()
     except Exception as exc:  # pragma: no cover -- defensive
