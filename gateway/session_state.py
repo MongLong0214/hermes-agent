@@ -75,6 +75,8 @@ class ConversationState:
     # (channel_prompt, parent_chat_id) of the last non-internal turn; internal events reuse it
     channel_pin: Optional[tuple[Optional[str], Optional[str]]] = None
     vc_last: Optional[str] = None  # last voice-channel context delivered
+    goal_compression_recovery: Optional[dict[str, Any]] = None  # hermes_cli.goals recovery state
+    loop_compression_recovery: Optional[dict[str, Any]] = None  # LoopManager.complete_exhausted_tick state
 
     def clear(self) -> None:
         """Reset every field to its default, so new fields are cleared automatically."""

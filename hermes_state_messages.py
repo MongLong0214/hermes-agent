@@ -1854,20 +1854,22 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
 
     def rewind_to_message(self, session_id: str, target_message_id: int, *, preserve_compaction_handoff: bool = False,
                           expected_active_ids: Optional[list[int]] = None,
-                          expected_target_content: Any = None) -> dict[str, Any]:
+                          expected_target_content: Any = None, turn_lease_holder: Optional[str] = None) -> dict[str, Any]:
         """Soft-delete (``active=0``) every message with id >= *target_message_id*, target included (the caller
         pre-fills it as the next prompt). Returns ``{"rewound_count", "target_message", "new_head_id"}``, plus
         ``replacement_message_id`` with ``preserve_compaction_handoff`` (archives a composite summary carrier,
         inserts its hidden handoff scaffold as the new head). ``ValueError``: target missing or not ``user``.
         ``expected_active_ids`` / ``expected_target_content`` pin the active set and canonical live payload
         in-txn before any mutation (presentation-only metadata changes don't invalidate a rewind). A live turn
-        lease refuses; expired/dead holders are reclaimed. ``rewind_count`` always increments."""
+        lease refuses unless ``turn_lease_holder`` owns it (a turn retracting its own row); expired/dead holders
+        are reclaimed. ``rewind_count`` always increments."""
         from hermes_state_mutation_transcript import rewind_in_transaction
         def _do(conn):
             target_row, ids, head_id, replacement_id = rewind_in_transaction(
                 self, conn, session_id, target_message_id,
                 preserve_compaction_handoff=preserve_compaction_handoff,
-                expected_active_ids=expected_active_ids, expected_target_content=expected_target_content)
+                expected_active_ids=expected_active_ids, expected_target_content=expected_target_content,
+                turn_lease_holder=turn_lease_holder)
             # The scaffold insert stamped a ``message_uid``; read it back in the same txn so the
             # caller can address the new head by its durable identity.
             replacement_uid = replacement_id and conn.execute(

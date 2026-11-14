@@ -507,6 +507,86 @@ class TestSelfPacedBackoff:
         assert mgr.state.current_delay == floor * 2  # digest ignored the clock
 
 
+class TestCompressionExhaustedTick:
+    """A tick whose turn exhausted compression added no reply: never judged, bounded retries."""
+
+    PAUSE = ("⏸ Loop paused after context compression was exhausted twice. "
+             "Run /compress, then /loop resume to continue.")
+
+    def _fired(self, sid, **kwargs):
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager(session_id=sid)
+        state = mgr.set("poll the build", interval_seconds=300, **kwargs)
+        state.next_due_at = time.time() - 1
+        assert mgr.fire_tick() is not None
+        return mgr
+
+    def test_first_exhaustion_schedules_next_tick_unjudged(self, hermes_home):
+        mgr = self._fired("ex1", until="the build is green")
+        with patch("hermes_cli.goals.judge_goal", side_effect=AssertionError("judged")) as judge:
+            decision, state = mgr.complete_exhausted_tick(None)
+        judge.assert_not_called()
+        assert decision["stopped"] is False
+        assert decision["status"] == "active"
+        assert mgr.state.awaiting_response is False
+        assert mgr.state.next_due_at > time.time() + 200
+        assert state == {"loop_created_at": mgr.state.created_at, "ticks": 1}
+
+    def test_second_consecutive_exhaustion_pauses(self, hermes_home):
+        from hermes_cli.loops import LoopManager
+
+        mgr = self._fired("ex2", until="the build is green")
+        _decision, state = mgr.complete_exhausted_tick(None)
+        mgr.state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        with patch("hermes_cli.goals.judge_goal", side_effect=AssertionError("judged")) as judge:
+            decision, next_state = mgr.complete_exhausted_tick(state)
+        judge.assert_not_called()
+        assert decision == {"status": "paused", "stopped": True,
+                            "reason": "context compression exhausted twice consecutively",
+                            "message": self.PAUSE}
+        assert next_state is None
+        reloaded = LoopManager(session_id="ex2").state
+        assert reloaded.status == "paused"
+        assert reloaded.awaiting_response is False
+        assert reloaded.paused_reason == "context compression exhausted twice consecutively"
+
+    def test_cleared_state_after_a_good_tick_retries_again(self, hermes_home):
+        mgr = self._fired("ex3")
+        mgr.complete_exhausted_tick(None)
+        mgr.state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        decision, state = mgr.complete_exhausted_tick(None)  # host cleared it after a good tick
+        assert decision["stopped"] is False
+        assert state["ticks"] == 1
+
+    def test_state_from_another_loop_does_not_count(self, hermes_home):
+        mgr = self._fired("ex4")
+        decision, state = mgr.complete_exhausted_tick(
+            {"loop_created_at": mgr.state.created_at - 5.0, "ticks": 1})
+        assert decision["stopped"] is False
+        assert state["ticks"] == 1
+
+    def test_caps_still_apply_and_clear_state(self, hermes_home):
+        mgr = self._fired("ex5", times=1)
+        decision, state = mgr.complete_exhausted_tick(None)
+        assert decision["stopped"] is True
+        assert decision["status"] == "done"
+        assert state is None
+
+    def test_no_tick_in_flight_is_a_noop(self, hermes_home):
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager(session_id="ex6")
+        mgr.set("poll", interval_seconds=300)
+        decision, state = mgr.complete_exhausted_tick({"loop_created_at": mgr.state.created_at, "ticks": 1})
+        assert decision["stopped"] is False
+        assert decision["reason"] == "no tick in flight"
+        assert state is None
+        assert mgr.state.status == "active"
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Controls (pause/resume/clear) + min interval + status
 # ──────────────────────────────────────────────────────────────────────

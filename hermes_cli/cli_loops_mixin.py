@@ -821,8 +821,16 @@ class CLILoopsMixin:
                 pass
             _cprint(f"  {_DIM}{t('cli.loop.paused_interrupted')}{_RST}")
             return
-        decision = mgr.complete_tick("" if getattr(self, "_last_turn_failed", False)
-                                     else self._last_assistant_response_text())
+        # A compression-exhausted tick is never judged: one retry, then the loop pauses. The
+        # gateway-backed manager has no such call (``session.automation``), so it keeps complete_tick("").
+        complete_exhausted = getattr(mgr, "complete_exhausted_tick", None)
+        if getattr(self, "_last_turn_compression_exhausted", False) and complete_exhausted is not None:
+            decision, self._loop_compression_recovery = complete_exhausted(
+                getattr(self, "_loop_compression_recovery", None))
+        else:
+            self._loop_compression_recovery = None
+            decision = mgr.complete_tick("" if getattr(self, "_last_turn_failed", False)
+                                         else self._last_assistant_response_text())
         # With the live-work dock up its loop row carries the countdown; the one-shot line would go stale.
         if (not _print_decision_message(decision) and decision.get("status") == "active"
                 and mgr.state is not None and getattr(self, "_subagent_monitor", None) is None):
@@ -864,6 +872,20 @@ class CLILoopsMixin:
                 logging.debug("goal pause-on-interrupt failed: %s", exc)
             _cprint(f"  {_DIM}{t('cli.goal.paused_interrupted')}{_RST}")
             return
+        # A compression-exhausted turn added no reply (the last one is stale), so it is never judged, and
+        # returning silently would leave the goal active with nothing queued. The session is kept, so each
+        # retry re-sends the oversized request: the shared bound allows one retry, then pauses the goal.
+        if getattr(self, "_last_turn_compression_exhausted", False):
+            from hermes_cli.goals import plan_compression_exhaustion_recovery
+            prompt, notice, self._goal_compression_recovery = plan_compression_exhaustion_recovery(
+                mgr, getattr(self, "_goal_compression_recovery", None))
+            _cprint(f"  {_DIM}{notice}{_RST}")
+            if prompt:
+                try:
+                    self._pending_input.put(prompt)
+                except Exception as exc:
+                    logging.debug("goal continuation enqueue failed: %s", exc)
+            return
 
         # Empty/whitespace responses are almost always transient failures (API error,
         # empty stream): judging would say "continue" and trip the parse-failure backstop.
@@ -874,6 +896,7 @@ class CLILoopsMixin:
         last_response = self._last_assistant_response_text()
         if not last_response.strip():
             return
+        self._goal_compression_recovery = None
         _active_deleg = 0
         try:
             from hermes_cli.goals import count_active_delegations, gather_background_processes as _gather_bg

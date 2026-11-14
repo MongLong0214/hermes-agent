@@ -325,8 +325,9 @@ def failure_cause_gloss(reason: Any, *, subject: str = "it", possessive: str = "
 _FAILURE_CODE_COPY: dict[str, str] = {
     "context_overflow": (
         "This conversation has grown too long for {model} to read, and Hermes couldn't shrink "
-        "it enough automatically. Start a new session with /new (your history is kept), or try "
-        "/compress once more. Switching to a model with a bigger context window also works."
+        "it enough automatically, so your last message was not answered. Try /compress once more "
+        "and send it again, or start a new session with /new (your history is kept). Switching to "
+        "a model with a bigger context window also works."
     ),
     "truncated": (
         "The model's reply was cut off before it finished (it hit its output length limit), so "

@@ -17,6 +17,8 @@ from hermes_cli.gateway_client import GatewayClientError
 logger = logging.getLogger(__name__)
 
 _ERRORS = {"RuntimeError": RuntimeError, "ValueError": ValueError, "IndexError": IndexError}
+# A loop decision when the gateway call was dropped: nothing stopped, nothing to print.
+_UNAVAILABLE = {"status": None, "stopped": False, "reason": "gateway unavailable", "message": ""}
 
 
 def _decode(value):
@@ -209,8 +211,14 @@ class GatewayLoopManager(_Remote):
 
     def complete_tick(self, last_response):
         decision = self._rpc("complete_tick", last_response or "")
-        return decision if isinstance(decision, dict) else {"status": None, "stopped": False,
-                                                             "reason": "gateway unavailable", "message": ""}
+        return decision if isinstance(decision, dict) else dict(_UNAVAILABLE)
+
+    def complete_exhausted_tick(self, recovery_state):
+        """``(decision, next_state)``, the bound evaluated on the gateway; a dropped call keeps the state."""
+        reply = self._rpc("complete_exhausted_tick", recovery_state)
+        if isinstance(reply, list) and len(reply) == 2 and isinstance(reply[0], dict):
+            return reply[0], reply[1] if isinstance(reply[1], dict) else None
+        return dict(_UNAVAILABLE), recovery_state
 
     def goal_blocks_tick(self):
         return bool(self._rpc("goal_blocks_tick"))

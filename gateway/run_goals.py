@@ -299,19 +299,48 @@ class GatewayGoalsMixin:
         # The manager loads its state from state.db on construction: off the loop, in this scope.
         return await asyncio.to_thread(factory, sid)
 
+    def _post_turn_conversation(self, session_entry: Any, source: Any):
+        """The turn's ``ConversationState`` (conversation boundaries such as /new clear it), or None."""
+        key = None
+        if source is not None:
+            with suppress(Exception):
+                key = self._session_key_for_source(source)
+        key = key or getattr(session_entry, "session_key", None)
+        return self._session_state(key).conversation if key else None
+
     async def _post_turn_goal_continuation(
-        self, *, session_entry: Any, source: Any, final_response: str,
+        self, *, session_entry: Any, source: Any, final_response: str, compression_exhausted: bool = False,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
-        continuation through the adapter FIFO so a simultaneous real user message takes priority."""
+        continuation through the adapter FIFO so a simultaneous real user message takes priority.
+        A compression-exhausted turn is never judged: it gets the bounded retry shared with the TUI
+        and CLI (one continuation on the same session, then the goal pauses)."""
         def _load():
             from hermes_cli.goals import GoalManager
             max_turns = self._goal_max_turns_from_config()
             return lambda sid: GoalManager(session_id=sid, default_max_turns=max_turns)
 
         mgr = await self._post_turn_manager(session_entry, "goal continuation", "goals", _load)
+        conversation = self._post_turn_conversation(session_entry, source)
         if mgr is None or not mgr.is_active():
+            if conversation is not None:
+                conversation.goal_compression_recovery = None
             return
+        if compression_exhausted:
+            from hermes_cli.goals import plan_compression_exhaustion_recovery
+            # pause() writes state.db: off the loop, with the profile contextvars.
+            prompt, msg, next_state = await self._run_in_executor_with_context(
+                plan_compression_exhaustion_recovery, mgr,
+                conversation.goal_compression_recovery if conversation is not None else None,
+            )
+            if conversation is not None:
+                conversation.goal_compression_recovery = next_state
+            if source is not None:
+                await self._defer_goal_status_notice_after_delivery(source, msg)
+            await self._enqueue_goal_continuation(source, prompt)
+            return
+        if conversation is not None:
+            conversation.goal_compression_recovery = None
 
         _bg_procs, _active_deleg = None, 0
         with suppress(Exception):
@@ -334,8 +363,12 @@ class GatewayGoalsMixin:
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
-        prompt = decision.get("continuation_prompt") or ""
-        if not decision.get("should_continue") or not prompt or source is None:
+        if decision.get("should_continue"):
+            await self._enqueue_goal_continuation(source, decision.get("continuation_prompt"))
+
+    async def _enqueue_goal_continuation(self, source: Any, prompt: Optional[str]) -> None:
+        """Queue the next goal turn on the same session; a real user message already queued runs first."""
+        if not prompt or source is None:
             return
         if getattr(source, "platform", None) == Platform.LOCAL:
             # A local session's adapter FIFO has no reader: its turns are authority admissions.
@@ -375,13 +408,17 @@ class GatewayGoalsMixin:
         # still needs to be released and rescheduled. A failed turn with text (a refusal: its
         # folder is gone) is no evidence either (the TUI's hook skips it the same way): the tick is
         # released with no text, so a --until judge never grades it.
+        # A compression-exhausted turn is failed too, but it is not left there: both hooks apply the
+        # shared bound (never judged; one retry, then pause) instead of leaving the goal active and idle.
         failed = self._turn_failed()
+        exhausted = self._turn_compression_exhausted(agent_result)
         hooks = [("loop completion", self._post_turn_loop_completion)]
-        if final_text.strip() and not failed:
+        if (final_text.strip() and not failed) or exhausted:
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             try:
-                await hook(session_entry=session_entry, source=source, final_response="" if failed else final_text)
+                await hook(session_entry=session_entry, source=source, final_response="" if failed else final_text,
+                           compression_exhausted=exhausted)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
         await self._publish_local_control(source, only_if_present=True)
@@ -396,13 +433,25 @@ class GatewayGoalsMixin:
         await publish_async(active_authority(self), source.chat_id, only_if_present=only_if_present)
 
     @staticmethod
-    def _turn_failed() -> bool:
-        """Whether the owner recorded this turn's result as failed (``session_ingress`` captures it
-        around ``_handle_message``; turns outside an owner capture nothing)."""
+    def _captured_turn_result() -> dict:
+        """The result the owner recorded for this turn (``session_ingress`` captures it around
+        ``_handle_message``; turns outside an owner capture nothing)."""
         from gateway.session_results import execution_result
         captured = execution_result.get() or {}
         result = captured.get('terminal_result', captured.get('result'))
-        return isinstance(result, dict) and bool(result.get('failed'))
+        return result if isinstance(result, dict) else {}
+
+    @classmethod
+    def _turn_failed(cls) -> bool:
+        """Whether the owner recorded this turn's result as failed."""
+        return bool(cls._captured_turn_result().get('failed'))
+
+    @classmethod
+    def _turn_compression_exhausted(cls, agent_result: Any) -> bool:
+        """Whether the turn ended on compression exhaustion; a lock-contended defer is not one.
+        ``_handle_message_with_agent`` returns the reply text, so the owner's captured result decides then."""
+        result = agent_result if isinstance(agent_result, dict) else cls._captured_turn_result()
+        return bool(result.get("compression_exhausted") and not result.get("compression_deferred"))
 
     @staticmethod
     def _final_text_for_post_turn_hooks(agent_result, event=None) -> str:
@@ -419,11 +468,12 @@ class GatewayGoalsMixin:
         return streamed if isinstance(streamed, str) and streamed.strip() else text
 
     async def _post_turn_loop_completion(
-        self, *, session_entry: Any, source: Any, final_response: str,
+        self, *, session_entry: Any, source: Any, final_response: str, compression_exhausted: bool = False,
     ) -> None:
         """Complete a /loop wakeup tick after a gateway turn. No-op unless a tick is in flight
         (``awaiting_response``, set when the wakeup was injected); applies the LOOP_COMPLETE marker
-        / --until judge / caps and schedules the next tick for the idle wakeup watcher."""
+        / --until judge / caps and schedules the next tick for the idle wakeup watcher. An exhausted
+        tick is never judged; the same bound as /goal applies — one retry, then the loop pauses."""
         def _load():
             from hermes_cli.loops import LoopManager
             return lambda sid: LoopManager(session_id=sid)
@@ -432,10 +482,20 @@ class GatewayGoalsMixin:
         state = mgr.state if mgr is not None else None
         if state is None or not state.awaiting_response:
             return
+        conversation = self._post_turn_conversation(session_entry, source)
         # The --until judge is a sync aux-LLM call — keep it off the event loop, but carry the
         # contextvars: a bare executor hop drops the profile HERMES_HOME override and secret scope,
         # so a served secondary's tick would be written into the DEFAULT profile's state.db.
-        decision = await self._run_in_executor_with_context(mgr.complete_tick, final_response or "")
+        next_state = None
+        if compression_exhausted:
+            decision, next_state = await self._run_in_executor_with_context(
+                mgr.complete_exhausted_tick,
+                conversation.loop_compression_recovery if conversation is not None else None,
+            )
+        else:
+            decision = await self._run_in_executor_with_context(mgr.complete_tick, final_response or "")
+        if conversation is not None:
+            conversation.loop_compression_recovery = next_state
         msg = decision.get("message") or ""
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)

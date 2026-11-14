@@ -1799,8 +1799,8 @@ def _run_conversation_turn(
 
     result = _finalize_from_state(agent, s)
     if s._compression_timeout_exhausted:
-        # Reuse the gateway's context-recovery contract: transcript stays intact while
-        # future input can move to a clean session (#98722).
+        # Reuse the gateway's context-recovery contract: the session keeps its history, the
+        # unanswered ask is retracted owner-side, and the user chooses /compress or /new (#98722).
         result.update(error=_COMPRESSION_TIMEOUT_FINAL_RESPONSE, partial=True, compression_exhausted=True)
     return result
 
@@ -1925,7 +1925,10 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
 
     Excluded: the context-pressure classes (``compression_exhausted``, ``compression_deferred``,
     ``failure_reason == "context_overflow"``) — appending to an already-oversized session is the
-    #1630 growth loop; their repair is rotation or a retry. ``content_policy_blocked`` too: the
+    #1630 growth loop. An exhausted turn instead retracts its own user row here, under its own turn
+    lease (``_retract_exhausted_turn``); a worker store has no rewind, so there the gateway retracts it
+    once the lease is released (``_hmwa_retract_exhausted_turn``). The others are left for a retry.
+    ``content_policy_blocked`` too: the
     WHOLE refused turn is erased from the conversation — the user message, any tool rounds that ran,
     and the refusal (the owner rewinds it durably: the gateway owner-side for Bot Chat, the CLI/ACP
     owner for their direct DB; in-memory surfaces return the pre-refusal history). Erasing the whole
@@ -1938,16 +1941,21 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
     try:
         if not isinstance(result, dict) or result.get("completed") is True:
             return
-        if (
-            result.get("compression_exhausted") or result.get("compression_deferred")
-            or result.get("failure_reason") in ("context_overflow", "content_policy_blocked")
-        ):
+        if result.get("compression_deferred") or result.get("failure_reason") == "content_policy_blocked":
+            return
+        exhausted = bool(result.get("compression_exhausted"))
+        if not exhausted and result.get("failure_reason") == "context_overflow":
             return
         messages = result.get("messages")
         db, session_id = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
         if not isinstance(messages, list) or not messages or db is None or not session_id:
             return
-        if getattr(agent, "_persist_disabled", False) or db.latest_conversation_role(session_id) not in OPEN_TURN_TAIL_ROLES:
+        if getattr(agent, "_persist_disabled", False):
+            return
+        if exhausted:
+            _retract_exhausted_turn(agent, result, messages, db, session_id)
+            return
+        if db.latest_conversation_role(session_id) not in OPEN_TURN_TAIL_ROLES:
             return
         # Scope the "did a tool run" scan to this turn when its boundary is proven; otherwise
         # hedge over the whole list rather than under-report a possible side effect.
@@ -1962,6 +1970,28 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
         agent._flush_messages_to_session_db(messages)
     except Exception:
         logger.debug("failed-turn boundary not written", exc_info=True)
+
+
+def _retract_exhausted_turn(agent, result: dict[str, Any], messages: list[dict[str, Any]], db, session_id) -> None:
+    """Soft-delete a compression-exhausted turn's own user row, the durable tail the turn-start flush wrote.
+
+    Exhaustion keeps the session, so an open row would be merged into the next ask (#107070) and replayed
+    on every later request, and closing it would replay it too while growing an oversized session (#1630).
+    Only a ``user`` tail, durable and in memory, is retracted: a turn that ran tools first keeps its record.
+    Uses the /undo rewind (carrier-aware, active set and warm history pinned) under this turn's own lease,
+    so a lease another turn holds still refuses it; any mismatch raises and leaves the row where it is.
+    The turn boundary keys go with the row, as on the preflight-timeout exhaustion, which never writes it.
+    """
+    if not isinstance(messages[-1], dict) or messages[-1].get("role") != "user":
+        return
+    rewind = getattr(db, "rewind_user_turn", None)
+    if rewind is None or db.latest_conversation_role(session_id) != "user":
+        return  # a worker store: the gateway retracts it owner-side once the lease is released
+    outcome = rewind(session_id, -1, warm_history=messages,
+                     turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None))
+    messages[:] = outcome.prefix
+    result.pop("turn_id", None)
+    result.pop("current_turn_user_idx", None)
 
 
 __all__ = ["run_conversation"]

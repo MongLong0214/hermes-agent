@@ -174,3 +174,127 @@ async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     assert not adapter._pending_messages
 
 
+
+
+# ── compression exhaustion: the bound the TUI and CLI share ─────────
+
+_EXHAUSTED = {"final_response": "This conversation has grown too long.", "failed": True,
+              "partial": True, "compression_exhausted": True, "completed": False}
+
+
+def _fifo_recorder(runner):
+    enqueued = []
+    runner._enqueue_fifo = lambda key, event, _adapter: enqueued.append((key, event.text))
+    return enqueued
+
+
+@pytest.mark.asyncio
+async def test_exhausted_turn_is_not_judged_and_schedules_one_continuation(hermes_home):
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    enqueued = _fifo_recorder(runner)
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(session_entry.session_id)
+    mgr.set("polish the docs")
+    judge = MagicMock(return_value=("done", "looks finished", False, None, False))
+    with patch("hermes_cli.goals.judge_goal", judge):
+        await runner._run_post_turn_hooks(agent_result=dict(_EXHAUSTED), source=src, is_internal=False)
+        await _drain_until(lambda: adapter.sends)
+
+    judge.assert_not_called()
+    assert enqueued == [(session_entry.session_key, mgr.next_continuation_prompt())]
+    assert [s["content"] for s in adapter.sends] == [
+        "Context compression was exhausted. Retrying the active goal once."]
+    state = GoalManager(session_entry.session_id).state
+    assert state.status == "active" and state.turns_used == 0
+    conversation = runner._session_state(session_entry.session_key).conversation
+    assert conversation.goal_compression_recovery["attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_second_exhaustion_pauses_the_goal_and_posts_the_notice_once(hermes_home):
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    enqueued = _fifo_recorder(runner)
+    from gateway.session_results import execution_result
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_entry.session_id).set("polish the docs")
+    judge = MagicMock(return_value=("continue", "keep going", False, None, False))
+    reply = _EXHAUSTED["final_response"]
+    with patch("hermes_cli.goals.judge_goal", judge):
+        for turn in (1, 2):
+            # The live path returns the reply text; the owner captured the result dict.
+            token = execution_result.set({"result": dict(_EXHAUSTED)})
+            try:
+                await runner._run_post_turn_hooks(agent_result=reply, source=src, is_internal=False)
+            finally:
+                execution_result.reset(token)
+            await _drain_until(lambda: len(adapter.sends) >= turn)
+
+    judge.assert_not_called()
+    assert len(enqueued) == 1 and "polish the docs" in enqueued[0][1], "exactly one retry"
+    state = GoalManager(session_entry.session_id).state
+    assert state.status == "paused"
+    assert state.paused_reason == "context compression exhausted twice consecutively"
+    pause = [s["content"] for s in adapter.sends if "paused" in s["content"].lower()]
+    assert pause == ["Goal paused after context compression was exhausted twice. "
+                     "Run /compress, then /goal resume to continue."]
+    assert runner._session_state(session_entry.session_key).conversation.goal_compression_recovery is None
+
+
+@pytest.mark.asyncio
+async def test_compression_deferred_is_not_exhaustion(hermes_home):
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    _fifo_recorder(runner)
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_entry.session_id).set("polish the docs")
+    deferred = dict(_EXHAUSTED, compression_deferred=True)
+    judge = MagicMock(return_value=("continue", "keep going", False, None, False))
+    with patch("hermes_cli.goals.judge_goal", judge):
+        for _ in range(2):
+            await runner._run_post_turn_hooks(agent_result=dict(deferred), source=src, is_internal=False)
+    await asyncio.sleep(0.05)
+    assert GoalManager(session_entry.session_id).state.status == "active"
+    assert not any("compression was exhausted" in s["content"] for s in adapter.sends)
+    assert runner._session_state(session_entry.session_key).conversation.goal_compression_recovery is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_state_is_conversation_scoped_and_cleared_by_new(hermes_home):
+    from gateway.session_state import ConversationState
+
+    assert ConversationState().goal_compression_recovery is None
+    assert ConversationState().loop_compression_recovery is None
+    runner, _adapter, session_entry, src = _make_runner_with_adapter()
+    _fifo_recorder(runner)
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_entry.session_id).set("polish the docs")
+    with patch("hermes_cli.goals.judge_goal", MagicMock()):
+        await runner._run_post_turn_hooks(agent_result=dict(_EXHAUSTED), source=src, is_internal=False)
+    conversation = runner._session_state(session_entry.session_key).conversation
+    conversation.loop_compression_recovery = {"loop_created_at": 1.0, "ticks": 1}
+    assert conversation.goal_compression_recovery is not None
+
+    runner._clear_conversation_scope(session_entry.session_key, reason="session_reset")  # the /new funnel
+
+    assert conversation.goal_compression_recovery is None
+    assert conversation.loop_compression_recovery is None
+
+
+@pytest.mark.asyncio
+async def test_successful_turn_between_exhaustions_resets_the_bound(hermes_home):
+    runner, _adapter, session_entry, src = _make_runner_with_adapter()
+    enqueued = _fifo_recorder(runner)
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_entry.session_id).set("polish the docs")
+    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "keep going", False, None, False)):
+        await runner._run_post_turn_hooks(agent_result=dict(_EXHAUSTED), source=src, is_internal=False)
+        await runner._run_post_turn_hooks(agent_result={"final_response": "real progress"}, source=src,
+                                          is_internal=False)
+        assert runner._session_state(session_entry.session_key).conversation.goal_compression_recovery is None
+        await runner._run_post_turn_hooks(agent_result=dict(_EXHAUSTED), source=src, is_internal=False)
+    assert len(enqueued) == 3
+    assert GoalManager(session_entry.session_id).state.status == "active"
