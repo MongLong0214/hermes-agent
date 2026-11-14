@@ -72,14 +72,15 @@ class TestGeminiCredentials:
         assert creds["api_key"] == "gemini-secret"
 
 
-    def test_runtime_gemini(self, monkeypatch):
+    def test_runtime_gemini_is_refused_before_any_rung_reads_the_key(self, monkeypatch):
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+        from hermes_cli import runtime_provider
+
         monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-        result = resolve_runtime_provider(requested="gemini")
-        assert result["provider"] == "gemini"
-        assert result["api_mode"] == "chat_completions"
-        assert result["api_key"] == "google-key"
-        assert result["base_url"] == "https://generativelanguage.googleapis.com/v1beta"
+        with patch.object(runtime_provider, "_ladder_rungs") as rungs:
+            with pytest.raises(GeminiOutboundDenied):
+                runtime_provider.resolve_runtime_provider(requested="gemini")
+        rungs.assert_not_called()
 
 
 # ── Model Catalog ──
@@ -108,32 +109,37 @@ class TestGeminiModelNormalization:
 
 class TestGeminiAgentInit:
 
-    def test_gemini_agent_uses_chat_completions(self, monkeypatch):
-        """Gemini still reports chat_completions even though the transport is native."""
+    def test_gemini_agent_is_refused_at_init_before_any_client(self, monkeypatch):
+        """A Gemini agent on Google's endpoint is refused before the native client is built."""
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
         monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
         with patch("agent.gemini_native_adapter.GeminiNativeClient") as mock_client:
             mock_client.return_value = MagicMock()
             from run_agent import AIAgent
-            agent = AIAgent(
-                model="gemini-2.5-flash",
-                provider="gemini",
-                api_key="test-key",
-                base_url="https://generativelanguage.googleapis.com/v1beta",
-            )
-            assert agent.api_mode == "chat_completions"
-            assert agent.provider == "gemini"
+            with pytest.raises(GeminiOutboundDenied):
+                AIAgent(
+                    model="gemini-2.5-flash",
+                    provider="gemini",
+                    api_key="test-key",
+                    base_url="https://generativelanguage.googleapis.com/v1beta",
+                )
+        mock_client.assert_not_called()
 
 
 
-    def test_gemini_resolve_provider_client_uses_native_client(self, monkeypatch):
-        """resolve_provider_client('gemini') should build GeminiNativeClient."""
+    def test_gemini_resolve_provider_client_is_refused_before_any_client(self, monkeypatch):
+        """resolve_provider_client('gemini') builds neither GeminiNativeClient nor an OpenAI client."""
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
         monkeypatch.setenv("GEMINI_API_KEY", "AIzaSy_TEST_KEY")
         with patch("agent.gemini_native_adapter.GeminiNativeClient") as mock_client, \
              patch("agent.auxiliary_client.OpenAI") as mock_openai:
             mock_client.return_value = MagicMock()
             from agent.auxiliary_client import resolve_provider_client
-            resolve_provider_client("gemini")
-        assert mock_client.called
+            with pytest.raises(GeminiOutboundDenied):
+                resolve_provider_client("gemini")
+        mock_client.assert_not_called()
         mock_openai.assert_not_called()
 
 

@@ -10,7 +10,9 @@ landed at ~96K against a real safe input budget of ~65K, and the provider
 400'd before compaction ever fired.
 
 These tests assert the compressor's reservation mirrors the adapter default
-on the native Gemini path, and ONLY there.
+on the native Gemini path, and ONLY there. A Google-hosted endpoint is now
+refused at agent init (Google outbound denial), so those cases assert the
+refusal: no client is ever built for them.
 """
 
 
@@ -18,10 +20,11 @@ on the native Gemini path, and ONLY there.
 
 from unittest.mock import patch
 
-
+import pytest
 
 import agent.context_compressor as cc_mod
 from agent.gemini_native_adapter import GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
+from agent.gemini_outbound_policy import GeminiOutboundDenied
 
 
 CFG = {"agent": {}}
@@ -53,15 +56,17 @@ def _build_agent(model, base_url, provider="", max_tokens=None, window=131072):
         )
 
 
-def test_native_gemini_unset_max_tokens_reserves_adapter_default():
-    agent = _build_agent(
-        "gemma-3-27b-it",
-        "https://generativelanguage.googleapis.com/v1beta",
-    )
-    cc = agent.context_compressor
-    assert cc.max_tokens == GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
-    # Trigger must sit at/below the real safe input budget the wire leaves.
-    assert cc.threshold_tokens <= cc.context_length - GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
+def _assert_refused_before_any_client(model, base_url, **kwargs):
+    with patch("agent.agent_runtime_helpers.create_openai_client") as build_client, \
+         patch("agent.gemini_native_adapter.GeminiNativeClient") as native_client:
+        with pytest.raises(GeminiOutboundDenied):
+            _build_agent(model, base_url, **kwargs)
+    build_client.assert_not_called()
+    native_client.assert_not_called()
+
+
+def test_native_gemini_host_is_refused_before_any_client():
+    _assert_refused_before_any_client("gemma-3-27b-it", "https://generativelanguage.googleapis.com/v1beta")
 
 
 def test_gemini_provider_name_also_reserves_default():
@@ -71,13 +76,9 @@ def test_gemini_provider_name_also_reserves_default():
     assert agent.context_compressor.max_tokens == GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
 
 
-def test_explicit_max_tokens_wins_over_adapter_default():
-    agent = _build_agent(
-        "gemma-3-27b-it",
-        "https://generativelanguage.googleapis.com/v1beta",
-        max_tokens=8192,
-    )
-    assert agent.context_compressor.max_tokens == 8192
+def test_explicit_max_tokens_on_the_native_host_is_refused_too():
+    _assert_refused_before_any_client(
+        "gemma-3-27b-it", "https://generativelanguage.googleapis.com/v1beta", max_tokens=8192)
 
 
 def test_non_gemini_paths_keep_no_reservation():
@@ -87,10 +88,6 @@ def test_non_gemini_paths_keep_no_reservation():
     assert agent.context_compressor.max_tokens is None
 
 
-def test_gemini_openai_compat_endpoint_not_treated_as_native():
-    # The /openai compatibility endpoint does not use the native adapter.
-    agent = _build_agent(
-        "gemma-3-27b-it",
-        "https://generativelanguage.googleapis.com/v1beta/openai",
-    )
-    assert agent.context_compressor.max_tokens is None
+def test_gemini_openai_compat_endpoint_is_refused_too():
+    # The /openai compatibility surface is still a Google inference host.
+    _assert_refused_before_any_client("gemma-3-27b-it", "https://generativelanguage.googleapis.com/v1beta/openai")

@@ -159,7 +159,7 @@ def test_google_bound_resolution_is_refused_before_any_rung(seams, patches, call
 
 def test_auto_picking_a_google_provider_is_refused_before_its_runtime(monkeypatch):
     touched = []
-    monkeypatch.setattr(runtime_provider, "_get_model_config", lambda: {})
+    monkeypatch.setattr(runtime_provider, "_get_model_config", dict)
     monkeypatch.setattr(runtime_provider, "_resolve_requested_shortcuts", lambda *a: None)
     monkeypatch.setattr(runtime_provider, "_named_custom_rung", lambda *a: None)
     monkeypatch.setattr(runtime_provider, "_local_endpoint_bypass", lambda *a: None)
@@ -185,7 +185,7 @@ def test_a_google_hosted_pool_entry_is_refused_before_its_key_is_read(monkeypatc
 
 
 def test_a_rung_that_lands_on_a_google_host_is_refused_after_the_ladder(monkeypatch):
-    monkeypatch.setattr(runtime_provider, "_get_model_config", lambda: {})
+    monkeypatch.setattr(runtime_provider, "_get_model_config", dict)
     monkeypatch.setattr(runtime_provider, "_ladder_rungs", lambda *a: iter([{
         "provider": "custom", "requested_provider": "relay", "model": "ordinary-model", "base_url": STUDIO,
         "api_key": "k", "api_mode": "chat_completions", "source": "test"}]))
@@ -195,7 +195,7 @@ def test_a_rung_that_lands_on_a_google_host_is_refused_after_the_ladder(monkeypa
 
 
 def test_a_google_fallback_entry_is_skipped_before_its_key_is_read(monkeypatch):
-    import hermes_cli.fallback_config as fallback_config
+    from hermes_cli import fallback_config
 
     keys_read, requested = [], []
     google_entries = [{"provider": "gemini", "model": "gemini-2.5-flash"},

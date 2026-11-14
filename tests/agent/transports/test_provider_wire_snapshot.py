@@ -218,6 +218,23 @@ def _load(snapshot: Path = SNAPSHOT) -> dict[str, Any]:
 CELLS = _cells()
 BASE_URL_CELLS = [(key, model, url) for key, (model, url) in BASE_URL_ONLY.items()]
 CELL_KEYS = frozenset({c[0] for c in CELLS} | set(BASE_URL_ONLY))
+# Providers whose endpoint is a Google inference host: Google outbound is denied, so their agent is
+# refused at init and no wire is built. Their recorded cells stay so the coverage check still holds.
+GOOGLE_HOSTED = frozenset({"gemini", "vertex", "solstice"})
+WIRE_CELLS = [c for c in CELLS if c[0] not in GOOGLE_HOSTED]
+REFUSED_CELLS = [c for c in CELLS if c[0] in GOOGLE_HOSTED]
+
+
+def assert_refused_before_any_client(provider: str, model: str, base_url: str, **agent_kwargs: Any) -> None:
+    """The agent for a Google-hosted route raises the typed denial before any client is built."""
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    with patch("agent.agent_runtime_helpers.create_openai_client") as build_client, \
+         patch("agent.gemini_native_adapter.GeminiNativeClient") as native_client:
+        with pytest.raises(GeminiOutboundDenied):
+            _agent(provider, model, base_url, **agent_kwargs)
+    build_client.assert_not_called()
+    native_client.assert_not_called()
 
 
 def _check(key: str, actual: dict[str, Any], meta: dict[str, Any], snapshot: Path = SNAPSHOT,
@@ -238,9 +255,18 @@ def _check(key: str, actual: dict[str, Any], meta: dict[str, Any], snapshot: Pat
     assert actual == expected, f"{key} wire changed — {_first_divergence(expected, actual)}"
 
 
-@pytest.mark.parametrize("provider,model,base_url", CELLS, ids=[c[0] for c in CELLS])
+@pytest.mark.parametrize("provider,model,base_url", WIRE_CELLS, ids=[c[0] for c in WIRE_CELLS])
 def test_provider_wire_matches_snapshot(offline, provider, model, base_url):
     _check(provider, _wire(provider, model, base_url), {"model": model, "base_url": base_url})
+
+
+@pytest.mark.parametrize("provider,model,base_url", REFUSED_CELLS, ids=[c[0] for c in REFUSED_CELLS])
+def test_google_hosted_provider_is_refused_before_any_wire(offline, provider, model, base_url):
+    assert_refused_before_any_client(provider, model, base_url)
+
+
+def test_every_registered_google_hosted_provider_has_a_refusal_cell():
+    assert {c[0] for c in REFUSED_CELLS} == GOOGLE_HOSTED
 
 
 @pytest.mark.parametrize("key,model,base_url", BASE_URL_CELLS, ids=[c[0] for c in BASE_URL_CELLS])

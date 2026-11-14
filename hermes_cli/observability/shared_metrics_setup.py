@@ -38,7 +38,9 @@ _OAUTH_FAILURE_KEY = "_metrics_setup_failure"
 # Ends that are not failures: the user stopped it, or let the sign-in code run out.
 _NOT_FAILURES = frozenset({"cancelled", "expired"})
 # Tokens other tools read too (gh, the Hugging Face Hub): saving one is not connecting that provider.
-_SHARED_TOKENS = frozenset({"GH_TOKEN", "GITHUB_TOKEN", "HF_TOKEN"})
+# GEMINI_API_KEY stays here although no tool panel asks for it any more (Gemini TTS was removed with
+# the Google outbound denial), so a bare save is still not counted as a Gemini connection.
+_SHARED_TOKENS = frozenset({"GH_TOKEN", "GITHUB_TOKEN", "HF_TOKEN", "GEMINI_API_KEY"})
 # OAuth session status (+ reason) at its end -> (event, failure_class).
 _OAUTH_ENDINGS = {
     "approved": ("completed", "none"),

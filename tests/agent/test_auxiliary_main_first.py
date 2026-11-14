@@ -292,7 +292,6 @@ class TestResolveAutoMainFirst:
 
         def route_fact(provider):
             route_reads.append(provider)
-            return None
 
         def health_base_url(provider, explicit_base_url=None):
             health_calls.append((provider, explicit_base_url))

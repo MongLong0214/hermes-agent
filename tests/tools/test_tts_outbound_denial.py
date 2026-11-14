@@ -6,6 +6,7 @@ denial raised on the synthesis executor or a prefetch thread reaches the caller 
 deadlocking the drain. Fake streamers and a fake synth only: nothing is sent anywhere.
 """
 
+import json
 import queue
 import threading
 from unittest.mock import MagicMock, patch
@@ -45,7 +46,7 @@ def _run_speaker(q, **kwargs):
     def _target():
         try:
             stream_tts_to_speaker(q, stop, done, **kwargs)
-        except BaseException as exc:  # noqa: BLE001 - the test inspects what escaped
+        except BaseException as exc:  # the test inspects what escaped
             outcome["exc"] = exc
 
     worker = threading.Thread(target=_target, daemon=True)
@@ -272,7 +273,7 @@ def test_an_ordinary_sync_provider_still_speaks(monkeypatch, tmp_path):
     def _synth(text, output_path):
         with open(output_path, "wb") as fh:
             fh.write(b"ID3fake")
-        return '{"success": true, "file_path": "%s"}' % output_path
+        return json.dumps({"success": True, "file_path": output_path})
 
     monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "edge"})
     monkeypatch.setattr(ts, "resolve_streaming_provider", lambda cfg, preferred=None: None)

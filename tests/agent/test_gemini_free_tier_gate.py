@@ -3,12 +3,14 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 
 from agent.gemini_native_adapter import (
     gemini_http_error,
     is_free_tier_quota_error,
     probe_gemini_tier,
 )
+from agent.gemini_outbound_policy import GeminiOutboundDenied
 
 
 def _mock_response(status: int, headers: dict | None = None, text: str = "") -> MagicMock:
@@ -19,40 +21,28 @@ def _mock_response(status: int, headers: dict | None = None, text: str = "") -> 
     return resp
 
 
-def _run_probe(resp: MagicMock) -> str:
+def _assert_probe_refused(resp: MagicMock) -> None:
+    """The tier probe is Google outbound: refused before an HTTP client exists, whatever Google would answer."""
     with patch("agent.gemini_native_adapter.httpx.Client") as MC:
-        inst = MagicMock()
-        inst.post.return_value = resp
-        MC.return_value.__enter__.return_value = inst
-        return probe_gemini_tier("fake-key")
+        MC.return_value.__enter__.return_value.post.return_value = resp
+        with pytest.raises(GeminiOutboundDenied):
+            probe_gemini_tier("fake-key")
+    MC.assert_not_called()
 
 
 class TestProbeGeminiTier:
-    """Verify the tier probe classifies keys correctly."""
+    """The probe never runs: it would send the key to Google."""
 
-
-
-
-
-    def test_free_tier_via_429_body(self):
+    def test_a_free_tier_429_answer_is_never_requested(self):
         body = (
             '{"error":{"code":429,"message":"Quota exceeded for metric: '
             'generativelanguage.googleapis.com/generate_content_free_tier_requests, '
             'limit: 20"}}'
         )
-        resp = _mock_response(429, {}, body)
-        assert _run_probe(resp) == "free"
+        _assert_probe_refused(_mock_response(429, {}, body))
 
-
-    def test_successful_200_without_rpd_header_is_paid(self):
-        resp = _mock_response(200, {}, '{"candidates":[]}')
-        assert _run_probe(resp) == "paid"
-
-
-
-
-
-
+    def test_a_paid_200_answer_is_never_requested(self):
+        _assert_probe_refused(_mock_response(200, {}, '{"candidates":[]}'))
 
 
 class TestIsFreeTierQuotaError:

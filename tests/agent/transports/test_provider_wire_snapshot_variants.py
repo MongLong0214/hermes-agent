@@ -147,6 +147,13 @@ AUX_CELLS: list[tuple[str, str, str, str | None, dict[str, Any]]] = [
 ]
 
 CELL_KEYS = frozenset(c[0] for cells in (MODEL_VARIANTS, STREAM_CELLS, AUX_CELLS) for c in cells)
+# Agent cells on a Google inference host: refused at init (Google outbound denial), so no wire is
+# built. Their recorded entries stay so the orphan check still holds.
+REFUSED_KEYS = frozenset({"variant:gemini-max-tokens", "stream:gemini-native", "stream:gemini-openai"})
+WIRE_VARIANTS = [c for c in MODEL_VARIANTS if c[0] not in REFUSED_KEYS]
+WIRE_STREAM_CELLS = [c for c in STREAM_CELLS if c[0] not in REFUSED_KEYS]
+REFUSED_AGENT_CELLS = [(c[0], c[1], c[2], c[3], c[4] if c[0].startswith("variant:") else {})
+                       for c in (*MODEL_VARIANTS, *STREAM_CELLS) if c[0] in REFUSED_KEYS]
 
 
 class _Sent(Exception):
@@ -201,15 +208,25 @@ def _aux_kwargs(monkeypatch, provider: str, model: str, base_url: str | None, op
     return out
 
 
-@pytest.mark.parametrize("key,provider,model,base_url,agent_kwargs", MODEL_VARIANTS,
-                         ids=[c[0] for c in MODEL_VARIANTS])
+@pytest.mark.parametrize("key,provider,model,base_url,agent_kwargs", WIRE_VARIANTS,
+                         ids=[c[0] for c in WIRE_VARIANTS])
 def test_model_variant_wire_matches_snapshot(offline, key, provider, model, base_url, agent_kwargs):
     actual = base._wire(provider, model, base_url, reasoning_rows=REASONING_LADDER, **agent_kwargs)
     meta = {"provider": provider, "model": model, "base_url": base_url, "agent_kwargs": agent_kwargs}
     base._check(key, actual, meta, snapshot=SNAPSHOT, cell_keys=CELL_KEYS)
 
 
-@pytest.mark.parametrize("key,provider,model,base_url,attrs", STREAM_CELLS, ids=[c[0] for c in STREAM_CELLS])
+@pytest.mark.parametrize("key,provider,model,base_url,agent_kwargs", REFUSED_AGENT_CELLS,
+                         ids=[c[0] for c in REFUSED_AGENT_CELLS])
+def test_google_hosted_agent_cell_is_refused_before_any_wire(offline, key, provider, model, base_url, agent_kwargs):
+    base.assert_refused_before_any_client(provider, model, base_url, **agent_kwargs)
+
+
+def test_every_refused_key_is_a_recorded_cell():
+    assert {c[0] for c in REFUSED_AGENT_CELLS} == REFUSED_KEYS
+
+
+@pytest.mark.parametrize("key,provider,model,base_url,attrs", WIRE_STREAM_CELLS, ids=[c[0] for c in WIRE_STREAM_CELLS])
 def test_stream_kwargs_match_snapshot(offline, key, provider, model, base_url, attrs):
     actual = _stream_delta(provider, model, base_url, attrs)
     meta = {"provider": provider, "model": model, "base_url": base_url, "agent_attrs": attrs}

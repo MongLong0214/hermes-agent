@@ -47,13 +47,15 @@ def test_xai_tts_rejects_oversized_audio_response(tmp_path, monkeypatch):
     assert not output_path.exists()
 
 
-def test_gemini_tts_rejects_oversized_json_response(tmp_path, monkeypatch):
+def test_gemini_tts_is_refused_before_any_request(tmp_path, monkeypatch):
+    """Google outbound is denied: Gemini TTS never posts, so there is no response body to bound."""
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     response = StreamingResponse([b'{"candidates":', b"[{}]}"], headers={"Content-Type": "application/json"})
 
     with patch("requests.post", return_value=response) as post:
-        with pytest.raises(RuntimeError, match="Gemini TTS response exceeds 8 bytes"):
+        with pytest.raises(GeminiOutboundDenied):
             tts_tool._generate_gemini_tts("hello", str(tmp_path / "out.wav"), {})
 
-    assert post.call_args.kwargs["stream"] is True
-    assert response.closed is True
+    post.assert_not_called()

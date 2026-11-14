@@ -208,14 +208,13 @@ class TestGenerateSummaryTruncationGuard:
         assert c._last_compress_aborted is True
         assert c._previous_summary is None
 
-    def test_gemini_safety_blocked_summary_request_aborts_and_preserves(self):
-        """Gemini's safety block of the summary request is a refusal: abort, never the lossy fallback.
-
-        Gemini answers a blocked prompt with HTTP 200 and ``promptFeedback.blockReason``; the native
-        adapter raises it as a content-policy error instead of the empty content it used to return."""
+    def test_gemini_summary_request_is_refused_before_any_send(self):
+        """Google outbound is denied: the native client for a Gemini summary request is never built, so
+        nothing reaches Google. The summary attempt fails with the typed denial instead."""
         import httpx
 
         from agent.gemini_native_adapter import GeminiNativeClient
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
 
         sent = []
 
@@ -223,9 +222,15 @@ class TestGenerateSummaryTruncationGuard:
             sent.append(request)
             return httpx.Response(200, json={"promptFeedback": {"blockReason": "SAFETY"}})
 
-        client = GeminiNativeClient(api_key="AQ.test", http_client=httpx.Client(transport=httpx.MockTransport(handle)))
+        refusals = []
 
         def call_llm(**kwargs):
+            try:
+                client = GeminiNativeClient(api_key="AQ.test",
+                                            http_client=httpx.Client(transport=httpx.MockTransport(handle)))
+            except GeminiOutboundDenied as exc:
+                refusals.append(exc)
+                raise
             return client.chat.completions.create(model="gemini-2.5-flash", messages=kwargs["messages"])
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
@@ -236,11 +241,9 @@ class TestGenerateSummaryTruncationGuard:
             )
         msgs = _msgs()
         with patch("agent.context_compressor.call_llm", side_effect=call_llm):
-            result = c.compress(msgs, current_tokens=999999, force=True)
+            c.compress(msgs, current_tokens=999999, force=True)
 
-        assert result == msgs
-        assert c._last_compress_aborted is True
-        assert len(sent) == 1
+        assert refusals and sent == []
 
     def test_provider_refusal_field_is_rejected_even_with_summary_shaped_content(self):
         """An explicit ``message.refusal`` wins over plausible-looking content (#118406)."""

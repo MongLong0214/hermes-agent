@@ -1,30 +1,46 @@
-"""Provider aliases preserve the native-vs-compatible client boundary."""
+"""Gemini provider aliases: a Google endpoint is refused before any client is built, and a non-Google
+endpoint builds a plain OpenAI-compatible client."""
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import pytest
 from openai import OpenAI
 
 from agent.agent_runtime_helpers import create_openai_client
-from agent.gemini_native_adapter import GeminiNativeClient
+from agent.gemini_outbound_policy import GeminiOutboundDenied
 from providers import get_provider_profile
 
 
-def test_gemini_aliases_preserve_native_endpoint_selection():
+def _agent(provider):
+    return SimpleNamespace(
+        provider=provider, model="gemini-flash-latest",
+        _client_log_context=lambda: "test",
+        _build_keepalive_http_client=lambda *a, **k: None,
+    )
+
+
+def test_gemini_aliases_refuse_the_google_endpoint_before_any_client():
     profile = get_provider_profile("gemini")
     for provider in (profile.name, *profile.aliases):
-        for base_url, expected in (
-            ("https://generativelanguage.googleapis.com/v1beta", GeminiNativeClient),
-            ("https://example.invalid/v1", OpenAI),
-        ):
-            agent = SimpleNamespace(
-                provider=provider, model="gemini-flash-latest",
-                _client_log_context=lambda: "test",
-                _build_keepalive_http_client=lambda *a, **k: None,
-            )
-            client = create_openai_client(
-                agent, {"api_key": "test-key", "base_url": base_url},
-                reason="fallback", shared=False,
-            )
-            try:
-                assert isinstance(client, expected), (provider, base_url, type(client))
-            finally:
-                client.close()
+        with patch("agent.gemini_native_adapter.GeminiNativeClient") as native_client, \
+             patch("agent.process_bootstrap.OpenAI") as openai_client:
+            with pytest.raises(GeminiOutboundDenied):
+                create_openai_client(
+                    _agent(provider), {"api_key": "test-key", "base_url": "https://generativelanguage.googleapis.com/v1beta"},
+                    reason="fallback", shared=False,
+                )
+        native_client.assert_not_called()
+        openai_client.assert_not_called()
+
+
+def test_gemini_aliases_on_a_non_google_endpoint_build_an_openai_client():
+    profile = get_provider_profile("gemini")
+    for provider in (profile.name, *profile.aliases):
+        client = create_openai_client(
+            _agent(provider), {"api_key": "test-key", "base_url": "https://example.invalid/v1"},
+            reason="fallback", shared=False,
+        )
+        try:
+            assert isinstance(client, OpenAI), (provider, type(client))
+        finally:
+            client.close()

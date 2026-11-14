@@ -823,3 +823,49 @@ def test_the_native_gemini_adapter_refuses_before_any_http(monkeypatch, call):
     with pytest.raises(GeminiOutboundDenied):
         call(adapter)
     assert touched == []
+
+
+# ── Solstice (a target-only plugin whose own client is the native Gemini wire) ──────────────
+
+
+def _solstice_profile():
+    from providers import get_provider_profile
+
+    profile = get_provider_profile("solstice")
+    if profile is None:
+        pytest.skip("the solstice provider plugin is not installed")
+    return profile
+
+
+def test_the_solstice_plugin_client_is_refused_before_any_http(monkeypatch):
+    """SolsticeClient subclasses GeminiNativeClient, so the inherited __init__ refuses it first."""
+    import agent.gemini_native_adapter as adapter
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    profile = _solstice_profile()
+    touched = []
+    monkeypatch.setattr(adapter, "httpx", _Tripwire("httpx", touched))
+    with pytest.raises(GeminiOutboundDenied):
+        profile.create_client(api_key="ya29.token")
+    with pytest.raises(GeminiOutboundDenied):
+        profile.create_client(api_key="ya29.token", base_url="https://relay.example.test/v1")
+    assert touched == []
+
+
+def test_the_solstice_auxiliary_route_never_sends(monkeypatch):
+    """The auxiliary plugin-OAuth arm builds the plugin's own client; that construction is refused, so a
+    signed-in Solstice aux call gets no client and nothing is sent to Google or anywhere else."""
+    import agent.gemini_native_adapter as adapter
+    from agent import auxiliary_client
+
+    _solstice_profile()
+    touched = []
+    monkeypatch.setattr(adapter, "httpx", _Tripwire("httpx", touched))
+    monkeypatch.setattr(auxiliary_client, "OpenAI", _Tripwire("OpenAI", touched))
+    monkeypatch.setattr(auxiliary_client, "_create_openai_client", _Tripwire("_create_openai_client", touched))
+
+    client, model = auxiliary_client.resolve_provider_client(
+        "solstice", "gemini-3.8-flash", explicit_api_key="ya29.token")
+
+    assert (client, model) == (None, None)
+    assert touched == []

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.gemini_outbound_policy import GeminiOutboundDenied
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
 SLUG = "ambient-fake"
@@ -100,9 +101,10 @@ def _assert_owner(view: dict) -> None:
     assert view["explicit"] == SLUG
     assert view["creds"] is True
     assert view["runtime_explicit"] == (SLUG, "https://ambient-fake.invalid/v1", True)
-    # ambient credentials never auto-select, even where the plugin lives
+    # ambient credentials never auto-select, even where the plugin lives; the env-detected
+    # gemini pick is Google outbound and refused before its runtime is built
     assert view["auto"] == "gemini"
-    assert view["runtime_auto"][0] == "gemini"
+    assert isinstance(view["runtime_auto"], GeminiOutboundDenied)
 
 
 def _assert_absent(view: dict) -> None:
@@ -115,7 +117,7 @@ def _assert_absent(view: dict) -> None:
     assert isinstance(view["creds"], AuthError)
     assert isinstance(view["runtime_explicit"], Exception)
     assert view["auto"] == "gemini"
-    assert view["runtime_auto"][0] == "gemini" and view["runtime_auto"][2] is False
+    assert isinstance(view["runtime_auto"], GeminiOutboundDenied)  # so the token is sent nowhere
 
 
 def test_mirrored_row_is_absent_in_a_home_without_the_plugin_a_b_a(homes):
