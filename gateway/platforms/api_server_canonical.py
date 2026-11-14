@@ -1,0 +1,302 @@
+"""Authenticated canonical-surface ingress: ``POST /v1/canonical-surface/events``.
+
+One request carries one existing-only canonical event and is answered with the durable terminal
+``CanonicalReceiptCoordinator`` holds for it. The terminal goes only to this HTTP response: the
+payload names no destination, so reply authority stays request-local.
+"""
+
+import ctypes
+import logging
+import os
+import sqlite3
+import sys
+from contextlib import closing
+from types import SimpleNamespace
+from typing import Any
+
+try:
+    from aiohttp import web
+except ImportError:
+    web = None  # type: ignore[assignment]
+
+
+logger = logging.getLogger("gateway.platforms.api_server")
+
+ROUTE = "/v1/canonical-surface/events"
+IDENTITY_ROUTE = "/v1/canonical-surface/identity"
+RECEIPTS_TELEGRAM_ROUTE = "/v1/canonical-surface/receipts/telegram/{update_id}"
+
+
+class _ProcBSDInfo(ctypes.Structure):
+    """Darwin sys/proc_info.h's proc_bsdinfo (including the native timeval)."""
+
+    _fields_ = [
+        (name, ctypes.c_uint32) for name in (
+            "pbi_flags", "pbi_status", "pbi_xstatus", "pbi_pid", "pbi_ppid",
+            "pbi_uid", "pbi_gid", "pbi_ruid", "pbi_rgid", "pbi_svuid", "pbi_svgid", "rfu_1",
+        )
+    ] + [
+        ("pbi_comm", ctypes.c_char * 16), ("pbi_name", ctypes.c_char * 32),
+    ] + [
+        (name, ctypes.c_uint32) for name in (
+            "pbi_nfiles", "pbi_pgid", "pbi_pjobc", "e_tdev", "e_tpgid", "pbi_nice",
+        )
+    ] + [("pbi_start_tvsec", ctypes.c_uint64), ("pbi_start_tvusec", ctypes.c_uint64)]
+
+
+def _process_started_at(pid: int) -> str | None:
+    """Use ACP's kernel process-start source; unreadable is never replaced with clock time."""
+    if sys.platform == "darwin":
+        try:
+            libproc = ctypes.CDLL("libproc.dylib")
+            proc_pidinfo = libproc.proc_pidinfo
+            proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                     ctypes.c_void_p, ctypes.c_int]
+            proc_pidinfo.restype = ctypes.c_int
+            info = _ProcBSDInfo()
+            size = ctypes.sizeof(info)
+            # PROC_PIDTBSDINFO = 3 (sys/proc_info.h); require the full native record.
+            if proc_pidinfo(pid, 3, 0, ctypes.byref(info), size) != size or info.pbi_pid != pid:
+                return None
+            if not info.pbi_start_tvsec or info.pbi_start_tvusec >= 1_000_000:
+                return None
+            return f"darwin-tv:{info.pbi_start_tvsec}.{info.pbi_start_tvusec:06d}"
+        except (OSError, AttributeError):
+            return None
+    if sys.platform == "linux":
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as stat:
+                raw = stat.read()
+            fields = raw[raw.rindex(")") + 1:].split()
+            starttime = fields[19]
+            if starttime.isascii() and starttime.isdecimal():
+                return f"linux-clk:{starttime}"
+        except (OSError, ValueError, IndexError):
+            pass
+    return None
+
+# Refusals the coordinator raises before it claims the event, and only once the binding's own state.db
+# holds no receipt for the event: nothing ran under its id, so a resend under a new id is safe.
+_PRE_CLAIM_CODES = frozenset({
+    "canonical_roster_unavailable",
+    "canonical_binding_stale",
+    "canonical_agent_replaced",
+    "canonical_turn_busy",
+    "canonical_runtime_refused",
+    "canonical_envelope_escape",
+    "canonical_history_unanswered",
+})
+
+
+def _refusal(code: str, status: int, message: str = "Canonical request rejected.") -> "web.Response":
+    return web.json_response({"error": {"code": code, "message": message}}, status=status)
+
+
+def _http_routes(self) -> list[tuple[str, str, Any]]:
+    async def handle(request: "web.Request") -> "web.Response":
+        return await handle_canonical_surface_event(self, request)
+
+    async def identity(request: "web.Request") -> "web.Response":
+        return await handle_canonical_surface_identity(self, request)
+
+    async def handle_receipt(request: "web.Request") -> "web.Response":
+        return await handle_telegram_receipt_lookup(self, request)
+
+    return [("POST", ROUTE, handle), ("GET", IDENTITY_ROUTE, identity),
+            ("GET", RECEIPTS_TELEGRAM_ROUTE, handle_receipt)]
+
+
+async def handle_canonical_surface_identity(self, request: "web.Request") -> "web.Response":
+    """Read the sole configured binding's existing live head without claiming an event."""
+    from gateway.platforms.api_server import _api_request_profile
+
+    if _api_request_profile.get() not in (None, "default"):
+        return _refusal("canonical_binding_unknown", 404)
+    if not self._expected_api_key():
+        return self._auth_failed_response()
+    auth_error = self._check_auth(request)
+    if auth_error:
+        return auth_error
+    from gateway.canonical_surface import ExistingCanonicalBindingResolver
+    from hermes_state_target_bind import (
+        TargetBindReceiptFenceError, _lineage_root_digest, _resolve_lineage_root,
+    )
+
+    # The router matches the mirror, and the prefix middleware validates its profile.
+    # Keep the query/path check exact: no extra parameters or alternate profile aliases.
+    if request.path_qs != IDENTITY_ROUTE and not (
+        request.path_qs == f"/p/default{IDENTITY_ROUTE}"
+        and request.match_info.get("profile") == "default"
+    ):
+        return _refusal("canonical_invalid_request", 400)
+    runner = self.gateway_runner
+    if runner is None:
+        return _refusal("canonical_unavailable", 503, "Canonical request unavailable.")
+    bindings = getattr(runner.config, "canonical_surface_bindings", None) or {}
+    if len(bindings) != 1:
+        return _refusal("canonical_binding_unknown", 404)
+    binding = next(iter(bindings.values()))
+    resolver = ExistingCanonicalBindingResolver(runner.session_store)
+    try:
+        author_id, channel_id = binding.primary_pair()
+        entry = resolver.resolve(binding, SimpleNamespace(author_id=author_id, channel_id=channel_id))
+        path = resolver._existing_db_path(binding.session_key)
+        if path is None:
+            raise ValueError("canonical_binding_stale")
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+            conn.row_factory = sqlite3.Row
+            root_id = _resolve_lineage_root(conn, entry.session_id)
+    except (ValueError, IndexError, sqlite3.Error, TargetBindReceiptFenceError) as exc:
+        if str(exc) == "canonical_roster_unavailable":
+            return _refusal_for(str(exc))
+        return _refusal("canonical_binding_stale", 409)
+    pid = os.getpid()
+    started_at = _process_started_at(pid)
+    if started_at is None:
+        return _refusal("canonical_unavailable", 503, "Canonical request unavailable.")
+    return web.json_response({
+        "session_id": entry.session_id,
+        "lineage_root_digest": _lineage_root_digest(root_id),
+        "process_pid": pid,
+        "process_started_at": started_at,
+    })
+
+
+def _refusal_for(code: str) -> "web.Response":
+    if code == "canonical_roster_unavailable":
+        return _refusal(code, 503, "Routing roster unavailable; no turn was admitted.")
+    if code == "canonical_principal_rejected":
+        return _refusal(code, 403)
+    if code == "canonical_receipt_conflict":
+        return _refusal("canonical_event_conflict", 409)
+    if code in _PRE_CLAIM_CODES:
+        return _refusal(code, 409)
+    # Anything else may come from past the claim, where the receipt is pending: it is never
+    # re-executed, so it is reported as uncertainty rather than as a refusal inviting a resend.
+    return _refusal("canonical_event_uncertain", 409)
+
+
+async def handle_canonical_surface_event(self, request: "web.Request") -> "web.Response":
+    """Serve one authenticated canonical event through the durable receipt coordinator."""
+    auth_error = self._check_auth(request)
+    if auth_error:
+        return auth_error
+    from gateway.canonical_surface import CanonicalIngressEvent, CanonicalReceiptCoordinator
+    from gateway.platforms.api_server import _api_request_profile
+
+    try:
+        event = CanonicalIngressEvent.from_json_bytes(await request.read())
+    except ValueError:
+        return _refusal("canonical_invalid_request", 400)
+    runner = self.gateway_runner
+    if runner is None:
+        return _refusal("canonical_unavailable", 503, "Canonical request unavailable.")
+    # Bindings are the launch profile's config; a request scoped to another served profile
+    # (/p/<name>/ under multiplexing, authenticated with that profile's key) must not drive them.
+    profile = _api_request_profile.get()
+    bindings = getattr(runner.config, "canonical_surface_bindings", None) or {}
+    binding = bindings.get(event.binding) if profile in (None, "default") else None
+    if binding is None:
+        return _refusal("canonical_binding_unknown", 404)
+    try:
+        receipt = await CanonicalReceiptCoordinator(runner).submit(binding, event)
+    except ValueError as exc:
+        code = str(exc)
+        if code not in _PRE_CLAIM_CODES | {"canonical_principal_rejected", "canonical_receipt_conflict"}:
+            # Answered as uncertainty below: log the raising path and its cause, never the turn's text.
+            cause = exc.__cause__
+            logger.warning("Canonical event %r answered canonical_event_uncertain: stage=%s cause=%s",
+                           event.event_id[:96], code[:96], str(cause)[:96] if isinstance(cause, ValueError)
+                           else type(cause).__name__ if cause is not None else None)
+        return _refusal_for(code)
+    except Exception:
+        # The coordinator exposes no claim boundary, so an unexpected failure cannot prove the
+        # turn did not run; report uncertainty, never detail, and never invite a re-execution.
+        logger.exception("Canonical surface event %r failed; reporting uncertainty", event.event_id[:96])
+        return _refusal("canonical_event_uncertain", 409)
+    if receipt.status == "terminal" and receipt.failure is not None:
+        # A durable failure, never answered as text: its side-effect scope says what already ran.
+        return web.json_response({"error": {
+            "code": "canonical_event_failed", "message": "The canonical turn failed; it is never re-run.",
+            "side_effects": receipt.failure["side_effects"]}}, status=409)
+    if receipt.status == "unrecorded" and receipt.failure is not None:
+        # The turn ran and produced an answer whose record did not land: it is not delivered (no
+        # receipt binds it), it is kept (beside the receipt or in the local fallback) when
+        # ``answer_kept``, and never re-run. Kept is not delivered, and nothing is resent from it.
+        kept = receipt.failure.get("answer_kept") is True
+        return web.json_response({"error": {
+            "code": "canonical_answer_unrecorded",
+            "message": "The canonical turn ran but its answer could not be recorded, so it was not "
+                       "delivered; it is never re-run." if kept else
+                       "The canonical turn ran but its answer could be neither recorded nor preserved, so "
+                       "it was not delivered and is not kept; it is never re-run.",
+            "side_effects": receipt.failure["side_effects"], "delivery": "not_delivered",
+            "answer_kept": kept}}, status=409)
+    if receipt.status != "terminal" or receipt.terminal_text is None:
+        logger.warning("Canonical event %r answered canonical_event_uncertain: receipt %s",
+                       event.event_id[:96], receipt.status)
+        return _refusal("canonical_event_uncertain", 409)
+    return web.json_response({"event_id": event.event_id, "text": receipt.terminal_text})
+
+
+def _telegram_receipt_binding(bindings: dict) -> Any:
+    """The sole Telegram-origin binding, or None when there is not exactly one.
+
+    U4's ``HermesGatewayReceiptPort`` sends no binding name — Hermes is the single Telegram
+    consumer (CEO 23e4a944), so there is exactly one canonical binding whose origin is a
+    Telegram chat to resolve against. Zero or more than one is ``canonical_binding_unknown``,
+    the same code the POST route uses for an unresolvable binding, rather than guessing one.
+    """
+    telegram_bindings = [b for b in bindings.values() if getattr(b, "telegram_chat_id", None)]
+    return telegram_bindings[0] if len(telegram_bindings) == 1 else None
+
+
+async def handle_telegram_receipt_lookup(self, request: "web.Request") -> "web.Response":
+    """``GET /v1/canonical-surface/receipts/telegram/{update_id}`` — read-only answer for ACP's
+    ``HermesGatewayReceiptPort``. Never opens a turn, a lease, or a write handle: a slow or
+    crashed gateway cannot make this hang, and a lookup for an update nothing ever claimed costs
+    one read-only query."""
+    auth_error = self._check_auth(request)
+    if auth_error:
+        return auth_error
+    from gateway import acp_turn_receipts
+    from gateway.canonical_surface import ExistingCanonicalBindingResolver
+    from gateway.platforms.api_server import _api_request_profile
+
+    update_id = (request.match_info.get("update_id") or "").strip()
+    if not update_id:
+        return _refusal("canonical_invalid_request", 400)
+    runner = self.gateway_runner
+    if runner is None:
+        return _refusal("canonical_unavailable", 503, "Canonical request unavailable.")
+    profile = _api_request_profile.get()
+    bindings = getattr(runner.config, "canonical_surface_bindings", None) or {}
+    binding = _telegram_receipt_binding(bindings) if profile in (None, "default") else None
+    if binding is None:
+        return _refusal("canonical_binding_unknown", 404)
+    resolver = ExistingCanonicalBindingResolver(runner.session_store)
+    db_path = resolver._existing_db_path(binding.session_key)
+    if db_path is None:
+        # The resolver returns None for "no store yet" AND for a filesystem error or a transient
+        # profile-home lookup failure (canonical_surface.py's own broad except). None of those can
+        # establish that this update was never claimed — H1's contract is that unreadability is
+        # never permission to resend, so this is uncertainty, not NEVER_FOUND.
+        return _refusal("canonical_event_uncertain", 409)
+    from hermes_state import SessionDB
+
+    reader = SessionDB(db_path, read_only=True)
+    try:
+        receipt = acp_turn_receipts.served(reader, update_id)
+    except acp_turn_receipts.ReceiptContractError as exc:
+        # Stated in the contract only by inventing a value: an explicit error, so ACP keeps the turn
+        # in doubt rather than settling it on a guess.
+        logger.warning("Telegram receipt for update %s cannot be served in the receipt contract: %s",
+                       update_id, exc)
+        return _refusal("canonical_receipt_unprovable", 409, "This receipt cannot be stated in the receipt "
+                        "contract; its outcome stays in doubt.")
+    except Exception:
+        logger.exception("Telegram receipt lookup failed for update %s; reporting uncertainty", update_id)
+        return _refusal("canonical_event_uncertain", 409)
+    finally:
+        reader.close()
+    return web.json_response(receipt.to_response())
