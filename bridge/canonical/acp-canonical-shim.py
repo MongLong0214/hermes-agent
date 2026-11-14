@@ -28,26 +28,26 @@ import time
 import urllib.error
 import urllib.request
 
-BASE = os.environ.get("CANONICAL_SURFACE_URL", "http://127.0.0.1:8642")
+BASE = os.environ.get("CANONICAL_SURFACE_URL", "http://127.0.0.1:8642")  # health: allow HX005 -- the standalone shim reads its launch environment once; each buzz-acp launch is a new process
 ROUTE = "/v1/canonical-surface/events"
-BINDING = os.environ.get("CANONICAL_BINDING", "acp-canonical-ceo")
-KEY = os.environ.get("API_SERVER_KEY", "")
+BINDING = os.environ.get("CANONICAL_BINDING", "acp-canonical-ceo")  # health: allow HX005 -- the standalone shim reads its launch environment once; each buzz-acp launch is a new process
+KEY = os.environ.get("API_SERVER_KEY", "")  # health: allow HX005 -- the standalone shim reads its launch environment once; each buzz-acp launch is a new process
 # The endpoint runs a full model turn before it answers, so this budget is a turn's, not an RPC's.
-TIMEOUT = float(os.environ.get("CANONICAL_TIMEOUT_SECS", "900"))
-LOG = os.environ.get("CANONICAL_SHIM_LOG", os.path.expanduser("~/.hermes/logs/acp-canonical-shim.log"))
+TIMEOUT = float(os.environ.get("CANONICAL_TIMEOUT_SECS", "900"))  # health: allow HX005 -- the standalone shim reads its launch environment once; each buzz-acp launch is a new process
+LOG = os.environ.get("CANONICAL_SHIM_LOG", os.path.expanduser("~/.hermes/logs/acp-canonical-shim.log"))  # health: allow HX005 -- the standalone shim reads its launch environment once; each buzz-acp launch is a new process
 # 2026-09-27, CEO 지시로 기본값이 quarantine 이다. 이 binding 은 session_key
 # agent:main:telegram:dm:<owner-dm-id> 로 해석되므로, 전달된 CTO 이벤트는 CEO 세션에 owner 의
 # 텔레그램 턴으로 저장된다. run_bound_existing_turn 은 event.text 만 넘기고 user role 로 적으므로
 # 서명된 Buzz pubkey 가 본문과 분리되지 않는다 — 접두사나 heartbeat=0 은 방어가 아니다. 서명자
 # 분리가 게이트웨이에 들어오기 전까지 이 자리는 전달하지 않고, 사건을 증거로 남기기만 한다.
-FORWARD = os.environ.get("CANONICAL_FORWARD", "quarantine").strip().lower()
+FORWARD = os.environ.get("CANONICAL_FORWARD", "quarantine").strip().lower()  # health: allow HX005 -- the standalone shim reads its launch environment once; each buzz-acp launch is a new process
 # #627 canary (CEO 04f3035f, 2026-10-04): with the default quarantine left in place, exactly one event
 # may be forwarded — the first one whose own signer, channel and body nonce match what this file
 # arms, before its expiry. The claim renames the file to ``.claimed`` before submitting, so nothing is
 # forwarded twice and every other event stays quarantined. Disarm by deleting the file.
-CANARY = os.environ.get("CANONICAL_CANARY_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+CANARY = os.environ.get("CANONICAL_CANARY_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)),  # health: allow HX005 -- the standalone shim reads its launch environment once; each buzz-acp launch is a new process
                                                                "canary.json"))
-QUARANTINE = os.environ.get(
+QUARANTINE = os.environ.get(  # health: allow HX005 -- the standalone shim reads its launch environment once; each buzz-acp launch is a new process
     "CANONICAL_QUARANTINE_LOG", os.path.expanduser("~/.hermes/logs/canonical-quarantine.jsonl"))
 
 # #627 canary 1 (2026-10-04) reached the CEO and was answered, but nothing appeared in the thread:
@@ -57,18 +57,18 @@ QUARANTINE = os.environ.get(
 # stay in force), signed
 # with the key inherited from buzz-acp. One terminal post per event id: a marker is claimed before the
 # send, and a failed or refused send is logged, never retried.
-BUZZ_CLI = os.environ.get("CANONICAL_BUZZ_CLI", os.path.expanduser("~/.hermes/bridge/bin/buzz"))
-MENTIONS = os.environ.get("CANONICAL_MENTIONS_FILE", os.path.expanduser("~/.hermes/bridge/required-mentions.json"))
+BUZZ_CLI = os.environ.get("CANONICAL_BUZZ_CLI", os.path.expanduser("~/.hermes/bridge/bin/buzz"))  # health: allow HX005 -- the standalone shim reads its launch environment once; each buzz-acp launch is a new process
+MENTIONS = os.environ.get("CANONICAL_MENTIONS_FILE", os.path.expanduser("~/.hermes/bridge/required-mentions.json"))  # health: allow HX005 -- the standalone shim reads its launch environment once; each buzz-acp launch is a new process
 # Owner broadcasts may wake the CEO only in its paired project channels (2026-10-20).
-OWNER = os.environ.get("BUZZ_ACP_AGENT_OWNER", "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddca98c4")
-PUBLISHED = os.environ.get("CANONICAL_PUBLISHED_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+OWNER = os.environ.get("BUZZ_ACP_AGENT_OWNER", "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddca98c4")  # health: allow HX005 -- the standalone shim reads its launch environment once; each buzz-acp launch is a new process
+PUBLISHED = os.environ.get("CANONICAL_PUBLISHED_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)),  # health: allow HX005 -- the standalone shim reads its launch environment once; each buzz-acp launch is a new process
                                                                    "published"))
-PUBLISH_TIMEOUT = float(os.environ.get("CANONICAL_PUBLISH_TIMEOUT_SECS", "60"))
+PUBLISH_TIMEOUT = float(os.environ.get("CANONICAL_PUBLISH_TIMEOUT_SECS", "60"))  # health: allow HX005 -- the standalone shim reads its launch environment once; each buzz-acp launch is a new process
 # An answer whose post ends in timeout, send_failed or error is read back from its thread and, only when
 # that read shows no such reply, sent again: once after each of these waits (s), about nine minutes in
 # all. Each attempt keeps PUBLISH_TIMEOUT; each read-back is bounded by PUBLISH_READBACK_TIMEOUT.
 PUBLISH_RETRY_BACKOFF = (10, 30, 60, 120, 300)
-PUBLISH_READBACK_TIMEOUT = float(os.environ.get("CANONICAL_PUBLISH_READBACK_TIMEOUT_SECS", "30"))
+PUBLISH_READBACK_TIMEOUT = float(os.environ.get("CANONICAL_PUBLISH_READBACK_TIMEOUT_SECS", "30"))  # health: allow HX005 -- the standalone shim reads its launch environment once; each buzz-acp launch is a new process
 # buzz-cli caps `messages thread --limit` at 500 and has no cursor, so a read that returns this many
 # events may be cut short and never shows that a reply is absent.
 PUBLISH_READBACK_LIMIT = 500
@@ -81,7 +81,7 @@ try:
         "canonical_batch", os.path.join(os.path.dirname(os.path.abspath(__file__)), "canonical_batch.py"))
     _batch = importlib.util.module_from_spec(_batch_spec)
     _batch_spec.loader.exec_module(_batch)
-except Exception as exc:
+except Exception as exc:  # health: allow BLE001 -- a broken batch module must leave ACP up to refuse each affected event
     # Keep ACP available to refuse each affected event even after a partial/broken deployment.
     _batch = None
     _batch_error = f"{type(exc).__name__}: {exc}"
@@ -210,8 +210,8 @@ EVENT_RE = re.compile(r"Event ID:\s*([0-9a-f]{64})")
 # The gateway refuses a turn outright while the bound session is running
 # (`canonical_surface.py` raises `canonical_turn_busy`); it never queues. The CEO works for hours,
 # so a single attempt drops the message. Retry until buzz-acp's own turn budget is nearly spent.
-BUSY_RETRY_SECS = float(os.environ.get("CANONICAL_BUSY_RETRY_SECS", "20"))
-BUSY_DEADLINE_SECS = float(os.environ.get("CANONICAL_BUSY_DEADLINE_SECS", "840"))
+BUSY_RETRY_SECS = float(os.environ.get("CANONICAL_BUSY_RETRY_SECS", "20"))  # health: allow HX005 -- the standalone shim reads its launch environment once; each buzz-acp launch is a new process
+BUSY_DEADLINE_SECS = float(os.environ.get("CANONICAL_BUSY_DEADLINE_SECS", "840"))  # health: allow HX005 -- the standalone shim reads its launch environment once; each buzz-acp launch is a new process
 
 
 EVENT_HEADER = "[Buzz event:"
@@ -380,7 +380,7 @@ def _tags_at_end(lines):
         return None
     try:
         tags = json.loads(tail[len("Tags: "):])
-    except Exception:
+    except Exception:  # health: allow BLE001 -- malformed Tags JSON is an unparsed header, never an error
         return None
     if not (isinstance(tags, list) and all(isinstance(tag, list) and all(isinstance(v, str) for v in tag)
                                            for tag in tags)):
@@ -639,7 +639,7 @@ def refusal_key(prompt):
                     element = dict(element, text=_without_channel_name(text))
             kept.append(["element", element])
         digest = hashlib.sha256(json.dumps(kept, sort_keys=True).encode("ascii")).hexdigest()
-    except Exception as exc:  # an element nested past the recursion limit, or not JSON at all
+    except Exception as exc:  # an element nested past the recursion limit, or not JSON at all  # health: allow BLE001 -- an unserializable element makes the refusal unattributed, never a crash
         return "unattributed-" + hashlib.sha256(os.urandom(32)).hexdigest(), (
             f"its elements cannot be serialized ({type(exc).__name__})")
     if not identified:
@@ -820,7 +820,7 @@ def _send_state(returncode, stderr):
         return "sent"
     try:
         code = json.loads(stderr.strip().splitlines()[0]).get("error")
-    except Exception:  # anything stderr holds — even JSON nested past the recursion limit — is not a refusal
+    except Exception:  # anything stderr holds — even JSON nested past the recursion limit — is not a refusal  # health: allow BLE001 -- unparseable stderr is a send failure, never a refusal
         code = None
     return "wrapper_refused" if code in WRAPPER_REFUSALS else "send_failed"
 
@@ -837,7 +837,7 @@ def refusal_of(raw):
     try:
         error = json.loads(raw.decode("utf-8")).get("error")
         code = error.get("code")
-    except Exception:  # not JSON, not an object, nested past the recursion limit
+    except Exception:  # not JSON, not an object, nested past the recursion limit  # health: allow BLE001 -- an unreadable error body names no refusal code
         return None, {}
     if not isinstance(code, str) or not REFUSAL_CODE_RE.fullmatch(code):
         return None, {}
@@ -968,15 +968,15 @@ def _run_in_own_group(argv, data, timeout):
             pass
         try:
             proc.communicate(timeout=5)
-        except Exception:  # something left the group and holds a pipe: never wait on it
+        except Exception:  # something left the group and holds a pipe: never wait on it  # health: allow BLE001 -- a pipe held outside the killed group must never block this path
             for stream in (proc.stdin, proc.stdout, proc.stderr):
                 try:
                     stream.close()
-                except Exception:
+                except Exception:  # health: allow BLE001 S110 -- best-effort close after the group was killed
                     pass
             try:
                 proc.wait(timeout=5)
-            except Exception:
+            except Exception:  # health: allow BLE001 S110 -- best-effort reap after the group was killed
                 pass
         raise
     return proc.returncode, out, err
@@ -991,12 +991,12 @@ def _send_attempt(channel, target, body):
             body.encode("utf-8"), PUBLISH_TIMEOUT)
     except subprocess.TimeoutExpired:
         return "timeout", f"no exit within {PUBLISH_TIMEOUT:g}s"
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- any launch failure is journaled as this attempt's error state
         return "error", f"{type(exc).__name__}: {exc}"[:300]
     try:
         stderr = err.decode(errors="replace")
         return _send_state(code, stderr), f"exit {code}: {stderr.strip()[:300]}"
-    except Exception as exc:  # the claimed marker is filled whatever the classification does
+    except Exception as exc:  # the claimed marker is filled whatever the classification does  # health: allow BLE001 -- a classification failure still fills the claimed marker
         return ("sent" if code == 0 else "send_failed"), f"exit {code}: stderr unclassifiable ({type(exc).__name__})"
 
 
@@ -1028,7 +1028,7 @@ def _read_back(channel, target, digests):
              "--limit", str(PUBLISH_READBACK_LIMIT)],
             b"", PUBLISH_READBACK_TIMEOUT)
         events = json.loads(out.decode("utf-8")) if code == 0 else None
-    except Exception:
+    except Exception:  # health: allow BLE001 -- a failed or unparseable read-back is unknown, never absence
         return "unknown"
     signers, _ = _own_signers()
     if not (isinstance(events, list) and signers):
@@ -1092,7 +1092,7 @@ def _retry_publication(name, record, body, digests, tag):
                                             at=time.strftime("%Y-%m-%dT%H:%M:%S%z")))
         else:
             found = _read_back(channel, target, digests) == "posted"  # the last attempt landed, then hung
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- the retry thread ends on the journal's last record, never an unhandled thread error
         log(f"prompt {tag}… {kind} retry stopped: {type(exc).__name__}")
     if found:
         state, reason = "sent", f"found in the thread after attempt {attempts} ({state}: {reason})"
@@ -1526,7 +1526,7 @@ def _unfinished(base):
         return f"its journal entry is unreadable ({type(exc).__name__})"
     try:
         kind = json.loads(raw.splitlines()[0]).get("kind")
-    except Exception:
+    except Exception:  # health: allow BLE001 -- an unparseable journal entry has no kind
         kind = None
     if kind in ("answer", "notice"):
         return None
@@ -1669,12 +1669,12 @@ def _prohibition_persisted(event_id):
             os.fsync(directory)
         finally:
             os.close(directory)
-    except Exception:
+    except Exception:  # health: allow BLE001 -- a failed durable write reports False to the caller
         return False
     return True
 
 
-def reap_unfinished():
+def reap_unfinished():  # health: allow NESTING -- kept as live at 420c58a1: the shim's code stays identical to the deployed bridge
     """Tell the thread, once, about each event a shim process submitted and never finished delivering:
     its ``.inflight`` entry is still linked and no live process holds its lock (the owner was replaced
     — buzz-acp SIGKILLs the group on CancelDrainTimeout — or its handler raised). The notice takes the
@@ -1704,7 +1704,7 @@ def reap_unfinished():
                 continue  # a live process holds it, or it is gone
             try:
                 record = json.loads(raw.decode())
-            except Exception:
+            except Exception:  # health: allow BLE001 -- an unparseable in-flight record names no channel
                 record = None
             channel = record.get("channel") if isinstance(record, dict) else None
             if not os.path.lexists(os.path.join(PUBLISHED, outcome_key(event_id))):
@@ -1723,7 +1723,7 @@ def reap_unfinished():
                                     "kind": "unfinished_notice", "event_id": event_id, "channel": None,
                                     "reason": "the in-flight entry names no channel",
                                     "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
-                except Exception as exc:  # checked below: an entry claimed and not filled is no record
+                except Exception as exc:  # checked below: an entry claimed and not filled is no record  # health: allow BLE001 -- an entry that cannot be completed is checked below as no record
                     log(f"prompt {event_id[:12]}… unfinished; its journal entry was not completed: "
                         f"{type(exc).__name__}")
             # Until the record that refuses a resubmission is persisted, the in-flight entry is the only guard
@@ -1817,7 +1817,7 @@ def prompt_text(params):
 RETRY = "retry"
 
 
-def deliver_event(session, parsed, text, mentioned):
+def deliver_event(session, parsed, text, mentioned):  # health: allow CC -- kept as live at 420c58a1: the shim's code stays identical to the deployed bridge
     """Run one attributed event through the existing safety, retry and receipt path. Returns RETRY when
     the event must be resent later (nothing was claimed), otherwise None."""
     author, channel, base, body = parsed
@@ -1868,7 +1868,7 @@ def deliver_event(session, parsed, text, mentioned):
         fitted = fit_text(text, channel, base)
         reason = (f"canonical surface 길이 한도({GATEWAY_TEXT_LIMIT}자)를 넘습니다: 이전 스레드 맥락을 "
                   f"모두 생략해도 이 메시지와 이벤트 머리글만으로 한도를 넘습니다(원문 {len(text)}자)")
-    except Exception as exc:  # whatever the text holds, the outcome is a submission or a notice
+    except Exception as exc:  # whatever the text holds, the outcome is a submission or a notice  # health: allow BLE001 -- a fitting failure falls back to the notice path
         log(f"prompt {base[:12]}… fitting {len(text)} chars failed: {type(exc).__name__}: {str(exc)[:200]}")
         fitted = None
         reason = (f"canonical surface 길이 한도({GATEWAY_TEXT_LIMIT}자)에 맞추는 중 오류가 났습니다"
@@ -1947,7 +1947,7 @@ def deliver_event(session, parsed, text, mentioned):
             preclaim = ((exc.code, code) in ((400, "canonical_invalid_request"),
                                            (403, "canonical_principal_rejected")))
             break
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- any transport failure becomes this event's answer text
             log(f"prompt {event_id} failed: {type(exc).__name__}: {exc}")
             answer = f"canonical surface unreachable: {type(exc).__name__}: {exc}"
             # No gateway answer: the turn may have run, so the thread is told its outcome is unknown.
@@ -2057,7 +2057,7 @@ def _serve_prompt(prompt, message):
     try:
         reap_unfinished()
         handle(message)
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- a handler crash answers the RPC instead of ending the ACP process
         log(f"handler crashed on session/prompt: {type(exc).__name__}: {exc}")
         if prompt.rpc_id is not None:
             error(prompt.rpc_id, -32603, f"{type(exc).__name__}: {exc}")
@@ -2134,7 +2134,7 @@ def recover_main(args):
         if event_id not in recovered:
             try:
                 recovered[event_id] = _batch.fetch_event(event_id, channel)
-            except Exception as exc:
+            except Exception as exc:  # health: allow BLE001 -- the lookup failure is kept as that event's outcome
                 recovered[event_id] = exc
         return recovered[event_id]
 
@@ -2145,7 +2145,7 @@ def recover_main(args):
         _local.prompt = PromptTurn(None, session)
         try:
             _batch.deliver_member(api, session, prompt, channel, event_id, lookup)
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- a failed member sets the exit status; recovery goes on
             status = 1
             log(f"recover {event_id} failed: {_batch.failure_reason(exc)}")
             sys.stderr.write(f"acp-canonical-shim: recover {event_id} failed: {_batch.failure_reason(exc)}\n")
@@ -2206,7 +2206,7 @@ def main():
             continue
         try:
             dispatch(message)
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- a handler crash answers the RPC instead of ending the ACP process
             log(f"handler crashed on {message.get('method')}: {type(exc).__name__}: {exc}")
             if message.get("id") is not None:
                 error(message.get("id"), -32603, f"{type(exc).__name__}: {exc}")
