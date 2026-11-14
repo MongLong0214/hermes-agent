@@ -912,8 +912,10 @@ class GatewayStartupMixin:
     async def _redeliver_owed_attachments(self, obligation: Any, source: Any, adapter: Any) -> None:
         """Send the attachments the stored reply of *obligation* (its answer, or the notice that ends its
         message) still owes (platforms/base.py, redeliver_owed_attachments), on the bot that received
-        the message."""
-        from gateway.delivery_ledger import inbound_completion, obligation_components
+        the message: each at most MAX_REACTIVATIONS starts (delivery_ledger.claim_attachment_redelivery).
+        One whose tries are spent keeps its state and its record, and is reported, never tried again."""
+        from gateway.delivery_ledger import (
+            MAX_REACTIVATIONS, claim_attachment_redelivery, inbound_completion, obligation_components)
         _state, obligation_id = await asyncio.to_thread(inbound_completion, obligation)
         if obligation_id is None:
             return
@@ -924,9 +926,15 @@ class GatewayStartupMixin:
         if not isinstance(adapter, BasePlatformAdapter):
             logger.info("Stored reply %s owes attachments but its bot is offline; they wait", obligation_id)
             return
-        await adapter.redeliver_owed_attachments(
-            source, obligation_id, held,
-            metadata={"thread_id": source.thread_id} if getattr(source, "thread_id", None) else None)
+        claimed, spent = await asyncio.to_thread(claim_attachment_redelivery, obligation_id)
+        for part in spent:
+            logger.error("Stored reply %s: its attachment %s is still %s after %d later starts tried it; it is not "
+                         "tried again, and the message's record stays", obligation_id,
+                         part.get("path") or part.get("url"), part.get("state"), MAX_REACTIVATIONS)
+        if claimed:
+            await adapter.redeliver_owed_attachments(
+                source, obligation_id, claimed,
+                metadata={"thread_id": source.thread_id} if getattr(source, "thread_id", None) else None)
 
     async def _ledger_answered_inbound_records(self) -> int:
         """Boot pass, before the marker recovery and the delivery sweep: every stored message of an

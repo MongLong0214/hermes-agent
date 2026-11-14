@@ -1454,6 +1454,7 @@ class GatewayInboundMixin:
         event._inbound_answer_ref = event._inbound_row_ref = (
             inbound_answer_ref(event._inbound_row_id, event._inbound_run) if event._inbound_row_id else None)
         event._inbound_reply_kind = None  # the run's answer unless the turn says its reply is a notice
+        event._inbound_answer_stored = False  # set by the turn once its run has produced its answer
 
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:
@@ -1509,6 +1510,7 @@ class GatewayInboundMixin:
                 # Whether that reply is the run's answer or a notice sent instead (run_turn.py): each is
                 # owed under its own obligation (delivery_ledger.REPLY).
                 _incoming._inbound_reply_kind = getattr(event, "_inbound_reply_kind", None)
+                _incoming._inbound_answer_stored = bool(getattr(event, "_inbound_answer_stored", False))
                 if event is not _incoming:
                     _incoming._inbound_outcome = getattr(event, "_inbound_outcome", None)
                     _incoming._inbound_streamed_sent = getattr(event, "_inbound_streamed_sent", False)

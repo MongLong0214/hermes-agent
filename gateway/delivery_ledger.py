@@ -245,6 +245,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (obligation_id, component_id)
         )"""
     )
+    if "redeliveries" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_components)")}:
+        # How many later starts tried an undelivered attachment again (claim_attachment_redelivery).
+        add_column_if_missing(conn, "delivery_components", "redeliveries",
+                              "redeliveries INTEGER NOT NULL DEFAULT 0")
 
 
 def _transaction():
@@ -387,6 +391,10 @@ COMPONENT_MISSING = "missing"
 # (inbound_completion). A notice of such a run is superseded; an answer is provisional until the next start
 # finds the run's completed answer in its transcript (confirm_answer).
 CUT_SHORT = "run_cut_short"
+# Payload flag of a notice sent by a run that had already produced its answer (the agent stores it in the
+# transcript) before the turn failed: that notice is superseded too, never completion evidence for the
+# stored answer, which stays owed under the answer's own obligation.
+ANSWER_STORED = "answer_stored"
 
 # The answers of inbound_completion, the one decision on whether an owner message's reply is delivered.
 COMPLETE = "complete"    # every component of the reply delivered: the record and marker may go
@@ -395,7 +403,8 @@ MISSING = "missing"      # a required attachment's source is gone: blocks comple
 EXPIRED = "expired"      # the text's retry budget is spent (abandoned, attempts cap, stale) undelivered
 OPEN = "open"            # only a reply of a run a restart cut short: the transcript decides what is owed
 UNTRACKED = "untracked"  # a text row without components (written before components were): never complete
-# How many later starts may each give an expired reply one more send (reactivate_expired).
+# How many later starts may each give an expired reply's text one more send (reactivate_expired), and each
+# undelivered attachment of a reply one more try (claim_attachment_redelivery).
 MAX_REACTIVATIONS = 3
 
 
@@ -437,6 +446,26 @@ class ReplyNotStored(RuntimeError):
     """What an owner message's reply requires could not be stored (``record_components`` failed). Nothing
     of the reply may then be sent: an untracked send can neither prove the reply delivered nor stop a
     later start sending it again. The message's record and the reply's source (its transcript) stay."""
+
+
+def claim_attachment_redelivery(obligation_id: str) -> "tuple[List[Dict[str, Any]], List[Dict[str, Any]]]":
+    """A later start's try at the attachments the reply under *obligation_id* still owes (pending, refused
+    or ``missing``): each gets at most ``MAX_REACTIVATIONS`` such tries, the same bound as an expired
+    text's reactivation, counted here before the try. Returns ``(claimed, spent)``: the components to try
+    now, and those whose tries are spent; a spent one keeps its state (it still blocks completion, and
+    the record stays) and is not tried again. Raises when the ledger cannot be written."""
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT component_id, redeliveries FROM delivery_components
+               WHERE obligation_id=? AND kind != 'text' AND state != ?""",
+            (obligation_id, COMPONENT_DELIVERED)).fetchall()
+        claimed = {cid for cid, tries in rows if int(tries or 0) < MAX_REACTIVATIONS}
+        for cid in claimed:
+            conn.execute("""UPDATE delivery_components SET redeliveries=redeliveries+1
+                            WHERE obligation_id=? AND component_id=?""", (obligation_id, cid))
+        owed = {cid for cid, _tries in rows}
+        parts = _components_unlocked(conn, obligation_id)
+    return ([p for p in parts if p["id"] in claimed], [p for p in parts if p["id"] in owed - claimed])
 
 
 def obligation_components(obligation_id: str) -> List[Dict[str, Any]]:
@@ -484,8 +513,9 @@ def inbound_completion(obligation: InboundObligation, *, now: Optional[float] = 
 
     It weighs what the reply is (``REPLY``), what each component's state is, and the text's retry state:
     ``OPEN`` when the reply was sent by a run a restart cut short (``CUT_SHORT``: a superseded notice or a
-    provisional answer, never completion by itself); ``COMPLETE`` when every component is delivered (an
-    answer, or with no answer stored a notice that terminated the message); else ``EXPIRED`` when the
+    provisional answer, never completion by itself), or is a notice sent after the run had stored its
+    answer (``ANSWER_STORED``: superseded by that answer); ``COMPLETE`` when every component is delivered
+    (an answer, or with no answer stored a notice that terminated the message); else ``EXPIRED`` when the
     undelivered text's retry budget is spent, ``MISSING`` when an attachment's source is gone, ``OWED``
     otherwise. ``UNTRACKED`` for a text row without components, ``(None, None)`` for nothing. Raises when
     the ledger cannot be read: a failed read is never an answer."""
@@ -499,7 +529,8 @@ def inbound_completion(obligation: InboundObligation, *, now: Optional[float] = 
             answer_id = obligation.reply_id(REPLY_ANSWER)
             row = conn.execute("SELECT 1 FROM delivery_obligations WHERE obligation_id=?", (answer_id,)).fetchone()
             return (UNTRACKED, answer_id) if row is not None else (None, None)
-        if any(part.get(CUT_SHORT) for part in parts):
+        if any(part.get(CUT_SHORT) or (part.get(REPLY) == REPLY_NOTICE and part.get(ANSWER_STORED))
+               for part in parts):
             return OPEN, reply_id
         owed = [part for part in parts if part["state"] != COMPONENT_DELIVERED]
         if not owed:

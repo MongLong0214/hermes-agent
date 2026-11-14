@@ -2892,12 +2892,15 @@ def test_one_refused_image_of_two_is_owed_alone_though_its_batch_reported_succes
 # The first five tests are the review's reproductions; each fails at 2aa38989.
 
 
-def test_a_notice_a_restart_cut_short_never_stands_in_for_the_answer_the_run_stored(ingress, send, monkeypatch):
-    """s1c review P1-1: the agent stored its completed answer, then a post-turn hook raises while the
-    gateway drains, so the turn's reply is an error notice from a run a restart cut short. The notice is
-    its own obligation (a notice, superseded), never the answer's: the record and the marker stay, and the
-    next start owes the stored answer under the answer's obligation, delivers it, runs nothing again, and
-    only then cleans up. The delivered notice's obligation stays as history."""
+@pytest.mark.parametrize("ended", ["cut_short", "answer_stored"])
+def test_a_notice_a_restart_cut_short_never_stands_in_for_the_answer_the_run_stored(
+        ingress, send, monkeypatch, ended):
+    """s1c review P1-1: the agent stored its completed answer, then a post-turn hook raises, so the
+    turn's reply is an error notice: while the gateway drains (a run a restart cut short), or with no
+    restart at all (a run that ended on the notice after storing its answer). The notice is its own
+    obligation (a notice, superseded), never completion evidence for the stored answer: the record and
+    the marker stay, and the next start owes that answer under the answer's obligation, delivers it,
+    runs nothing again, and only then cleans up. The delivered notice's obligation stays as history."""
     import run_agent
 
     from gateway import delivery_ledger
@@ -2921,9 +2924,10 @@ def test_a_notice_a_restart_cut_short_never_stands_in_for_the_answer_the_run_sto
     monkeypatch.setattr(run_agent, "AIAgent", building)
 
     async def draining_hook(*_args, **_kwargs):
-        h.runner._draining = True
-        await h.runner.async_session_store.mark_resume_pending(h.key)
-        raise RuntimeError("post-turn hook failed while draining")
+        if ended == "cut_short":
+            h.runner._draining = True
+            await h.runner.async_session_store.mark_resume_pending(h.key)
+        raise RuntimeError("post-turn hook failed")
 
     async def exercise():
         await h.warm()
@@ -2940,7 +2944,8 @@ def test_a_notice_a_restart_cut_short_never_stands_in_for_the_answer_the_run_sto
     assert (turns, chats, left) == ([], ["chat"], [])
     assert _marker(nxt) is None and _components(ingress, rid) == [("text", "text", "delivered")]
     notice = delivery_ledger.obligation_components(_inbound_obligation(ingress, rid, "notice"))
-    assert [(c["kind"], c["state"], c[delivery_ledger.REPLY], c.get(delivery_ledger.CUT_SHORT))
+    flag = delivery_ledger.CUT_SHORT if ended == "cut_short" else delivery_ledger.ANSWER_STORED
+    assert [(c["kind"], c["state"], c[delivery_ledger.REPLY], c.get(flag))
             for c in notice] == [("text", "delivered", "notice", True)]  # kept, superseded
 
 
@@ -2974,26 +2979,41 @@ def test_a_reply_whose_components_cannot_be_stored_sends_nothing_until_they_are(
     assert _marker(nxt) is None
 
 
-def test_a_stored_answer_whose_attachment_is_gone_keeps_it_owed_as_missing(ingress, send, monkeypatch, tmp_path):
+@pytest.mark.parametrize("back", ["next_start", "after_the_bound"])
+def test_a_stored_answer_whose_attachment_is_gone_keeps_it_owed_as_missing(
+        ingress, send, monkeypatch, tmp_path, caplog, back):
     """s1c review P1-3: a completed answer, text and a PDF, was stored before any of its components
     were, then the PDF is deleted. The next start owes both: the text is delivered, the PDF stays one of
     the reply's components, recorded missing (never dropped, never counted delivered), and the record
-    stays. Once the file is back, the start after that sends the PDF alone and cleans up. The message is
-    never run again."""
+    stays. Once the file is back, the start after that sends the PDF alone and cleans up. The tries are
+    bounded like a text's reactivation: after MAX_REACTIVATIONS starts found it gone, a start sends
+    nothing even with the file back; the PDF stays missing, the record stays, and an ERROR says so. The
+    message is never run again."""
+    import logging
+
+    from gateway import delivery_ledger
+
     document = tmp_path / "report.pdf"
     document.write_bytes(b"%PDF-test")
     _stored_turn(ingress, "missing", f"{_TERMINAL}\nMEDIA:{document}")
     document.unlink()
     sent = _attachment_sends(monkeypatch, set())
-    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
-    turns, _inputs, chats, left = _answered(ingress, nxt)
-    assert (turns, chats, left, sent) == ([], ["chat"], ["inbound-missing.json"], [])
-    assert _components(ingress, "missing") == [("text", "text", "delivered"), ("media:0", "media", "missing")]
+    for start in range(1 if back == "next_start" else delivery_ledger.MAX_REACTIVATIONS):
+        nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+        turns, _inputs, chats, left = _answered(ingress, nxt)
+        assert (turns, chats, left, sent) == ([], ["chat"] if start == 0 else [], ["inbound-missing.json"], [])
+        assert _components(ingress, "missing") == [("text", "text", "delivered"), ("media:0", "media", "missing")]
     document.write_bytes(b"%PDF-test")
-    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    with caplog.at_level(logging.ERROR):
+        nxt = _next_process(ingress, send, monkeypatch, crashed=True)
     turns, _inputs, chats, left = _answered(ingress, nxt)
-    assert (turns, chats, left) == ([], [], [])
-    assert [(kind, ok) for kind, _what, ok in sent] == [("document", True)]
+    if back == "next_start":
+        assert (turns, chats, left) == ([], [], [])
+        assert [(kind, ok) for kind, _what, ok in sent] == [("document", True)]
+    else:
+        assert (turns, chats, left, sent) == ([], [], ["inbound-missing.json"], [])
+        assert ("media:0", "media", "missing") in _components(ingress, "missing")
+        assert any("not tried again" in r.getMessage() for r in caplog.records)
 
 
 def test_a_stored_answer_that_is_only_an_attachment_is_delivered_and_never_run_again(

@@ -2106,7 +2106,8 @@ class GatewayTurnMixin:
             # A queued chain raised past an answer it had already sent: the notice is owed under the
             # follow-up it failed on ("" when that follow-up has no record: owed under none).
             event._inbound_answer_ref = e._inbound_answer_ref or None
-        # This reply is a notice, never the run's answer, even when the agent had already stored one.
+        # This reply is a notice, never the run's answer. When the run had already produced that answer
+        # (``_inbound_answer_stored``), the notice does not end the message: the answer is still owed.
         event._inbound_reply_kind = _inbound_reply_kind(None)
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
@@ -2491,6 +2492,11 @@ class GatewayTurnMixin:
                 acp_admission=getattr(event, "_acp_admission", None),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
+            # The run produced its answer, which the agent stores itself: a notice this turn sends instead
+            # (it raises later) never ends the message (delivery_ledger.ANSWER_STORED).
+            from gateway.delivery_ledger import REPLY_ANSWER
+            event._inbound_answer_stored = _inbound_reply_kind(agent_result) == REPLY_ANSWER and bool(
+                str(agent_result.get("final_response") or "").strip())
 
             self._adopt_queued_terminal(event, agent_result)
 

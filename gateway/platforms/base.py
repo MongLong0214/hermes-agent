@@ -4353,13 +4353,15 @@ class BasePlatformAdapter(ABC):
 
     async def _record_reply_components(self, source: Any, session_key: str, answer_ref: Optional[str],
                                        extracted: "_ExtractedResponse", *, cut_short: bool = False,
-                                       kind: Optional[str] = None) -> "tuple[Optional[str], list]":
+                                       kind: Optional[str] = None,
+                                       answer_stored: bool = False) -> "tuple[Optional[str], list]":
         """Store what the reply owed under *answer_ref* (an owner message's record and run, gateway/
         run_inbound.py) requires, before any of it is sent (delivery_ledger.record_components): its text
         and every attachment, under component ids stable within the reply, as the run's answer or as a
         notice sent instead (*kind*, delivery_ledger.REPLY: each under its own obligation). ``cut_short``:
         the run did not end its message (a restart cut it short; its record stays), so this reply is
-        marked as one that does not settle the message by itself. Returns the obligation id and the
+        marked as one that does not settle the message by itself; so is a notice whose run had already
+        stored its answer (``answer_stored``, delivery_ledger.ANSWER_STORED). Returns the obligation id and the
         components it holds, with their states (an earlier store of this reply, partly delivered, wins).
         ``(None, [])`` only when nothing tracks the reply: it has no reference (not an owner message's),
         or the ledger is off (the sends themselves are then the proof). Raises
@@ -4367,14 +4369,16 @@ class BasePlatformAdapter(ABC):
         if not answer_ref:
             return None, []
         from gateway.delivery_ledger import (
-            CUT_SHORT, REPLY, REPLY_ANSWER, InboundObligation, ReplyNotStored, ledger_enabled, record_components)
+            ANSWER_STORED, CUT_SHORT, REPLY, REPLY_ANSWER, REPLY_NOTICE, InboundObligation, ReplyNotStored,
+            ledger_enabled, record_components)
         kind = kind or REPLY_ANSWER
+        flags = {**({CUT_SHORT: True} if cut_short else {}),
+                 **({ANSWER_STORED: True} if answer_stored and kind == REPLY_NOTICE else {})}
         try:
             if not await asyncio.to_thread(ledger_enabled):
                 return None, []
             obligation_id = InboundObligation.to(session_key, answer_ref, source).reply_id(kind)
-            components = [{**part, REPLY: kind, **({CUT_SHORT: True} if cut_short else {})}
-                          for part in extracted.components()]
+            components = [{**part, REPLY: kind, **flags} for part in extracted.components()]
             return obligation_id, await asyncio.to_thread(record_components, obligation_id, components)
         except Exception as exc:
             logger.warning("[%s] Storing the components of an owner message's reply failed; nothing of it is "
@@ -5022,7 +5026,8 @@ class BasePlatformAdapter(ABC):
                         event.source, session_key,
                         None if self._final_unledgered(event, is_ephemeral_response) else _answer_ref, extracted,
                         cut_short=bool(getattr(event, "_inbound_cut_short", False)),
-                        kind=getattr(event, "_inbound_reply_kind", None))
+                        kind=getattr(event, "_inbound_reply_kind", None),
+                        answer_stored=bool(getattr(event, "_inbound_answer_stored", False)))
                 except ReplyNotStored:
                     # Not a normal result: nothing of the reply is sent (no text, voice or attachment), and
                     # its record and marker stay; the next start owes it from its transcript.
@@ -5145,7 +5150,7 @@ class BasePlatformAdapter(ABC):
             await self._release_turn_marker(event, owed=reply_owed)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             event._inbound_ledger_ref = event._inbound_outcome = event._inbound_reply_kind = None
-            event._inbound_streamed_sent = event._inbound_cut_short = False
+            event._inbound_streamed_sent = event._inbound_cut_short = event._inbound_answer_stored = False
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
