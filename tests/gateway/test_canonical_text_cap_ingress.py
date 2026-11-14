@@ -70,8 +70,8 @@ def ingress(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", home / "state.db")
-    # The home override wins over HERMES_HOME, and a module collected in the same process may leave
-    # one set (tests/gateway/test_canonical_peer_tool_grant.py pins its own at import), so pin this one.
+    # The home override wins over HERMES_HOME, and a caller (a profile scope, or another module's pin
+    # such as tests/gateway/test_canonical_peer_tool_grant.py's module fixture) may hold one, so pin this one.
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     override = set_hermes_home_override(home)
     try:

@@ -6,7 +6,6 @@ just means "the peer path runs nothing". The tools are REAL MCP tool handlers
 
 from __future__ import annotations
 
-import atexit
 import os
 import shutil
 import tempfile
@@ -19,35 +18,39 @@ try:
 except ImportError:  # not POSIX
     pwd = None
 
-# Pinned BEFORE any dependent Hermes import, for every resolver, import-time path, cache and
-# subprocess of this module: HOME and HERMES_HOME name a fresh tmp dir, and the context-local home
-# override, which wins over both, is replaced by that same tmp home, so a caller's existing override
-# (a profile scope) cannot aim this module at a real home either. A run outside tests/ (no hermetic
-# conftest) once let peer tool test helpers replace the user's live config.
+# Pinned for this module's tests, before any test body runs, for every resolver, cache and subprocess
+# they reach: HOME and HERMES_HOME name a fresh tmp dir, and the context-local home override, which
+# wins over both, is replaced by that same tmp home, so a caller's existing override (a profile scope)
+# cannot aim this module at a real home either. Import does no HOME-dependent work (every dependent
+# Hermes import here is lazy), so nothing runs before the pin. A run outside tests/ (no hermetic
+# conftest) once let peer tool test helpers replace the user's live config; pinned at collection
+# instead, HOME and HERMES_HOME stayed redirected for every test that ran before this module.
+# tests/agent/test_canonical_peer_tools_isolation.py holds both properties.
 _REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir) if pwd is not None else Path.home()
 _LIVE_CONFIG = (_REAL_HOME / ".hermes" / "config.yaml").resolve()
-_PINNED_ROOT = Path(tempfile.mkdtemp(prefix="hermes-peer-tools-")).resolve()
-if _PINNED_ROOT.is_relative_to(_LIVE_CONFIG.parent) or _LIVE_CONFIG.is_relative_to(_PINNED_ROOT):
-    raise RuntimeError(f"the pinned test home {_PINNED_ROOT} overlaps the real home")
-atexit.register(shutil.rmtree, _PINNED_ROOT, True)
-_ENV_BEFORE = {key: os.environ.get(key) for key in ("HOME", "HERMES_HOME")}
-os.environ["HOME"] = str(_PINNED_ROOT)
-os.environ["HERMES_HOME"] = str(_PINNED_ROOT / ".hermes")
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-_MODULE_PIN = set_hermes_home_override(_PINNED_ROOT / ".hermes")
-
 
 @pytest.fixture(autouse=True, scope="module")
-def _release_the_module_pin():
-    yield
-    reset_hermes_home_override(_MODULE_PIN)
-    for key, value in _ENV_BEFORE.items():
-        if value is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = value
+def _module_pin():
+    root = Path(tempfile.mkdtemp(prefix="hermes-peer-tools-")).resolve()
+    if root.is_relative_to(_LIVE_CONFIG.parent) or _LIVE_CONFIG.is_relative_to(root):
+        raise RuntimeError(f"the pinned test home {root} overlaps the real home")
+    env_before = {key: os.environ.get(key) for key in ("HOME", "HERMES_HOME")}
+    os.environ["HOME"] = str(root)
+    os.environ["HERMES_HOME"] = str(root / ".hermes")
+    pin = set_hermes_home_override(root / ".hermes")
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(pin)
+        for key, value in env_before.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(root, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
