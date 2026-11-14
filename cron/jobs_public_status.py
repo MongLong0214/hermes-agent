@@ -33,10 +33,11 @@ PUBLIC_CRON_JOB_FIELDS = (
     "last_delivery_error", "last_fire_error",
 )
 # The dashboard edits a job's execution config and shows its run error (web/src/lib/api.ts
-# ``CronJob``), so it serves those too; claims and ``origin`` still stay on the host.
+# ``CronJob``), so it serves those too, plus the schedule knobs its create/update routes take
+# (hermes_cli/web_server_cron.py); claims and ``origin`` still stay on the host.
 DASHBOARD_CRON_JOB_FIELDS = PUBLIC_CRON_JOB_FIELDS + (
     "script", "no_agent", "model", "provider", "base_url", "context_from", "enabled_toolsets",
-    "workdir", "last_error",
+    "workdir", "last_error", "timezone", "grace_minutes", "catch_up", "failure_deliver",
 )
 
 PROVIDER_KIND_PREFIX = "provider:"

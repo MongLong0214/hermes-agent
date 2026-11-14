@@ -1563,3 +1563,38 @@ class TestCronRunHistoryFallback:
         assert older["id"] == f"cron_output:{job_id}:2026-09-25_10-00-00"
         assert older["title"].startswith("COMPLETED · successful older run")
         assert older["started_at"] == _at("2026-09-25_10-00-00").timestamp()
+
+
+def test_dashboard_jobs_serve_the_closed_projection_without_claims_or_origin(isolated_profiles):
+    """The dashboard JSON carries no fire/run claim and no origin, and its failure fields are the
+    closed labels, also for a record written raw before the store closed them."""
+    from cron.jobs_public_status import public_delivery_error, public_run_error
+
+    raw = "HTTP 401: key sk-leakcanary0123 rejected by https://u:hunter2@leakcanary.example/v1"
+    job = _web_server_cron._call_cron_for_profile(
+        "worker_alpha", "create_job", prompt="dash", schedule="every 1h", name="dash")
+    with _web_server_cron._cron_store_scope(isolated_profiles["worker_alpha"]) as cron_jobs:
+        records = cron_jobs.load_jobs()
+        records[0].update(
+            origin={"platform": "telegram", "chat_id": "424242", "user_id": "777"},
+            fire_claim={"by": "host-a:4242", "at": "2026-09-01T00:00:00+00:00"},
+            run_claim={"by": "host-a:4242"}, last_status="error", last_error=raw,
+            last_delivery_error=f"telegram: 400 at {raw}",
+            last_fire_error={"at": "2026-09-01T00:00:00+00:00", "detail": raw})
+        cron_jobs.save_jobs(records)
+
+    (listed,) = _rt_cron._list_cron_jobs_sync("worker_alpha")
+
+    assert listed["id"] == job["id"] and listed["profile"] == "worker_alpha"
+    assert not {"origin", "fire_claim", "run_claim"} & set(listed)
+    assert listed["last_error"] == public_run_error(raw)
+    assert listed["last_delivery_error"] == public_delivery_error(raw)
+    served = json.dumps(listed)
+    assert "leakcanary" not in served and "hunter2" not in served and "424242" not in served
+
+
+def test_dashboard_helper_results_that_are_not_jobs_keep_their_keys(isolated_profiles):
+    job = _web_server_cron._call_cron_for_profile(
+        "worker_alpha", "create_job", prompt="dash", schedule="every 1h", name="stop")
+    result = _web_server_cron._call_cron_for_profile("worker_alpha", "cancel_job_run", job["id"])
+    assert result["cancelled"] is False and result["detail"]
