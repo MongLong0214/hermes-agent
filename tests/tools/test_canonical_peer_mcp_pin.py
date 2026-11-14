@@ -9,7 +9,6 @@ transport that records every call reaching it."""
 
 from __future__ import annotations
 
-import atexit
 import os
 import shutil
 import tempfile
@@ -22,32 +21,35 @@ try:
 except ImportError:  # not POSIX
     pwd = None
 
-# Pinned BEFORE any dependent Hermes import (see tests/agent/test_canonical_peer_tools.py): a run
-# outside tests/ once let peer tool test helpers replace the user's live config.
+# Pinned for this module's tests, before any of them imports a dependent Hermes module (every such
+# import here is lazy; see tests/agent/test_canonical_peer_tools.py): a run outside tests/ once let
+# peer tool test helpers replace the user's live config. Pinned at collection instead, HOME and
+# HERMES_HOME stayed redirected for every test that runs before this module in the same process.
 _REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir) if pwd is not None else Path.home()
 _LIVE_CONFIG = (_REAL_HOME / ".hermes" / "config.yaml").resolve()
-_PINNED_ROOT = Path(tempfile.mkdtemp(prefix="hermes-peer-mcp-pin-")).resolve()
-if _PINNED_ROOT.is_relative_to(_LIVE_CONFIG.parent) or _LIVE_CONFIG.is_relative_to(_PINNED_ROOT):
-    raise RuntimeError(f"the pinned test home {_PINNED_ROOT} overlaps the real home")
-atexit.register(shutil.rmtree, _PINNED_ROOT, True)
-_ENV_BEFORE = {key: os.environ.get(key) for key in ("HOME", "HERMES_HOME")}
-os.environ["HOME"] = str(_PINNED_ROOT)
-os.environ["HERMES_HOME"] = str(_PINNED_ROOT / ".hermes")
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-_MODULE_PIN = set_hermes_home_override(_PINNED_ROOT / ".hermes")
-
 
 @pytest.fixture(autouse=True, scope="module")
-def _release_the_module_pin():
-    yield
-    reset_hermes_home_override(_MODULE_PIN)
-    for key, value in _ENV_BEFORE.items():
-        if value is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = value
+def _module_pin():
+    root = Path(tempfile.mkdtemp(prefix="hermes-peer-mcp-pin-")).resolve()
+    if root.is_relative_to(_LIVE_CONFIG.parent) or _LIVE_CONFIG.is_relative_to(root):
+        raise RuntimeError(f"the pinned test home {root} overlaps the real home")
+    env_before = {key: os.environ.get(key) for key in ("HOME", "HERMES_HOME")}
+    os.environ["HOME"] = str(root)
+    os.environ["HERMES_HOME"] = str(root / ".hermes")
+    pin = set_hermes_home_override(root / ".hermes")
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(pin)
+        for key, value in env_before.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(root, ignore_errors=True)
 
 
 import asyncio
