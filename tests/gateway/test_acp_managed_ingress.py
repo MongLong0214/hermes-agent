@@ -316,6 +316,13 @@ class TestManagedAdmissionGate:
         assert _managed_state(gw) == (0, 0, 0)
         assert receipts.lookup(gw.db, 901).status == "NEVER_FOUND"
 
+    @pytest.mark.parametrize("value,enabled", [
+        ("off", False), ("false", False), ("0", False), ("no", False), (" OFF ", False), ("False", False),
+        ("on", True), ("true", True), ("yes", True), (False, False), (True, True)], ids=repr)
+    def test_a_quoted_gate_value_is_read_as_its_word(self, value, enabled):
+        """YAML reads a bare ``off`` as a boolean; a quoted one arrives as the string and must close the gate too."""
+        assert ingress.admission_enabled({"gateway": {"acp_managed_admission": value}}) is enabled
+
     @pytest.mark.parametrize("gate", [None, "true"])
     def test_an_open_gate_keeps_managed_admission_unchanged(self, gw, gate):
         self._set_gate(gate)
