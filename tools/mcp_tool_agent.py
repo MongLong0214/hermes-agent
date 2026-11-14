@@ -29,6 +29,24 @@ def _def_name(tool_def: dict) -> str:
     return (tool_def.get("function") or {}).get("name", "")
 
 
+def _bridge_listing_grew(kept: dict, fresh: Optional[dict]) -> bool:
+    """True when ``fresh`` (a ``tool_search`` def) advertises a deferred tool or group that
+    ``kept`` does not. The bridge's bytes stay frozen through check_fn flaps and recounts, but
+    its listing is how the model learns a deferred tool exists, so a newly connected server
+    must reach it — the same one-time prefix cost an eager tool appended at the tail pays."""
+    if fresh is None or _def_name(kept) != "tool_search":
+        return False
+    from tools.tool_search_catalog import listing_names_new_tools
+    describe = lambda d: (d.get("function") or {}).get("description", "")
+    return listing_names_new_tools(describe(kept), describe(fresh))
+
+
+def _search_listing_grew(current_defs: list, new_defs: list) -> bool:
+    search = lambda defs: next((d for d in defs if _def_name(d) == "tool_search"), None)
+    current = search(current_defs)
+    return current is not None and _bridge_listing_grew(current, search(new_defs))
+
+
 def _agent_tool_defs(agent) -> list:
     return list(getattr(agent, "tools", None) or [])
 
@@ -111,9 +129,10 @@ def _publish_tool_snapshot(
         # caller can't clobber.
         agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
         agent._tool_snapshot_selection = selection
-        # Same name set: nothing to publish, unless the caller is content_aware
-        # (explicit reload, compaction) and the serialized schema bytes moved.
-        if new_names == current and not (content_aware and _tool_defs_content_changed(agent, new_defs)):
+        # Same name set: nothing to publish, unless a server landed only in the deferred listing,
+        # or the caller is content_aware (explicit reload, compaction) and the schema bytes moved.
+        if (new_names == current and not _search_listing_grew(current_defs, new_defs)
+                and not (content_aware and _tool_defs_content_changed(agent, new_defs))):
             return None
         agent.tools = new_defs
         agent.valid_tool_names = new_names
@@ -388,14 +407,19 @@ def _merge_preserving_prefix(current_defs: list, new_defs: list, registered_name
 
     The bridge tools are synthesized by ``assemble_tool_defs``, never registered, and a fresh
     snapshot omits them when the deferred set shrinks under the activation threshold: they
-    keep their slot regardless (search reads the live catalog at dispatch)."""
+    keep their slot regardless (search reads the live catalog at dispatch). The one exception is
+    a ``tool_search`` listing that names a new server or tool outside the freeze (``held``): the
+    listing is the only place the model learns a deferred tool exists, so the fresh def takes the
+    slot, at the same one-time cost a late eager tool appended at the tail pays."""
     from tools.tool_search_catalog import BRIDGE_TOOL_NAMES
     fresh = {_def_name(entry): entry for entry in new_defs if _def_name(entry)}
     merged = []
     for entry in current_defs:
         name = _def_name(entry)
         replacement = fresh.pop(name, None)
-        if replacement is not None or name in BRIDGE_TOOL_NAMES or (name and name in registered_names):
+        if name not in held and _bridge_listing_grew(entry, replacement):
+            merged.append(replacement)
+        elif replacement is not None or name in BRIDGE_TOOL_NAMES or (name and name in registered_names):
             merged.append(entry)
     merged.extend(entry for name, entry in fresh.items() if name not in held)
     return merged, {_def_name(t) for t in merged}

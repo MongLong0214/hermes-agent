@@ -140,3 +140,88 @@ def test_local_search_runs_the_pinned_ripgrep_not_the_first_on_path(_local_env, 
                         lambda name: InstalledPackage(pinned.parent, "15", pinned) if name == "ripgrep" else None)
     ops = ShellFileOperations(_local_env, cwd=str(tmp_path))
     assert ops._resolve_command("rg") == str(pinned).replace("\\", "/")
+
+
+def _wait_dead(pid, within):
+    import os
+    import time
+
+    deadline = time.monotonic() + within
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _kill_quietly(pidfile):
+    """Reap a leftover sleeper through its group: once reparented to init it is outside the
+    test's process tree, where the live-system guard refuses a per-PID kill."""
+    import contextlib
+    import os
+
+    with contextlib.suppress(Exception):
+        pgid = os.getpgid(int(pidfile.read_text().strip()))
+        if pgid != os.getpgrp():
+            os.killpg(pgid, 9)
+
+
+@pytest.mark.parametrize("merge_stderr", [False, True], ids=["stdout", "stdout+stderr"])
+def test_native_runner_returns_within_the_bound_when_a_grandchild_holds_the_pipe(
+        tree, ops_factory, monkeypatch, tmp_path, merge_stderr):
+    """rg exits but a descendant the group kill cannot reach keeps its pipes open: the search
+    returns with the output already drained instead of waiting for the descendant to exit."""
+    import time
+
+    from tools.environments import local as local_env
+
+    monkeypatch.setattr(local_env, "_kill_process_group_posix", lambda proc: None)  # unreachable survivor
+    ops = ops_factory(tree, [])
+    pidfile = tmp_path / "bg.pid"
+    started = time.monotonic()
+    try:
+        result = ops._run_rg_native(["sh", "-c", f"'echo needle; (sleep 12 & echo $! > {pidfile})'"],
+                                    10, timeout=1, merge_stderr=merge_stderr)
+        elapsed = time.monotonic() - started
+    finally:
+        _kill_quietly(pidfile)
+    assert "needle" in result.stdout, result.to_dict()
+    assert elapsed < 8.0, f"a surviving descendant must not hang the search, took {elapsed:.2f}s"
+
+
+def test_native_runner_kills_surviving_group_when_leader_already_exited(tree, ops_factory, tmp_path):
+    """The leader (``sh``) backgrounds ``sleep`` and exits well before the deadline (after the
+    spawn has recorded its group). The pgid recorded at spawn still reaches the descendant left
+    in its group; skipping the kill because the leader is gone leaves it running."""
+    import time
+
+    ops = ops_factory(tree, [])
+    pidfile = tmp_path / "bg.pid"
+    started = time.monotonic()
+    try:
+        result = ops._run_rg_native(
+            ["sh", "-c", f"'echo needle; (sleep 12 & echo $! > {pidfile}); sleep 0.3'"], 10, timeout=1)
+        elapsed = time.monotonic() - started
+        assert "needle" in result.stdout, result.to_dict()
+        assert elapsed < 8.0, f"a surviving descendant must not hang the search, took {elapsed:.2f}s"
+        assert _wait_dead(int(pidfile.read_text().strip()), within=5.0), "the descendant must be killed"
+    finally:
+        _kill_quietly(pidfile)
+
+
+def test_native_runner_tolerates_pgid_lookup_racing_rg_exit(tree, ops_factory, monkeypatch):
+    """rg can exit before its group is recorded at spawn and be gone by the kill; with no
+    leader and no recorded pgid the lookup's ``ProcessLookupError`` must not escape and
+    discard the output already drained."""
+    import os
+    import subprocess
+
+    monkeypatch.setattr(subprocess.Popen, "poll", lambda self: None)
+    monkeypatch.setattr(os, "getpgid", lambda pid: (_ for _ in ()).throw(ProcessLookupError(3, "No such process")))
+    ops = ops_factory(tree, [])
+    result = ops._run_rg_native(["sh", "-c", "'echo needle-one; echo needle-two'"], 10, timeout=5)
+    assert result.exit_code == 0
+    assert "needle-one" in result.stdout and "needle-two" in result.stdout, result.stdout

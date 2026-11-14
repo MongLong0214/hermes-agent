@@ -58,6 +58,11 @@ _FILENAME_SEARCH_ADMISSION = threading.Condition()
 _ACTIVE_FILENAME_SEARCH_ROOTS: set[tuple[str, str, str]] = set()
 _FILENAME_SEARCH_WAIT_SECONDS = 0.05
 
+# How long the native rg lane waits for its pipe drainers after the group kill. A descendant
+# that outlives the kill (ignored signal, setsid escape the snapshot missed) holds the pipes
+# open; past this bound the daemon drainers are abandoned with the output already read.
+_RG_DRAIN_FINAL_JOIN_BOUND_S = 2.0
+
 
 def _normalized_filename_search_root(env: Any, root: str, fallback_cwd: str) -> str:
     """Normalize a filename-walk root without resolving remote paths locally."""
@@ -658,15 +663,21 @@ class SearchMixin:
             if time.monotonic() > deadline:
                 exit_code = 124
                 break
-        if proc.poll() is None:
+        # Kill the group even when rg itself already exited and was reaped: a backgrounded
+        # descendant stays in it and holds the pipes, and the pgid recorded at spawn still
+        # reaches it. Nothing left to signal at all (no leader, no recorded pgid) is not an
+        # error, and must not discard the output already drained.
+        with contextlib.suppress(ProcessLookupError):
             _kill_process_group_posix(proc)  # native lane is POSIX-only (gate above)
         proc.wait()
-        drainer.join()
-        proc.stdout.close()
+        final_deadline = time.monotonic() + _RG_DRAIN_FINAL_JOIN_BOUND_S
+        drainer.join(_RG_DRAIN_FINAL_JOIN_BOUND_S)
+        if not drainer.is_alive():
+            proc.stdout.close()
         stdout = b"".join(lines).decode("utf-8", errors="replace")
         if err_drainer is not None:
-            err_drainer.join()
-            if proc.stderr is not None:
+            err_drainer.join(max(0.0, final_deadline - time.monotonic()))
+            if proc.stderr is not None and not err_drainer.is_alive():
                 proc.stderr.close()
             err_text = b"".join(err_chunks).decode("utf-8", errors="replace")
             if err_omitted[0]:
