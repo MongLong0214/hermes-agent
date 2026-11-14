@@ -706,6 +706,9 @@ exclude-newer-package = { certifi = false }
 
 [tool.setuptools.packages.find]
 include = [
+  # Namespace packages (no __init__.py): gateway/canonical_surface.py imports bridge.canonical.
+  "bridge",
+  "bridge.canonical",
   "agent",
   "agent.*",
   "tools",

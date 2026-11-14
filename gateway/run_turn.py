@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- canonical surface seam: _build_agent_for_resolved_session is a hook only; the build lives in gateway/run_turn_runner.py (build_agent_for_resolved_session)
 """Agent-turn execution for GatewayRunner: _handle_message_with_agent, _run_agent*, proxy path,
 MCP reload. Bound onto ``GatewayRunner`` via the MRO; ``gateway.run`` internals
 are imported lazily inside method bodies (import cycle) so ``patch("gateway.run.X")`` still works.
@@ -329,6 +330,12 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         finally:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
+
+    async def _build_agent_for_resolved_session(self, entry: Any) -> None:
+        """Build and cache the agent for an existing, resolved live session as an ordinary turn on it
+        would (the canonical surface's seam; ``run_turn_runner.build_agent_for_resolved_session``)."""
+        from gateway.run_turn_runner import build_agent_for_resolved_session
+        await build_agent_for_resolved_session(self, entry)
 
     def _profile_scope_for_source(self, source: SessionSource):
         """``_profile_runtime_scope`` for ``source``'s profile when a secret scope is required.

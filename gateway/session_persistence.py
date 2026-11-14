@@ -350,9 +350,24 @@ class SessionPersistenceMixin:
         keys the DB doesn't have, then persisted to the DB on the next _save).
         """
         if self._loaded:
+            if getattr(self, "_startup_prune_pending", False):
+                # An existing-only reader read the index first (``_read_index_without_recovery_locked``):
+                # this is the first load that may act on it, so it owes what a first load does after
+                # reading, now, once (and, like one, without the reconcile pass).
+                self._startup_prune_pending = False
+                self.sessions_dir.mkdir(parents=True, exist_ok=True)
+                self._finish_first_load_locked(getattr(self, "_startup_mirror_rewrite_pending", False))
+                return
             self._reconcile_recovered_routing_locked()
             return
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self._finish_first_load_locked(self._read_routing_index_locked())
+
+    def _read_routing_index_locked(self) -> bool:
+        """Read the routing index into ``_entries`` and mark the store loaded (lock held): state.db
+        rows, then the legacy sessions.json for keys the DB lacks, then missing origins healed from
+        their conversation rows in memory. Writes nothing. True when the DB load succeeded and the
+        mirror holds retired routes the first load must rewrite out of it."""
         db_load_succeeded = self._load_routing_rows_locked()
         db_had_entries = db_load_succeeded and bool(self._entries)
         mirror_retired = self._import_legacy_sessions_json(db_had_entries)
@@ -362,7 +377,26 @@ class SessionPersistenceMixin:
         # would then keep the stale mirror entry over the newer DB row.
         self._heal_missing_origins(self._entries.values())
         self._routing_fallback_baseline = None if db_load_succeeded else self._entries_as_dicts()
-        if mirror_retired and db_load_succeeded:
+        return bool(mirror_retired and db_load_succeeded)
+
+    def _read_index_without_recovery_locked(self) -> None:
+        """For existing-only readers (lock held): the routing index exactly as the lazy load reads it,
+        but none of what the lazy load then does to it — no stale-entry prune, no recovery or reopen of
+        an ended session, no repoint, no save, no directory created. The prune (and a mirror rewrite)
+        stays owed to the first ordinary load (``_ensure_loaded_locked``), so a route to an ended
+        session is read as it is and refused by the reader, and the ordinary path still heals it."""
+        if self._loaded:
+            return
+        try:
+            self._startup_mirror_rewrite_pending = self._read_routing_index_locked()
+        finally:
+            # A read that failed after marking the store loaded still owes the prune.
+            self._startup_prune_pending = self._loaded
+
+    def _finish_first_load_locked(self, rewrite_mirror: bool) -> None:
+        """What the first load does once the index is read (lock held): the mirror rewrite it owes,
+        then the startup prune."""
+        if rewrite_mirror:
             # Rewrite the mirror while the fences that kept those routes out still hold: a prune's
             # ages out, and the import would then restore the retired route.
             self._save()

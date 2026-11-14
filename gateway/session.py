@@ -812,6 +812,10 @@ class SessionStore(
         self.config = config
         self._entries: dict[str, SessionEntry] = {}
         self._loaded = False
+        # Set when an existing-only reader loaded the index first: the first ordinary load still owes
+        # the startup prune (and the mirror rewrite, when the read found retired routes in it).
+        self._startup_prune_pending = False
+        self._startup_mirror_rewrite_pending = False
         # A fallback-only initial load is reconciled with state.db once the handle recovers.
         self._routing_db_loaded = False
         self._routing_fallback_baseline: Optional[dict[str, Any]] = None
@@ -1385,6 +1389,34 @@ class SessionStore(
             return None
         with self._lock:
             return self._entry_locked(session_key)
+
+    def lookup_by_session_key_existing(self, session_key: str) -> Optional[SessionEntry]:
+        """Return the existing entry for an exact key without creating, recovering or saving it.
+
+        A store nothing has loaded yet reads its routing index first, without recovery
+        (``_read_index_without_recovery_locked``): a clean restart loads it only on the first ordinary
+        inbound or crash recovery, so a canonical event arriving first found every binding stale; but
+        this reader must never prune, reopen or repoint a route, so a route to an ended session is
+        answered as it stands (and refused by the caller), and the prune stays owed to the first
+        ordinary load. The read heals a missing origin in memory exactly as the ordinary load does. A
+        loaded store is read as it stands, never re-reconciled, so the same key keeps answering the
+        same entry object for the callers' identity re-checks. A key absent after the read is still
+        None, and a read that fails answers None."""
+        if not isinstance(session_key, str) or not session_key:
+            return None
+        with self._lock:
+            if not self._loaded:
+                try:
+                    self._read_index_without_recovery_locked()
+                except Exception:
+                    logger.warning("gateway.session: index load for an existing-only lookup failed",
+                                   exc_info=True)
+                    return None
+            return self._entries.get(session_key)
+
+    def _should_reset(self, entry: SessionEntry, source: SessionSource) -> Optional[str]:
+        """Return the current explicit-reset reason for an existing route, if any."""
+        return self._route_reset_reason(entry)
 
     def peek_session_id(self, session_key: str) -> Optional[str]:
         """Lock-held accessor for the key -> session_id mapping (None if unknown)."""
