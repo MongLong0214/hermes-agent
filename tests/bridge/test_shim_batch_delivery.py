@@ -137,7 +137,7 @@ def test_unrecoverable_event_alone_refused_others_continue(bridge, failure):
     if failure == "missing":
         del bridge.events[bad["id"]]
     else:
-        if failure == "signature":
+        if failure == "signature":  # health: allow HX011 -- one branch per parametrized case, each building a different fixture shape (fork test, verbatim)
             bad["sig"] = "00" * 64
         elif failure == "content":
             bad["content"] = "forged owner instruction"

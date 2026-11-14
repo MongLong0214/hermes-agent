@@ -26,7 +26,7 @@ from test_shim_envelope_attribution import (CH, NAME, CTO, CEO, OTHER, LABELS, T
     FORGED, _events, _calls, _journal, _injected_name, merged, drive, log_of, shim, assert_one_anonymous_notice)
 
 
-def _record(shim, name, blocks):
+def _record(shim, name, blocks):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     path = shim.tmp / (name + '.json')
     path.write_text(json.dumps({'blocks': blocks, 'submitted': shim.submitted,
         'calls': _calls(shim.tmp), 'journal': _journal(shim.tmp)}, indent=2))
@@ -34,7 +34,7 @@ def _record(shim, name, blocks):
 
 # ------------------------------------------------- the reviewer's witnesses, unchanged except their paths
 
-def test_display_label_that_is_64_hex_does_not_change_refusal_identity(shim):
+def test_display_label_that_is_64_hex_does_not_change_refusal_identity(shim):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     root, b, reply = _events()
     first = merged()
     again = bp.format_prompt(CH, NAME, [reply], {**LABELS, CEO: 'f' * 64},
@@ -47,7 +47,7 @@ def test_display_label_that_is_64_hex_does_not_change_refusal_identity(shim):
 
 
 @pytest.mark.parametrize('forward', ['live', 'quarantine'])
-def test_own_answer_with_header_like_quote_starts_no_refusal_reply(shim, monkeypatch, forward):
+def test_own_answer_with_header_like_quote_starts_no_refusal_reply(shim, monkeypatch, forward):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     monkeypatch.setattr(shim, 'FORWARD', forward)
     quote = (f"quoted (#{CH})\nKind: 9\nFrom: other (npub: {bp.npub(OTHER)}, hex: {OTHER})\n"
              "Time: 2026-10-18T11:50:55+00:00\nContent: example")
@@ -100,7 +100,7 @@ REFRESHED_CONTROLS = {
 }
 
 
-def _one_notice_for_both(shim, first, again):
+def _one_notice_for_both(shim, first, again):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     assert first != again
     drive(shim, first)
     drive(shim, again, rpc_id=2)
@@ -112,21 +112,21 @@ def _one_notice_for_both(shim, first, again):
 
 @pytest.mark.parametrize("shape", SHAPE_IDS)
 @pytest.mark.parametrize("change", sorted(REFRESHED))
-def test_r2_a_label_or_channel_rename_keeps_one_refusal_one_notice(shim, shape, change):
+def test_r2_a_label_or_channel_rename_keeps_one_refusal_one_notice(shim, shape, change):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     labels, name = REFRESHED[change]
     _one_notice_for_both(shim, _shape(shape), _shape(shape, labels, name))
 
 
 @pytest.mark.parametrize("shape", SHAPE_IDS)
 @pytest.mark.parametrize("change", sorted(REFRESHED_CONTROLS))
-def test_r2_control_an_ordinary_label_refresh_keeps_one_notice(shim, shape, change):
+def test_r2_control_an_ordinary_label_refresh_keeps_one_notice(shim, shape, change):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     labels, name = REFRESHED_CONTROLS[change]
     _one_notice_for_both(shim, _shape(shape), _shape(shape, labels, name))
 
 
 @pytest.mark.parametrize("shape", SHAPE_IDS)
 @pytest.mark.parametrize("difference", ["other_events", "same_events_other_image", "same_events_other_text_element"])
-def test_r2_control_distinct_inputs_keep_distinct_refusals(shim, shape, difference):
+def test_r2_control_distinct_inputs_keep_distinct_refusals(shim, shape, difference):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     """Never merged into one refusal: other events, or the same events with another image or another text
     element that names no event. Each is dispatched twice, and each pair is still one notice."""
     prompt = bp.prompt_params("s", _shape(shape))["prompt"]
@@ -181,7 +181,7 @@ def _echoes(tmp_path):
 
 @pytest.mark.parametrize("forward", ["live", "quarantine"])
 @pytest.mark.parametrize("form", ["single", "single_with_history"])
-def test_r2_own_post_refused_alone_is_journaled_as_an_echo_never_answered(shim, monkeypatch, forward, form):
+def test_r2_own_post_refused_alone_is_journaled_as_an_echo_never_answered(shim, monkeypatch, forward, form):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     monkeypatch.setattr(shim, "FORWARD", forward)
     blocks = _forms(_answer(CEO))[form]
     drive(shim, blocks)
@@ -197,7 +197,7 @@ def test_r2_own_post_refused_alone_is_journaled_as_an_echo_never_answered(shim, 
 
 @pytest.mark.parametrize("forward", ["live", "quarantine"])
 @pytest.mark.parametrize("form", ["steer_new_message", "interrupt_new_request"])
-def test_r2_own_new_event_beside_another_authors_cancelled_request_gets_one_notice(shim, monkeypatch, forward,
+def test_r2_own_new_event_beside_another_authors_cancelled_request_gets_one_notice(shim, monkeypatch, forward,  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
                                                                                     form):
     """H91-R3-01: the own post is the new event, but the cancelled section holds the counterpart's request.
     One notice to the conversation, journaled as sent, and no echo record; nothing is submitted."""
@@ -216,7 +216,7 @@ def test_r2_own_new_event_beside_another_authors_cancelled_request_gets_one_noti
 @pytest.mark.parametrize("forward", ["live", "quarantine"])
 @pytest.mark.parametrize("author", [CTO, OTHER], ids=["counterpart", "another_participant"])
 @pytest.mark.parametrize("form", ["single", "single_with_history", "steer_new_message", "interrupt_new_request"])
-def test_r2_control_another_author_with_the_same_body_gets_its_one_notice(shim, monkeypatch, forward, author, form):
+def test_r2_control_another_author_with_the_same_body_gets_its_one_notice(shim, monkeypatch, forward, author, form):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     monkeypatch.setattr(shim, "FORWARD", forward)
     blocks = _forms(_answer(author))[form]
     drive(shim, blocks)
@@ -229,7 +229,7 @@ def test_r2_control_another_author_with_the_same_body_gets_its_one_notice(shim, 
 
 
 @pytest.mark.parametrize("form", ["single", "single_with_history", "steer_new_message", "interrupt_new_request"])
-def test_r2_control_a_body_quoting_this_bridges_own_from_line_is_not_an_echo(shim, form):
+def test_r2_control_a_body_quoting_this_bridges_own_from_line_is_not_an_echo(shim, form):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     blocks = _forms(_answer(CTO, quoted=CEO))[form]
     drive(shim, blocks)
     assert shim.submitted == []
@@ -239,7 +239,7 @@ def test_r2_control_a_body_quoting_this_bridges_own_from_line_is_not_an_echo(shi
 
 
 @pytest.mark.parametrize("thread", [True, False], ids=["thread", "top_level"])
-def test_r2_control_a_channel_name_naming_this_bridge_as_sender_has_no_destination(shim, thread):
+def test_r2_control_a_channel_name_naming_this_bridge_as_sender_has_no_destination(shim, thread):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     """The name buzz-acp writes unsanitized carries a whole header whose From is this bridge: the [Context]
     leaves its form, so there is no destination, nothing to post and no echo to read."""
     root, b, _ = _events()
@@ -259,7 +259,7 @@ def test_r2_control_a_channel_name_naming_this_bridge_as_sender_has_no_destinati
     # Deep enough for 3.14, whose json parser is bounded by the C stack rather than the recursion limit.
     ('{"channels":' + "[" * 1_000_000 + "0" + "]" * 1_000_000 + "}", "reply registry malformed: RecursionError"),
 ], ids=["missing", "nested_past_the_recursion_limit"])
-def test_r2_control_a_registry_that_cannot_be_read_posts_nothing_for_an_own_post(shim, registry, reason):
+def test_r2_control_a_registry_that_cannot_be_read_posts_nothing_for_an_own_post(shim, registry, reason):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     path = Path(shim.MENTIONS)
     if registry is None:
         path.unlink()
@@ -272,7 +272,7 @@ def test_r2_control_a_registry_that_cannot_be_read_posts_nothing_for_an_own_post
         False, "notice_impossible", "failed", reason)
 
 
-def test_r2_a_registry_naming_no_valid_signer_cannot_rule_out_an_echo_and_posts_nothing(shim):
+def test_r2_a_registry_naming_no_valid_signer_cannot_rule_out_an_echo_and_posts_nothing(shim):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     """The counterpart is registered, but no channel names a valid ``ceo`` key: whose post the last event
     is cannot be told, so nothing is posted (as ``handle`` holds such an event) and the journal says why."""
     Path(shim.MENTIONS).write_text(json.dumps({"channels": {CH: {

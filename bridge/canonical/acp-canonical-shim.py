@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# health: allow FILE_LINES -- one standalone file installed beside canonical_batch.py; the body is byte-identical to the live 420c58a1
 """ACP-stdio agent that submits to Hermes's canonical surface instead of forking a session.
 
 `buzz-acp` speaks ACP over stdio to whatever `--agent-command` names. Pointing it at

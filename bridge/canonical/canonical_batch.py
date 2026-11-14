@@ -184,7 +184,7 @@ def deliver_batch(namespace, session, prompt):
         if event_id not in recovered:
             try:
                 recovered[event_id] = fetch_event(event_id, channel)
-            except Exception as exc:
+            except Exception as exc:  # health: allow BLE001 -- a failed lookup is kept as that event's outcome and the batch goes on
                 recovered[event_id] = exc
         return recovered[event_id]
 
@@ -202,7 +202,7 @@ def deliver_batch(namespace, session, prompt):
         try:
             if deliver_member(api, session, prompt, channel, event_id, lookup) == api.RETRY:
                 retry = True
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- isolates one member's failure so the rest of the batch is delivered
             # Isolate lookup, refusal and publication failures too. A submitted event retains the
             # existing unknown-outcome journal; its siblings must still get their own attempt.
             reason = failure_reason(exc)

@@ -5,7 +5,7 @@ from pathlib import Path
 from test_shim_batch_delivery import bridge, signed, install, drive, batch, _calls
 
 
-def test_retiring_all_rooms_suppresses_a_batch_without_requesting_retry(bridge):
+def test_retiring_all_rooms_suppresses_a_batch_without_requesting_retry(bridge):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     events = [signed(1), signed(2)]
     install(bridge, *events)
     roster = Path(bridge.MENTIONS)

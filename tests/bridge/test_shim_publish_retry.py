@@ -261,7 +261,7 @@ def test_a_timed_out_attempt_is_killed_with_its_whole_process_group(shim):
     started = time.monotonic()
     ask(shim, EVENT_A)
     assert final(shim, EVENT_A)["state"] == "sent"
-    time.sleep(max(0, started + 3.5 - time.monotonic()))  # well past the child's own write
+    time.sleep(max(0, started + 3.5 - time.monotonic()))  # well past the child's own write  # health: allow HX013 -- a negative: the orphaned child's late write would have landed by now
     assert not late.exists(), "a child of the timed-out attempt outlived it"
     assert len(posts(shim, EVENT_A)) == 1
 
@@ -270,7 +270,7 @@ def test_a_wrapper_refusal_is_final_and_never_retried(shim):
     plan(shim, "send", EVENT_A, {"exit": 1, "stderr": '{"error":"mention_policy"}'})
     ask(shim, EVENT_A)
     done = final(shim, EVENT_A)
-    time.sleep(0.5)  # longer than every patched backoff: a retry would have run by now
+    time.sleep(0.5)  # longer than every patched backoff: a retry would have run by now  # health: allow HX013 -- a negative: a retry would have run by now
     assert [c["cmd"] for c in calls(shim, EVENT_A)] == ["send"]
     assert {k: done.get(k) for k in ("sent", "state", "delivery", "attempts")} == {
         "sent": False, "state": "wrapper_refused", "delivery": "failed", "attempts": 1}

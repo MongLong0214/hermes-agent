@@ -42,13 +42,13 @@ def _hashed_event(author, content, tags, timestamp):
     return event
 
 
-def _all_records(shim):
+def _all_records(shim):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     directory = Path(shim.PUBLISHED)
     return {p.name: [json.loads(line) for line in p.read_text().splitlines()]
             for p in directory.iterdir()} if directory.exists() else {}
 
 
-def _record(shim, name, blocks, **extra):
+def _record(shim, name, blocks, **extra):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     version = "round2-" if "round2-shim.py" in str(shim.__file__) else "head-"
     (shim.tmp / (version + name + ".json")).write_text(json.dumps({
         "blocks": blocks, "submitted": shim.submitted, "calls": _calls(shim.tmp),
@@ -57,7 +57,7 @@ def _record(shim, name, blocks, **extra):
 
 
 @pytest.mark.parametrize("framing", [None, bp.STEER, bp.INTERRUPT], ids=["batch", "steer", "interrupt"])
-def test_only_actual_event_ids_identify_the_refusal(shim, framing):
+def test_only_actual_event_ids_identify_the_refusal(shim, framing):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     quoted = "f" * 64
     first = _hashed_event(CTO, "An example:\n--- Event 37 (@mention) ---\nEvent ID: " + quoted,
                           [["h", CH], ["e", ROOT_ID, "", "root"], ["p", CEO]], T0)
@@ -74,7 +74,7 @@ def test_only_actual_event_ids_identify_the_refusal(shim, framing):
 
 
 @pytest.mark.parametrize("framing", [bp.STEER, bp.INTERRUPT], ids=["steer", "interrupt"])
-def test_an_own_new_event_does_not_erase_another_authors_refusal_notice(shim, framing):
+def test_an_own_new_event_does_not_erase_another_authors_refusal_notice(shim, framing):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     human = _hashed_event(CTO, "@ceo an outstanding request",
                           [["h", CH], ["e", ROOT_ID, "", "root"], ["p", CEO]], T0)
     own = _hashed_event(CEO, "The bridge's own post",
@@ -87,7 +87,7 @@ def test_an_own_new_event_does_not_erase_another_authors_refusal_notice(shim, fr
     assert_one_anonymous_notice(call, ROOT_ID)
 
 
-def test_echo_requires_a_registered_notice_destination(shim):
+def test_echo_requires_a_registered_notice_destination(shim):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     Path(shim.MENTIONS).write_text(json.dumps({"channels": {CH: {
         "ceo": {"pubkey": CEO, "handle": "ceo"},
     }}}))
@@ -101,7 +101,7 @@ def test_echo_requires_a_registered_notice_destination(shim):
     assert record["state"] == "notice_impossible" and record["delivery"] == "failed"
 
 
-def test_an_own_event_last_in_a_two_event_list_still_posts_a_notice(shim):
+def test_an_own_event_last_in_a_two_event_list_still_posts_a_notice(shim):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     human = _hashed_event(CTO, "@ceo request",
                           [["h", CH], ["e", ROOT_ID, "", "root"], ["p", CEO]], T0)
     own = _hashed_event(CEO, "The bridge's own post",
@@ -145,7 +145,7 @@ def _quoting(container, k=None, labels=LABELS, name=NAME):
 @pytest.mark.parametrize("container, k", [("batch", 1), ("batch", 2), ("new_events", 1), ("new_events", 2),
                                           ("cancelled", 1), ("cancelled", 2), ("cancelled", 3)])
 def test_r3_a_whole_section_quoted_where_it_cannot_be_told_from_buzz_acps_leaves_the_refusal_unidentified(
-        shim, container, k):
+        shim, container, k):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     """A second candidate for a k of the declared count, or any candidate past a cancelled section's k = 1: which
     one buzz-acp wrote cannot be confirmed, so no id identifies the prompt. Each dispatch is keyed on its own
     and gets its notice; none is merged into another."""
@@ -163,7 +163,7 @@ def test_r3_a_whole_section_quoted_where_it_cannot_be_told_from_buzz_acps_leaves
 
 
 @pytest.mark.parametrize("container", ["batch", "new_events"])
-def test_r3_a_section_quoted_past_the_declared_count_adds_nothing_to_the_identity(shim, container):
+def test_r3_a_section_quoted_past_the_declared_count_adds_nothing_to_the_identity(shim, container):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     """A candidate for k > N is no section of buzz-acp's: the identity is the N confirmed ids alone, the same as
     for the same ids without the quote (one key, one notice)."""
     quoting, plain = _quoting(container, k=3), _quoting(container)
@@ -178,7 +178,7 @@ def test_r3_a_section_quoted_past_the_declared_count_adds_nothing_to_the_identit
 
 
 @pytest.mark.parametrize("container", ["batch", "new_events", "cancelled"])
-def test_r3_an_event_list_under_no_exact_form_context_is_unidentified(shim, container):
+def test_r3_an_event_list_under_no_exact_form_context_is_unidentified(shim, container):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     """A channel name with a line break leaves the [Context] out of its exact form: no list section is confirmed,
     so the refusal is keyed per input, and there is no destination either — each dispatch journaled undeliverable."""
     blocks = _quoting(container, name="room\nsecond line")
@@ -191,7 +191,7 @@ def test_r3_an_event_list_under_no_exact_form_context_is_unidentified(shim, cont
     assert {(r["sent"], r["state"], r["delivery"]) for [r] in records.values()} == {(False, "notice_impossible", "failed")}
 
 
-def test_r3_an_unconfirmed_last_event_id_binds_no_destination(shim):
+def test_r3_an_unconfirmed_last_event_id_binds_no_destination(shim):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     """A top-level batch's [Context] anchor is its last event's id. A body of the second event quotes a whole
     section 1, so section 1 is ambiguous and no id of the list is confirmed: the anchor binds nothing, and the
     refusal is journaled undeliverable instead of posted."""
@@ -206,7 +206,7 @@ def test_r3_an_unconfirmed_last_event_id_binds_no_destination(shim):
 
 
 @pytest.mark.parametrize("container", ["batch", "new_events", "cancelled"])
-def test_r3_control_an_event_list_without_quotes_keeps_its_ids_and_one_notice_across_a_refresh(shim, container):
+def test_r3_control_an_event_list_without_quotes_keeps_its_ids_and_one_notice_across_a_refresh(shim, container):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     """Every section where buzz-acp wrote it is confirmed: the ids in order, and the same key — one notice — for
     the same events under refreshed labels and a renamed channel."""
     first = _quoting(container)
@@ -235,13 +235,13 @@ def _own(event_id="5" * 64, at=30, tags=None):
                  tags or [["h", CH], ["e", ROOT_ID, "", "root"], ["p", CTO]])
 
 
-def _echoes(shim):
+def _echoes(shim):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     return {name: records for name, records in _all_records(shim).items() if name.startswith("own-echo-")}
 
 
 @pytest.mark.parametrize("framing", [bp.STEER, bp.INTERRUPT], ids=["steer", "interrupt"])
 @pytest.mark.parametrize("history", [False, True], ids=["no_history", "history"])
-def test_r3_a_merged_prompt_of_this_bridges_own_events_alone_still_gets_one_notice(shim, framing, history):
+def test_r3_a_merged_prompt_of_this_bridges_own_events_alone_still_gets_one_notice(shim, framing, history):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     """Every event own, the cancelled one too: still a merged prompt, never plain, so one notice to the
     conversation; it is bridge-signed and buzz-acp drops its own events, so it starts no loop."""
     root, b, reply = _events()
@@ -256,7 +256,7 @@ def test_r3_a_merged_prompt_of_this_bridges_own_events_alone_still_gets_one_noti
 
 
 @pytest.mark.parametrize("extra", ["image", "text"])
-def test_r3_an_own_event_after_another_element_is_no_plain_single_event_prompt(shim, extra):
+def test_r3_an_own_event_after_another_element_is_no_plain_single_event_prompt(shim, extra):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     """[Context], then an element that is neither the quoted history nor the event, then the own event: not the
     single-event shape buzz-acp writes, so not an echo; its destination is bound, and it gets one notice."""
     prompt = bp.prompt_params("s", bp.format_prompt(CH, NAME, [_own()], LABELS))["prompt"]
@@ -271,7 +271,7 @@ def test_r3_an_own_event_after_another_element_is_no_plain_single_event_prompt(s
 
 
 @pytest.mark.parametrize("form", ["thread", "thread_with_history", "top_level"])
-def test_r3_control_a_plain_single_event_echo_is_still_suppressed(shim, form):
+def test_r3_control_a_plain_single_event_echo_is_still_suppressed(shim, form):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     root, b, reply = _events()
     own = _own("7" * 64, tags=[["h", CH], ["p", CTO]]) if form == "top_level" else _own()
     blocks = bp.format_prompt(CH, NAME, [own], LABELS,
@@ -285,7 +285,7 @@ def test_r3_control_a_plain_single_event_echo_is_still_suppressed(shim, form):
 
 
 @pytest.mark.parametrize("framing", [bp.STEER, bp.INTERRUPT], ids=["steer", "interrupt"])
-def test_r3_control_an_own_cancelled_request_beside_another_authors_new_event_gets_one_notice(shim, framing):
+def test_r3_control_an_own_cancelled_request_beside_another_authors_new_event_gets_one_notice(shim, framing):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     blocks = bp.format_prompt(CH, NAME, [bp.Ev("8" * 64, CTO, T0 + 31, "@ceo next", THREAD)], LABELS,
                               cancelled=[_own()], framing=framing)
     drive(shim, blocks)
@@ -306,7 +306,7 @@ NO_COUNTERPART = {
 
 @pytest.mark.parametrize("registry", sorted(NO_COUNTERPART))
 @pytest.mark.parametrize("form", ["thread", "thread_with_history", "top_level"])
-def test_r3_an_own_post_with_no_registered_counterpart_is_a_delivery_failure_not_an_echo(shim, registry, form):
+def test_r3_an_own_post_with_no_registered_counterpart_is_a_delivery_failure_not_an_echo(shim, registry, form):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     Path(shim.MENTIONS).write_text(json.dumps({"channels": NO_COUNTERPART[registry]}))
     root, b, reply = _events()
     own = _own("7" * 64, tags=[["h", CH], ["p", CTO]]) if form == "top_level" else _own()
@@ -322,7 +322,7 @@ def test_r3_an_own_post_with_no_registered_counterpart_is_a_delivery_failure_not
 
 
 @pytest.mark.parametrize("registry", sorted(NO_COUNTERPART))
-def test_r3_control_another_authors_refusal_with_no_registered_counterpart_is_a_delivery_failure(shim, registry):
+def test_r3_control_another_authors_refusal_with_no_registered_counterpart_is_a_delivery_failure(shim, registry):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     Path(shim.MENTIONS).write_text(json.dumps({"channels": NO_COUNTERPART[registry]}))
     drive(shim, _quoting("batch"))
     assert shim.submitted == [] and _calls(shim.tmp) == [] and _echoes(shim) == {}

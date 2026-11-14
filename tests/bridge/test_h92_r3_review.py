@@ -205,7 +205,7 @@ def _turn(shape, foreign):
     def run(actor, text, kwargs):
         opening = _agent_row(text, kwargs, overridden=False)
         final = {"role": "assistant", "content": o4.FINAL, "finish_reason": "stop"}
-        if shape == "a_nudge":  # turn_truncation.py appends the nudge as a bare user row
+        if shape == "a_nudge":  # turn_truncation.py appends the nudge as a bare user row  # health: allow HX011 -- one branch per parametrized case, each building a different fixture shape (fork test, verbatim)
             rows = [opening, {"role": "assistant", "content": "", "finish_reason": "incomplete"},
                     {"role": "user", "content": o4._CODEX_INCOMPLETE_NUDGE}, final]
         elif shape == "b_compaction_before_opening":  # the turn's row is in the protected tail

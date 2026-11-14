@@ -77,7 +77,7 @@ def current_authority(real, prefix, channel, rule, target):
     # reply-to·p-tag 검증 및 새 actor/fallback 금지는 그대로 유지한다.
 
 
-def main():
+def main():  # health: allow CC -- the send gate's argv checks stay in one function, as live at 420c58a1
     real, *args = sys.argv[1:]
     # Parse only root options. Never search arbitrary content for command words.
     i = 0
@@ -143,7 +143,7 @@ def main():
     # reads and send are NOT atomic; relay-side enforcement owns that race.
     current_authority(real,lookup_prefix,channel,rule,target)
     if via_stdin:
-        result = subprocess.run([real,*forwarded],input=body.encode('utf-8'))
+        result = subprocess.run([real,*forwarded],input=body.encode('utf-8'))  # health: allow HX006 -- the caller bounds the send: the shim kills this whole process group at PUBLISH_TIMEOUT
         raise SystemExit(result.returncode)
     os.execv(real,[real,*forwarded])
 

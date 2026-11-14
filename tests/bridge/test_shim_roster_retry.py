@@ -9,7 +9,7 @@ from test_shim_batch_delivery import bridge, signed, install, drive, batch, bp, 
 
 
 @pytest.mark.parametrize('framing', [None, bp.STEER, bp.INTERRUPT], ids=['counted', 'steer', 'interrupt'])
-def test_one_roster_refusal_retries_without_repeating_successful_batch_siblings(bridge, framing):
+def test_one_roster_refusal_retries_without_repeating_successful_batch_siblings(bridge, framing):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     events = [signed(n) for n in (1, 2, 3)]
     install(bridge, *events)
     held = events[0]['id']
@@ -30,7 +30,7 @@ def test_one_roster_refusal_retries_without_repeating_successful_batch_siblings(
     assert bridge.frames[-1]['result'] == {'stopReason': 'end_turn'}
 
 
-def test_local_roster_outage_does_not_acknowledge_a_recovered_mention_batch(bridge):
+def test_local_roster_outage_does_not_acknowledge_a_recovered_mention_batch(bridge):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     events = [signed(1), signed(2)]
     install(bridge, *events)
     roster = Path(bridge.MENTIONS)

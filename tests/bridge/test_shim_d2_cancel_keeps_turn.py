@@ -144,7 +144,7 @@ class FakeGateway:
                     self._send(event_id, 200, {"event_id": event_id, "text": record["text"]})
                     return
                 gw.claim_of(event_id).set()
-                time.sleep(gw.turn_secs)
+                time.sleep(gw.turn_secs)  # health: allow HX013 -- the fake gateway's turn lasts turn_secs; the duration is the fixture
                 with gw.lock:
                     gw.receipts[event_id].update(state="terminal", text=gw.answer_for(event_id))
                     gw.running -= 1
@@ -446,7 +446,7 @@ def test_a_cancel_racing_the_turns_end_gets_one_response_and_the_answer_one_post
     session = agent.start_session()
     agent.prompt(2, session, channel_prompt(E1, ROOT_TEXT))
     assert rig.gw.claim_of(E1).wait(10) and _attributed(rig, E1) == 1
-    time.sleep(max(rig.gw.turn_secs + offset, 0))
+    time.sleep(max(rig.gw.turn_secs + offset, 0))  # health: allow HX013 -- the cancel is placed at an offset from the turn's end; that race is the case
     agent.cancel(session)
     assert agent.wait_result(2, CANCEL_GRACE) is not None
     _wait(_settled(rig, E1), 20)  # waits only: the assertions below name what failed
@@ -542,7 +542,7 @@ def test_a_prompt_cancelled_before_it_was_submitted_is_cancelled_and_never_submi
     target.cancel(session)
     assert target.wait_result(3, CANCEL_GRACE)["result"] == {"stopReason": "cancelled"}
     _wait(_settled(rig, E1), 20)  # waits only: the assertions below name what failed
-    time.sleep(1.5)  # room for a wrongly resumed E3 submission
+    time.sleep(1.5)  # room for a wrongly resumed E3 submission  # health: allow HX013 -- a negative: no wrongly resumed submission arrives in this window
     for each in rig.agents:
         each.close()
 

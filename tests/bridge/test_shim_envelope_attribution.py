@@ -282,7 +282,7 @@ def test_control_merged_and_batched_prompts_are_refused_with_exactly_one_notice(
 ])
 def test_control_a_notice_that_fails_or_cannot_be_built_is_a_delivery_failure(shim, monkeypatch, case, state):
     blocks = merged()
-    if case == "wrapper_refused":
+    if case == "wrapper_refused":  # health: allow HX011 -- one branch per parametrized case, each building a different fixture shape (fork test, verbatim)
         monkeypatch.setenv("FAKE_BUZZ_EXIT", "1")
     elif case == "send_failed":
         monkeypatch.setenv("FAKE_BUZZ_EXIT", "2")

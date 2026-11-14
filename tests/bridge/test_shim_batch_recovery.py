@@ -12,7 +12,7 @@ from test_shim_batch_delivery import (
 
 @pytest.mark.parametrize('framing', [bp.STEER, bp.INTERRUPT], ids=['steer', 'interrupt'])
 @pytest.mark.parametrize('quoted', [False, True], ids=['plain', 'quoted-signed-event'])
-def test_failed_cancelled_member_does_not_drop_later_members(bridge, framing, quoted):
+def test_failed_cancelled_member_does_not_drop_later_members(bridge, framing, quoted):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     events = [signed(n) for n in (1,2,3,4)]
     if quoted:
         example = signed(5)
@@ -31,7 +31,7 @@ def test_failed_cancelled_member_does_not_drop_later_members(bridge, framing, qu
 
 @pytest.mark.parametrize('status,code', [(403, 'canonical_principal_rejected'),
                                        (400, 'canonical_invalid_request')])
-def test_replayed_preclaim_refusal_can_publish_answer(bridge, status, code):
+def test_replayed_preclaim_refusal_can_publish_answer(bridge, status, code):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     events = [signed(n) for n in (1,2)]
     install(bridge, *events)
     bridge.failures[events[0]['id']] = urllib.error.HTTPError('http://canonical.invalid', status, 'denied', {},
@@ -46,7 +46,7 @@ def test_replayed_preclaim_refusal_can_publish_answer(bridge, status, code):
 
 
 @pytest.mark.parametrize('outcome', ['gateway-uncertain', 'abandoned-submission'])
-def test_preclaim_replay_keeps_terminal_uncertainty_guard(bridge, outcome):
+def test_preclaim_replay_keeps_terminal_uncertainty_guard(bridge, outcome):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     events = [signed(n) for n in (1, 2)]
     event_id = events[0]['id']
     install(bridge, *events)
@@ -69,7 +69,7 @@ def test_preclaim_replay_keeps_terminal_uncertainty_guard(bridge, outcome):
     assert len(_calls(bridge.tmp)) == 3  # includes the sibling's one answer
 
 
-def test_inflight_event_never_gets_not_received_recovery_notice(bridge, monkeypatch):
+def test_inflight_event_never_gets_not_received_recovery_notice(bridge, monkeypatch):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     events = [signed(n) for n in (1,2)]
     install(bridge, *events)
     entered, release = threading.Event(), threading.Event()
@@ -110,7 +110,7 @@ def test_inflight_event_never_gets_not_received_recovery_notice(bridge, monkeypa
 
 
 @pytest.mark.parametrize('merged', [False, True], ids=['counted', 'cancelled-list'])
-def test_unavailable_module_does_not_refuse_already_answered_events(bridge, monkeypatch, merged):
+def test_unavailable_module_does_not_refuse_already_answered_events(bridge, monkeypatch, merged):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     events = [signed(n) for n in (1, 2, 3)]
     install(bridge, *events)
     blocks = batch(events[2:], cancelled=events[:2]) if merged else batch(events)
@@ -131,7 +131,7 @@ def test_unavailable_module_does_not_refuse_already_answered_events(bridge, monk
 # candidate. Unencodable (lone surrogate) or over-deep JSON must be a non-match, never the end of the
 # walk or a crash of the whole batch.
 @pytest.mark.parametrize("framing", [bp.STEER, bp.INTERRUPT], ids=["steer", "interrupt"])
-def test_unencodable_quoted_tags_do_not_drop_cancelled_siblings(bridge, framing):
+def test_unencodable_quoted_tags_do_not_drop_cancelled_siblings(bridge, framing):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     events = [signed(n) for n in (1, 2, 3, 4)]
     events[0] = signed(1, content='@ceo quote of JSON:\nTags: ["\\ud800"]\nend quote')
     install(bridge, *events[1:])
@@ -139,7 +139,7 @@ def test_unencodable_quoted_tags_do_not_drop_cancelled_siblings(bridge, framing)
     assert_delivered(bridge, events[1:])
 
 
-def test_over_deep_quoted_tags_never_crash_the_batch(bridge, monkeypatch):
+def test_over_deep_quoted_tags_never_crash_the_batch(bridge, monkeypatch):  # health: allow F811 -- the parameter is the pytest fixture imported from the sibling test module
     """The recursion limit is reached inside the digest's JSON encoding at some depth near 1000,
     which depends on the thread's stack; sweep the band the review reproduced."""
     monkeypatch.setattr(bridge, "publish_reply", lambda *args, **kwargs: True)
