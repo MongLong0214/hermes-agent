@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from cron.jobs import create_job, get_job, list_jobs, load_jobs, pause_job, save_jobs
-from cron.jobs_public_status import public_delivery_error
+from cron.jobs_public_status import public_delivery_error, public_fire_error, public_run_error
 from hermes_cli import cron as cron_cli
 from hermes_cli.cron import cron_command
 from hermes_cli.subcommands.cron import build_cron_parser
@@ -185,10 +185,29 @@ class TestCronDoctor:
         assert rc == 1
         assert "Cron doctor found 3 issue(s)" in out
         assert job["id"] in out
-        assert "last run failed: Provider returned error" in out
-        assert "was not delivered (telegram timeout)" in out
+        # A record written raw by an older build is reported by its closed labels.
+        assert f"last run failed: {public_run_error('Provider returned error')}" in out
+        assert f"was not delivered ({public_delivery_error('telegram timeout')})" in out
+        assert "Provider returned error" not in out and "telegram timeout" not in out
         assert "hermes cron edit" in out
         assert "script not found" in out
+
+    @pytest.mark.parametrize("command", ["list", "doctor"])
+    def test_raw_legacy_record_with_a_key_and_url_is_served_closed(self, tmp_cron_dir, capsys, command):
+        raw = "HTTP 401: key sk-leakcanary0123 rejected by https://u:hunter2@leakcanary.example/v1"
+        create_job(prompt="Daily digest", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0].update(last_run_at="2026-09-01T09:00:00+00:00", last_status="error", last_error=raw,
+                       last_delivery_error=f"telegram: 400 at {raw}",
+                       last_fire_error={"at": "2026-09-01T08:00:00+00:00", "detail": raw})
+        save_jobs(jobs)
+
+        cron_command(Namespace(cron_command=command, all=True))
+
+        out = capsys.readouterr().out
+        assert public_run_error(raw) in out and public_delivery_error(raw) in out
+        assert public_fire_error(jobs[0]["last_fire_error"])["detail"] in out
+        assert "leakcanary" not in out and "hunter2" not in out
 
     def test_doctor_reports_healthy_jobs(self, tmp_cron_dir, capsys):
         scripts_dir = tmp_cron_dir / "scripts"
@@ -220,7 +239,7 @@ class TestCronDoctor:
 
         out = capsys.readouterr().out
         assert rc == 1
-        assert "was not delivered (telegram timeout)" in out
+        assert f"was not delivered ({public_delivery_error('telegram timeout')})" in out
         assert "hermes cron edit" in out
         assert "last run failed" not in out
         assert "unknown error" not in out
@@ -290,9 +309,10 @@ class TestCronListStatusRendering:
         out = capsys.readouterr().out
         last_run_line = next(l for l in out.splitlines() if "Last run:" in l)
         assert "was not delivered" in last_run_line
-        assert "telegram timeout" in last_run_line, (
+        assert public_delivery_error("telegram timeout") in last_run_line, (
             "the delivery detail lives in last_delivery_error, not last_error"
         )
+        assert "telegram timeout" not in out
         assert cron_cli.Colors.GREEN not in last_run_line
 
     def test_ok_run_still_green(self, tmp_cron_dir, capsys, monkeypatch):
