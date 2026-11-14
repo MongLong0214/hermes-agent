@@ -488,16 +488,11 @@ class GatewayTurnPersistenceMixin:
         store = self.async_session_store
         sid = session_entry.session_id
         history = prepared.history
-        # The agent already persisted this turn's rows (codex app-server reports agent_persisted=True
-        # too); skip the DB write. Default = a session DB exists; non-persisting runtimes pass False.
-        # The agent already persisted these messages to SQLite via _flush_messages_to_session_db(), so skip
-        # the DB write here to prevent the duplicate-write bug (#860 / #42039). This holds for the codex
-        # app-server runtime too: although it early-returns and bypasses conversation_loop's per-step
-        # flushes, it flushes its own projected assistant/tool messages before returning and reports
-        # agent_persisted=True (see agent/codex_runtime.py). Reading the flag (default = self._session_db is
-        # not None) keeps the persistence contract explicit and lets any future non-persisting runtime opt
-        # into a gateway-side write by returning False.
-        agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
+        # agent_persisted=True is the agent's proof that this turn's rows are durable: skip the DB write
+        # (a re-write would duplicate them, #860 / #42039) and allow the True-only cleanups below. A
+        # missing or non-bool value is unknown, never True: keep the recovery copy, which skips every
+        # row the store already holds (_agent_holds_row), and run no True-only cleanup.
+        agent_persisted = agent_result.get("agent_persisted") is True
         _user_row = self._hmwa_user_transcript_entry(event, prepared, ts)
         # Only the NEW messages: history_offset (what the agent saw), not len(history), which
         # counts session_meta entries stripped before the agent saw them.

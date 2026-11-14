@@ -1145,12 +1145,12 @@ def _content_policy_blocked_result(
 ) -> dict[str, Any]:
     """Terminal turn result for a content-policy block (deterministic for the unchanged
     prompt, so no retry); shared by the HTTP-200 and exception paths. ``messages`` is the
-    CLEAN pre-refusal history (the refused turn is dropped from it). ``boundary_row_id`` is
-    the durable row that started the refused run, so the owner drops the exact turn."""
+    CLEAN pre-refusal history (the refused turn is dropped from it). ``boundary_row_id`` is the committed
+    row that started the refused run: the owner drops that exact turn, and only when it exists (agent_persisted)."""
     result = {
         "final_response": final_response, "messages": messages, "api_calls": api_call_count,
         "completed": False, "failed": True, "error": f"content_policy_blocked: {error_detail}",
-        "failure_reason": "content_policy_blocked", "failure_retryable": False,
+        "failure_reason": "content_policy_blocked", "failure_retryable": False, "agent_persisted": boundary_row_id is not None,
     }
     if boundary_row_id is not None:
         result["refused_turn_boundary_row_id"] = boundary_row_id

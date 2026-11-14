@@ -330,3 +330,24 @@ def test_a_preflight_timeout_stored_no_row_of_this_turn(real_agent):
     assert real_agent._flush_messages_to_session_db(history) is True
     result = _preflight_timeout_result(real_agent, RuntimeError("preflight compression timed out"), history)
     assert result["messages"] == history and result["agent_persisted"] is False
+
+def test_the_overflow_recovery_defers_after_its_own_flush(real_agent):
+    """turn_overflow's no-op compression pass under a held lock: the result reports the flush the
+    site runs, so a turn-start row that flush lands reads True."""
+    from agent.turn_overflow import _Recovery
+
+    agent = real_agent
+    messages = [{"role": "user", "content": "write an essay"}]  # its turn-start flush failed: unmarked
+    agent._compress_context = lambda before, system, **_kw: (before, system)
+    agent._compression_skipped_due_to_lock = "another-holder"
+    st = _Recovery(
+        agent=agent, api_messages=[], system_message="S", effective_task_id="t", api_call_count=1,
+        max_compression_attempts=3, messages=messages, active_system_prompt="S", conversation_history=None,
+        approx_tokens=0, compression_attempts=1,
+    )
+
+    verdict = st.compress(1000)
+
+    assert verdict.action == "return" and verdict.result["compression_deferred"] is True  # reach
+    assert [r["content"] for r in agent._session_db.get_messages(agent.session_id)] == ["write an essay"]
+    assert verdict.result["agent_persisted"] is True

@@ -22,7 +22,7 @@ from plugins.platforms.discord.adapter import DiscordAdapter
 
 _REAL_SCHEDULE = SessionAuthority._schedule  # the fixture parks scheduling; races restore it
 EXHAUSTED = {"failed": True, "partial": True, "completed": False, "compression_exhausted": True,
-             "failure_reason": "context_overflow", "messages": []}
+             "failure_reason": "context_overflow", "messages": [], "agent_persisted": True}
 
 
 @pytest_asyncio.fixture

@@ -26,7 +26,8 @@ from plugins.platforms.discord.adapter import DiscordAdapter
 
 ASK = "summarise the whole repository history"
 EXHAUSTED = {"final_response": "copy", "failed": True, "partial": True, "completed": False,
-             "compression_exhausted": True, "failure_reason": "context_overflow", "messages": []}
+             "compression_exhausted": True, "failure_reason": "context_overflow", "messages": [],
+             "agent_persisted": True}  # the agent's turn-start flush landed the ask
 
 
 @pytest_asyncio.fixture
