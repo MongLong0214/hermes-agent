@@ -157,17 +157,14 @@ class _Recovery(OverflowVerdict):
             overflow_reason=self.overflow_reason,
         )
         if self.messages is before:
-            deferred = None
-            if compression_skipped_due_to_lock(agent):
-                deferred = _compression_deferred_result(agent, self.messages, self.api_call_count)
-            elif compression_blocked_transiently(agent):
-                deferred = _compression_deferred_result(
-                    agent, self.messages, self.api_call_count, reason="transient_block",
-                )
-            if deferred is not None:
+            reason = ("lock" if compression_skipped_due_to_lock(agent)
+                      else "transient_block" if compression_blocked_transiently(agent) else None)
+            if reason is not None:
                 self.compression_attempts -= 1
+                # Persist first: the deferred result reports agent_persisted from the rows this flush left.
                 agent._persist_session(self.messages, self.conversation_history)
-                return self.done("return", deferred)
+                return self.done("return", _compression_deferred_result(
+                    agent, self.messages, self.api_call_count, reason=reason))
         if fail_on_timeout and context_compression_timed_out(agent):
             return self.fail_turn(
                 _COMPRESSION_TIMEOUT_FINAL_RESPONSE, turn_exit_reason="context_compression_timeout"

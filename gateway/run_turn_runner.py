@@ -1537,6 +1537,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             # The loop's proven current-turn row (``export_current_turn_boundary``) for the same `messages`: the
             # stored receipt cuts there instead of re-guessing from text (multimodal or rewritten input + a nudge).
             **({"current_turn_user_idx": result["current_turn_user_idx"]} if "current_turn_user_idx" in result else {}),
+            # The agent's own proof that this turn's rows are durable, forwarded only as a bool: the
+            # persistence block treats a missing value as unknown, never as True.
+            **({"agent_persisted": result["agent_persisted"]} if isinstance(result.get("agent_persisted"), bool) else {}),
             **usage,
             **({"persisted_turn": persisted_turn} if persisted_turn else {}),
         }
@@ -1557,8 +1560,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
             if not final_response:
                 final_response = t("gateway.shared.warn_passthrough", error=result["error"]) if result.get("error") else ""
-            # NOTE: deliberately omits agent_persisted/response_reused (and last_reasoning outside a local
-            # viewer's turn); the caller defaults agent_persisted differently when the key is absent.
+            # NOTE: deliberately omits response_reused (and last_reasoning outside a local viewer's turn).
             if local_sinks is not None:
                 return {
                     "final_response": final_response, **common, **viewer_meta,
@@ -1575,9 +1577,6 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             "response_previewed": previewed,
             "response_transformed": result.get("response_transformed", False),
             "response_reused": result.get("response_reused", False),
-            # Lets the persistence block tell whether the codex app-server path self-persisted (it
-            # didn't — see codex_runtime.py); default True keeps skip-db for the standard runtime.
-            "agent_persisted": result.get("agent_persisted", True),
         }
 
 

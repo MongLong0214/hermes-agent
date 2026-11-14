@@ -314,7 +314,7 @@ def finish_text_response(
         agent._cleanup_task_resources(effective_task_id)
         agent._persist_session(messages, conversation_history)
         return _verdict("return", stamp_failure(
-            partial_result(messages, api_call_count, user_response, error), "truncated", True,
+            partial_result(messages, api_call_count, user_response, error, agent=agent), "truncated", True,
         ))
 
     final_msg = agent._build_assistant_message(assistant_message, finish_reason)

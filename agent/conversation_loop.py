@@ -61,6 +61,7 @@ from agent.turn_request_assembly import assemble_api_request
 from agent.turn_response_check import check_api_response
 from agent.turn_response_intake import normalize_model_response
 from agent.turn_tool_round import run_tool_round
+from agent.turn_truncation import turn_rows_persisted
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches
@@ -1144,12 +1145,12 @@ def _content_policy_blocked_result(
 ) -> dict[str, Any]:
     """Terminal turn result for a content-policy block (deterministic for the unchanged
     prompt, so no retry); shared by the HTTP-200 and exception paths. ``messages`` is the
-    CLEAN pre-refusal history (the refused turn is dropped from it). ``boundary_row_id`` is
-    the durable row that started the refused run, so the owner drops the exact turn."""
+    CLEAN pre-refusal history (the refused turn is dropped from it). ``boundary_row_id`` is the committed
+    row that started the refused run: the owner drops that exact turn, and only when it exists (agent_persisted)."""
     result = {
         "final_response": final_response, "messages": messages, "api_calls": api_call_count,
         "completed": False, "failed": True, "error": f"content_policy_blocked: {error_detail}",
-        "failure_reason": "content_policy_blocked", "failure_retryable": False,
+        "failure_reason": "content_policy_blocked", "failure_retryable": False, "agent_persisted": boundary_row_id is not None,
     }
     if boundary_row_id is not None:
         result["refused_turn_boundary_row_id"] = boundary_row_id
@@ -1157,14 +1158,13 @@ def _content_policy_blocked_result(
 
 
 def _partial_turn_result(
-    final_response: str, messages: list[dict], api_call_count: int, **flags: Any
+    final_response: str, messages: list[dict], api_call_count: int, agent: Any = None, **flags: Any
 ) -> dict[str, Any]:
-    """Incomplete-turn result whose ``error`` mirrors ``final_response``; ``flags`` add the
-    recovery-contract keys (``failed``, ``compression_deferred``, ...)."""
-    return {
-        "final_response": final_response, "messages": messages, "completed": False,
-        "api_calls": api_call_count, "error": final_response, "partial": True, **flags,
-    }
+    """Incomplete-turn result whose ``error`` mirrors ``final_response``; ``flags`` add the recovery-contract
+    keys. With ``agent``, ``agent_persisted`` is the proof over ``messages``, the list the caller persisted."""
+    persisted = {} if agent is None else {"agent_persisted": turn_rows_persisted(agent, messages)}
+    return {"final_response": final_response, "messages": messages, "completed": False,
+            "api_calls": api_call_count, "error": final_response, "partial": True, **persisted, **flags}
 
 
 def _compression_deferred_result(agent, messages: list[dict], api_call_count: int, reason: str = "lock") -> dict[str, Any]:
@@ -1197,7 +1197,7 @@ def _compression_deferred_result(agent, messages: list[dict], api_call_count: in
     except Exception:
         pass
     return _partial_turn_result(
-        _final, messages, api_call_count,
+        _final, messages, api_call_count, agent,
         failed=False, compression_deferred=True, session_id=agent.session_id,
     )
 
@@ -1224,7 +1224,7 @@ def _provider_overflow_exhausted_result(
     agent._persist_session(messages, conversation_history)
     return _partial_turn_result(
         site_copy("context_overflow", model=agent.model),
-        messages, api_call_count, failed=True, compression_exhausted=True,
+        messages, api_call_count, agent, failed=True, compression_exhausted=True,
         turn_exit_reason="context_compression_exhausted",
         failure_reason="context_overflow", failure_retryable=False,
     )
@@ -1446,7 +1446,7 @@ def _preflight_timeout_result(agent, exc, conversation_history) -> dict[str, Any
         "Turn-start preflight compression timed out — ending turn with typed recovery result: %s", exc,
     )
     # Clear the tripwire slot note_turn_start registered (the early return skips the persist
-    # funnel). The user row is deliberately NOT persisted (#7100).
+    # funnel). The user row is deliberately NOT persisted (#7100): no row of this turn is stored.
     from agent.agent_runtime_helpers import note_turn_persisted
     note_turn_persisted(agent)
     # Not _COMPRESSION_TIMEOUT_FINAL_RESPONSE — that describes a different state
@@ -1454,7 +1454,7 @@ def _preflight_timeout_result(agent, exc, conversation_history) -> dict[str, Any
     return _partial_turn_result(
         str(exc), list(conversation_history or []), 0,
         failed=True, compression_exhausted=True, turn_exit_reason="context_compression_timeout",
-        failure_reason="context_overflow", failure_retryable=False,
+        failure_reason="context_overflow", failure_retryable=False, agent_persisted=turn_rows_persisted(agent, []),
     )
 
 

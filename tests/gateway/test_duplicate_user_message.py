@@ -1,10 +1,9 @@
 """Tests for #42039 — user messages stored twice in state.db.
 
-When the agent has its own SessionDB reference (``_session_db is not None``),
-``_flush_messages_to_session_db()`` persists messages to SQLite during the
-agent run.  The gateway's ``append_to_transcript()`` must then use
-``skip_db=True`` on all fallback paths to prevent writing a second copy
-to the same SQLite file.
+When the agent reports ``agent_persisted=True`` (its own
+``_flush_messages_to_session_db()`` persisted the turn to SQLite), the
+gateway's ``append_to_transcript()`` must use ``skip_db=True`` on all
+fallback paths to prevent writing a second copy to the same SQLite file.
 
 This test covers the two fallback paths that previously lacked
 ``skip_db=agent_persisted``:
@@ -145,6 +144,7 @@ async def test_agent_failed_early_skip_db_when_agent_has_session_db(
             "messages": [],
             "history_offset": 0,
             "last_prompt_tokens": 0,
+            "agent_persisted": True,
         }
     )
 
@@ -276,6 +276,7 @@ async def test_not_new_messages_skip_db_when_agent_has_session_db(
             "tools": [],
             "history_offset": 1,  # equals len(messages) → new_messages=[]
             "last_prompt_tokens": 0,
+            "agent_persisted": True,
         }
     )
 

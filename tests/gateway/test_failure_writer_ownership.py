@@ -211,7 +211,7 @@ def test_fresh_session_agent_flushed_failed_turn_is_closed(tmp_path):
         store = SessionStore(tmp_path / "sessions", GatewayConfig())
         runner = object.__new__(GatewayRunner)
         runner.session_store = store
-        runner._session_db = object()  # agent_persisted defaults True
+        runner._session_db = object()  # agent_persisted is read from the result, never defaulted
 
         async def noop(*args, **kwargs):
             return None
@@ -255,7 +255,7 @@ def test_failed_turn_whose_tail_is_a_tool_row_is_closed(tmp_path):
         store = SessionStore(tmp_path / "sessions", GatewayConfig())
         runner = object.__new__(GatewayRunner)
         runner.session_store = store
-        runner._session_db = object()  # agent_persisted defaults True
+        runner._session_db = object()  # agent_persisted is read from the result, never defaulted
 
         async def noop(*args, **kwargs):
             return None
@@ -310,7 +310,7 @@ def test_content_policy_refusal_drops_the_turn_and_evicts_the_cached_agent(tmp_p
         runner = object.__new__(GatewayRunner)
         runner.session_store = store
         runner._async_session_store = AsyncSessionStore(store)
-        runner._session_db = object()  # agent_persisted defaults True
+        runner._session_db = object()  # agent_persisted is read from the result, never defaulted
 
         async def noop(*args, **kwargs):
             return None
@@ -330,7 +330,7 @@ def test_content_policy_refusal_drops_the_turn_and_evicts_the_cached_agent(tmp_p
         refused = {"failed": True, "failure_reason": "content_policy_blocked", "failure_retryable": False,
                    "final_response": "⚠️ safety refusal", "error": "content_policy_blocked: x",
                    "messages": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi there"}],
-                   "history_offset": 0, "last_prompt_tokens": 0}
+                   "history_offset": 0, "last_prompt_tokens": 0, "agent_persisted": True}
         await runner._hmwa_persist_turn_transcript(
             event=MessageEvent(text="the request the filter blocked", source=source, message_id="m-9"),
             source=source, session_entry=entry, session_key=entry.session_key, agent_result=refused,
@@ -385,7 +385,7 @@ def test_content_policy_refused_turn_stays_in_the_display_tagged_content_refused
         refused = {"failed": True, "failure_reason": "content_policy_blocked", "failure_retryable": False,
                    "final_response": "⚠️ safety refusal", "error": "content_policy_blocked: x",
                    "messages": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi there"}],
-                   "history_offset": 0, "last_prompt_tokens": 0}
+                   "history_offset": 0, "last_prompt_tokens": 0, "agent_persisted": True}
         await runner._hmwa_persist_turn_transcript(
             event=MessageEvent(text="the request the filter blocked", source=source, message_id="m-9"),
             source=source, session_entry=entry, session_key=entry.session_key, agent_result=refused,

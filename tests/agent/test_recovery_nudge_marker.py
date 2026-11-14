@@ -358,3 +358,26 @@ def test_the_marker_is_not_persisted_and_the_reloaded_nudge_is_the_row_replay_al
 
     assert ContextCompressor._is_synthetic_compression_user_turn(reloaded[0])
     assert ContextCompressor._is_synthetic_compression_user_turn(nudge)
+
+
+# ── the codex-incomplete site (turn_truncation.continue_codex_incomplete) ────────────────────────────
+
+
+@pytest.mark.parametrize("in_peer_turn", [True, False])
+def test_the_codex_incomplete_nudge_is_marked_only_in_a_peer_turn(in_peer_turn):
+    """Second incomplete response repeating the first: the site appends its nudge after the assistant row."""
+    from agent.turn_truncation import continue_codex_incomplete
+
+    peer = _peer()
+    opening = _opening(peer) if in_peer_turn else {"role": "user", "content": BODY}
+    interim = {"role": "assistant", "content": "partial", "finish_reason": "incomplete"}
+    messages = [opening, dict(interim)]
+    agent = MagicMock(_persist_user_message_idx=0, _codex_incomplete_retries=1, _codex_reasoning_only_streak=0)
+    agent._build_assistant_message.return_value = dict(interim)
+
+    assert continue_codex_incomplete(agent, SimpleNamespace(content="partial", tool_calls=None), "incomplete",
+                                     messages=messages, conversation_history=None, api_call_count=2) is None
+
+    marker = {KEY: {"kind": "codex_incomplete", "run": peer["nonce"]}} if in_peer_turn else {}
+    assert [{k: v for k, v in m.items() if k != "timestamp"} for m in messages[2:]] == [
+        {"role": "user", "content": _text("codex_incomplete"), **marker}]
