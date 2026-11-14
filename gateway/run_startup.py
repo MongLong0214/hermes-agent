@@ -796,22 +796,22 @@ class GatewayStartupMixin:
         event = shutdown_flush.inbound_event_from_record(record)
         restore_identity(event.source, runner=self, transport_profile=record.get("transport_profile"))
         event._inbound_record_id, event._inbound_record_order = record["recovery_id"], record.get("order")
+        event._inbound_record_key, event._inbound_readmitted = record["session_key"], True
         event._hermes_startup_restore_replay = True  # accepted before the restart: not held by the gate
         return event, self._delivery_adapter_for(event.source)
 
     async def _readmit_session_records(self, session_key: str, targets: list) -> None:
-        """Run one session's stored messages in order. A message the transcript shows answered (its user
-        row, by message id, followed by a final reply) is consumed without a turn. The record, not an
-        empty auto-resume, answers the interrupted turn, so the session's resume flag is cleared first. A
-        message the inbound path declined (refused, a command, steered into a running turn) is consumed;
-        one it queued keeps its record until its own turn settles it."""
-        from gateway import shutdown_flush
+        """Run one session's stored messages in order. The record, not an empty auto-resume, answers
+        the interrupted turn, so the session's resume flag is cleared first. Each message goes through
+        the ordinary inbound path, which settles its record: its turn when it claims one, otherwise
+        ``_settle_unclaimed_inbound`` (a declined message is consumed, a queued one keeps it). One whose
+        answer is already in the transcript is delivered through the ledger instead of run again."""
         cleared = False
         for record, event, adapter in targets:
             recovery_id = record["recovery_id"]
-            if await self._inbound_record_answered(record):
-                logger.info("Stored owner message %s on %s was already answered; consumed", recovery_id, session_key)
-                shutdown_flush.discard_inbound_record(recovery_id)
+            if await self._consume_if_answered(record):
+                with _log_suppressed(logging.WARNING, "Redelivering an answered stored message failed: %s"):
+                    await self._redeliver_pending_obligations()
                 continue
             if not cleared:
                 cleared = True
@@ -825,35 +825,84 @@ class GatewayStartupMixin:
                     await asyncio.shield(task)
             except Exception:
                 logger.warning("Re-admitting stored owner message %s failed; kept", recovery_id, exc_info=True)
-                continue
-            if (getattr(event, "_inbound_record_id", None) == recovery_id
-                    and not getattr(event, "_inbound_record_claimed", False)
-                    and not self._draining and not self._event_is_queued(session_key, event)):
-                shutdown_flush.discard_inbound_record(recovery_id)
 
-    async def _inbound_record_answered(self, record: dict) -> bool:
-        """True when the record's message already has its answer in the transcript: its user row (by
-        platform message id) is followed by a final assistant reply before the next user row. A record
-        without a message id cannot be matched and is re-admitted."""
+    async def _ledger_answered_inbound_records(self) -> int:
+        """Boot pass, before the delivery sweep: every stored message of an earlier process whose answer
+        the transcript already holds (its turn was cut off after the agent answered, before delivery)
+        is handed to the delivery ledger and only then consumed. Returns how many were consumed."""
+        from gateway import shutdown_flush
+        live = self._inbound_live_ids()
+        consumed = 0
+        for record in shutdown_flush.load_inbound_records():
+            if record["recovery_id"] not in live:
+                consumed += await self._consume_if_answered(record)
+        return consumed
+
+    async def _consume_if_answered(self, record: dict) -> bool:
+        """When the record's message already has its final reply in the transcript, owe that reply
+        through the delivery ledger (the crash-left row the boot sweep claims and redelivers, a no-op
+        when the same reply was ledgered since the message was asked) and then delete the record.
+        False, keeping the record to be re-admitted, when there is no answer, it cannot be matched, or
+        no ledger can owe it."""
+        from gateway import shutdown_flush
+        from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
+        from hermes_cli.timefmt import coerce_epoch
+        found = await self._inbound_record_answer(record)
+        if found is None:
+            return False
+        history, asked_at, origin = found
+        text = self._crash_left_reply(history, 0.0, origin)
+        if text is None:
+            return False
+        key, recovery_id = record["session_key"], record["recovery_id"]
+        if text:
+            if not await asyncio.to_thread(ledger_enabled):
+                return False  # nothing could owe the answer: the message runs again instead
+            source = shutdown_flush.inbound_event_from_record(record).source
+            await asyncio.to_thread(
+                record_crash_left_reply,
+                obligation_id=compute_obligation_id(key, f"inbound:{recovery_id}", text), session_key=key,
+                platform=str(getattr(source.platform, "value", source.platform)), chat_id=source.chat_id,
+                thread_id=source.thread_id, content=text, since=coerce_epoch(asked_at) or 0.0,
+                adapter_profile=record.get("transport_profile"))
+        logger.info("Stored owner message %s on %s was answered before the restart; its answer is owed "
+                    "through the delivery ledger", recovery_id, key)
+        shutdown_flush.discard_inbound_record(recovery_id)
+        return True
+
+    async def _inbound_record_answer(self, record: dict):
+        """``(history up to the answer, asked-at timestamp, origin)`` when the record's message already
+        has its answer in the transcript: its user row (by platform message id) is followed by a final
+        assistant reply before the next user row; else None. A record without a message id cannot be
+        matched and is re-admitted."""
         from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND
         message_id = record["event"].get("message_id")
         entry = self.session_store.lookup_by_session_key_existing(record["session_key"]) if message_id else None
         if entry is None:
-            return False
+            return None
         try:
             history = await self.async_session_store.load_transcript(entry.session_id)
         except Exception:
-            return False
-        answered = asking = False
-        for row in history:
+            return None
+        answer = asked_at = None
+        asking = False
+        for index, row in enumerate(history):
             if row.get("role") == "user":
                 asking = str(row.get("message_id") or "") == str(message_id)
-                answered = answered and not asking  # a later copy of the message is asked anew
+                if asking:
+                    answer, asked_at = None, row.get("timestamp")  # a later copy of the message is asked anew
             elif (asking and row.get("role") == "assistant" and not row.get("tool_calls")
                   and isinstance(row.get("content"), str) and row["content"].strip()
                   and row.get("display_kind") != FAILED_TURN_DISPLAY_KIND):
-                answered, asking = True, False
-        return answered
+                answer, asking = index, False
+        if answer is None:
+            return None
+        if getattr(entry, "origin", None) is not None:
+            origin = entry.origin
+        else:
+            from gateway import shutdown_flush
+            origin = shutdown_flush.inbound_event_from_record(record).source
+        return history[:answer + 1], asked_at, origin
 
     def _event_is_queued(self, session_key: str, event: MessageEvent) -> bool:
         adapter = self._adapter_holding_pending(session_key)
@@ -1776,6 +1825,10 @@ class GatewayStartupMixin:
         # control sleep here once froze every platform).
         # Restart notification, home-channel startup notice, and obligation redelivery all call
         # adapter.send(). Bound them the same way _finish_startup_restore bounds resume turns. See #91969.
+        # Before the boot sweep: a stored message whose answer is already in the transcript hands that
+        # answer to the delivery ledger, so the sweep below delivers it (and clears its resume flag).
+        with _log_suppressed(logging.WARNING, "Answered inbound record recovery failed", exc_info=True):
+            await self._ledger_answered_inbound_records()
         await self._await_startup_boot_sends(
             planned_restart_notification_pending=_planned_restart_notification_pending(),
         )

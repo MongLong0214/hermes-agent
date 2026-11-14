@@ -4033,25 +4033,75 @@ class BasePlatformAdapter(ABC):
         # Identity FIRST: every key below (routing check, guard lookup, batch lane) derives from it.
         if self._drop_unresolved(event):
             return
-        expected_session_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()
-        # Explicitly routed events already name their destination; recovering a
-        # different topic would redirect them and yield before the session claim.
-        if (not expected_session_key and getattr(self, "_topic_recovery_fn", None) is not None
-                and event.source.platform == Platform.TELEGRAM and event.source.chat_type == "dm"):
-            await asyncio.to_thread(self._apply_topic_recovery, event)
-        session_key = self._event_session_key(event)
-        if expected_session_key and session_key != expected_session_key:
-            logger.warning("Dropping internally routed event: expected session=%s derived=%s",
-                           expected_session_key, session_key)
+        # An owner message is on disk before anything awaits or accepts it: until a turn claims it, or
+        # the busy path queues or hands it on, its inbound record is the copy a restart keeps.
+        if not await self._store_inbound(event, self._event_session_key(event), on_arrival=True):
             return
-        # On-entry self-heal: clear a guard whose owner task already exited.
-        if session_key in self._active_sessions:
-            self._heal_stale_session_lock(session_key)
-        if session_key in self._active_sessions:
-            await self._handle_message_while_active(event, session_key)
-            return
-        # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
-        event._gateway_accepted = self._start_session_processing(event, session_key)
+        handed_on = ended = False
+        try:
+            expected_session_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()
+            # Explicitly routed events already name their destination; recovering a
+            # different topic would redirect them and yield before the session claim.
+            if (not expected_session_key and getattr(self, "_topic_recovery_fn", None) is not None
+                    and event.source.platform == Platform.TELEGRAM and event.source.chat_type == "dm"):
+                await asyncio.to_thread(self._apply_topic_recovery, event)
+            session_key = self._event_session_key(event)
+            if getattr(event, "_inbound_record_key", None) not in (None, session_key):
+                await self._store_inbound(event, session_key, refuse=False)  # topic recovery re-keyed it
+            if expected_session_key and session_key != expected_session_key:
+                logger.warning("Dropping internally routed event: expected session=%s derived=%s",
+                               expected_session_key, session_key)
+                ended = True
+                return
+            # On-entry self-heal: clear a guard whose owner task already exited.
+            if session_key in self._active_sessions:
+                self._heal_stale_session_lock(session_key)
+            if session_key in self._active_sessions:
+                await self._handle_message_while_active(event, session_key)
+                ended = True
+                return
+            # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
+            event._gateway_accepted = handed_on = self._start_session_processing(event, session_key)
+            ended = True
+        finally:
+            if not handed_on:  # the task settles a message it took; nothing else will
+                self._settle_unclaimed_inbound(event, ended=ended)
+
+    async def _store_inbound(self, event: MessageEvent, session_key: str, *, on_arrival: bool = False,
+                             refuse: bool = True) -> bool:
+        """Store an owner message's inbound record through the runner (an awaited off-loop write,
+        gateway/run_inbound.py). True when it may go on: stored, or it needs no record (internal, a
+        managed /acp task, already stored under this key, no runner). On failure the owner is told it
+        was not processed (``refuse``) and False is returned. Arrivals store in arrival order."""
+        store = getattr(self.gateway_runner, "_store_inbound_record", None)
+        if (not inspect.iscoroutinefunction(store) or event.internal
+                or (getattr(event, "_inbound_record_id", None)
+                    and getattr(event, "_inbound_record_key", None) == session_key)
+                or self._is_acp_managed(event)):
+            return True
+        if on_arrival:
+            lock = self.__dict__.get("_inbound_arrival_lock")
+            if lock is None:
+                lock = self.__dict__["_inbound_arrival_lock"] = asyncio.Lock()
+            async with lock:
+                stored = await store(event, session_key)
+        else:
+            stored = await store(event, session_key)
+        if stored or not refuse:
+            return bool(stored)
+        try:
+            await self._send_with_retry(
+                chat_id=event.source.chat_id, content=self.gateway_runner._INBOUND_RECORD_REFUSED,
+                reply_to=_reply_anchor_for_event(event),
+                metadata=_mark_notify_metadata(_thread_metadata_for_event(event)))
+        except Exception:
+            logger.warning("[%s] Could not tell the owner a message was not stored", self.name, exc_info=True)
+        return False
+
+    def _settle_unclaimed_inbound(self, event: MessageEvent, *, ended: bool) -> None:
+        settle = getattr(self.gateway_runner, "_settle_unclaimed_inbound", None)
+        if callable(settle) and getattr(event, "_inbound_record_id", None):
+            settle(event, ended=ended)
 
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
@@ -4550,10 +4600,16 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = interrupt_event
         _thread_metadata = _thread_metadata_for_event(event)
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
+        handler_returned = False
         try:
+            # A follow-up taken from the queue (synchronously, as this task was spawned) is stored before
+            # this task's first await; a message stored on arrival already has its record.
+            if not await self._store_inbound(event, session_key):
+                return
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
+            handler_returned = True
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -4666,6 +4722,7 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            self._settle_unclaimed_inbound(event, ended=handler_returned)
             await self._release_turn_marker(event)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it

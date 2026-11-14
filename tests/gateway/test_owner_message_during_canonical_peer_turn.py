@@ -656,6 +656,7 @@ def _pause_owner_turn_at(h, monkeypatch, at):
         "session_open": (runner, "_hmwa_open_session", awaited),
         "turn_lease": (runner, "_hmwa_acquire_turn_lease", awaited),
         "marker_write": (store, "mark_turn_active", blocking),
+        "topic_lobby": (runner, "_is_telegram_topic_root_lobby", blocking),  # before the claim
     }[at]
     monkeypatch.setattr(owner, name, wrap(getattr(owner, name)))
 
@@ -706,6 +707,7 @@ def _next_process(ingress, send, monkeypatch, *, crashed=False, prepare=None, du
     monkeypatch.setattr(nxt.runner, "_start_post_connect_services", no_services)
     nxt.runner._startup_restore_in_progress = True  # set by start() before any adapter connects
     nxt.runner._startup_restore_queue, nxt.runner._startup_restore_tasks = [], []
+    nxt.runner._running = True  # set by start() before its wiring: boot redelivery sends only while running
     if prepare is not None:
         prepare(nxt)
 
@@ -817,7 +819,7 @@ def test_a_record_that_cannot_be_stored_refuses_the_turn_before_its_claim(ingres
         await h.adapter.handle_message(h.owner_event())
         await h.settle()
     asyncio.run(exercise())
-    assert (claims, h.actor.calls) == ([], ["hello"])
+    assert (claims, h.handled, h.actor.calls) == ([], [], ["hello"])  # not even accepted
     [(chat, notice)] = h.owner_replies()
     assert chat == "chat" and "not processed" in notice and "send it again" in notice
 
@@ -931,8 +933,11 @@ def test_a_turn_whose_marker_write_failed_is_not_answered_twice_once_its_agent_r
 
     asyncio.run(cut_off())
     assert failed and any(_OWNER_TEXT in actor.calls for actor in h.built)
-    turns, _inputs, _chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch))
-    assert (turns, left, _owner_rows(ingress)) == ([], [], 1)
+    assert [text for _chat, text in h.owner_replies() if _TERMINAL in text] == []  # cut off before delivery
+    turns, _inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch))
+    # Review r1 P1-b: the answer is owed through the delivery ledger before the record goes, and the
+    # boot sweep delivers it once; no second model turn.
+    assert (turns, chats, left, _owner_rows(ingress)) == ([], ["chat"], [], 1)
 
 
 @pytest.mark.parametrize("path", ["ordinary", "queued_behind_peer"])
@@ -1312,9 +1317,9 @@ def test_a_restart_during_the_final_send_is_settled_by_redelivery_alone(ingress,
         claimed.extend(rows)
         return rows
     monkeypatch.setattr(delivery_ledger, "sweep_recoverable", recorded_sweep)
-    turns, _inputs, _chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch))
+    turns, _inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch))
     assert [_TERMINAL in row["content"] for row in claimed] == [True]  # the ledger owns the reply
-    assert (turns, left) == ([], [])
+    assert (turns, chats, left) == ([], ["chat"], [])
 
 
 def test_a_multiplexed_message_is_readmitted_on_the_bot_that_received_it(mux):
@@ -1328,7 +1333,7 @@ def test_a_multiplexed_message_is_readmitted_on_the_bot_that_received_it(mux):
     assert (identity.transport_profile, identity.runtime_profile) == ("team_b", "default")
     key = mux.team_b._source_session_key(source)
     event = MessageEvent(text=_OWNER_TEXT, message_type=MessageType.TEXT, source=source, message_id="m9")
-    assert mux.runner._store_inbound_record(event, key)
+    assert asyncio.run(mux.runner._store_inbound_record(event, key))
     [record] = shutdown_flush.load_inbound_records()
     assert record["transport_profile"] == "team_b"
     readmitted, adapter = mux.runner._inbound_record_target(record)
@@ -1415,3 +1420,101 @@ def test_a_turn_the_restart_drain_interrupts_keeps_its_message(ingress, send, mo
     turns, inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch))
     assert (turns, chats, left) == ([_OWNER_TEXT], ["chat"], [])
     assert not any(_RESUME_NOTE in text for text in inputs)
+
+
+@pytest.mark.parametrize("path", ["arrival", "drained_follow_up"])
+def test_a_restart_after_the_adapter_accepted_a_message_before_its_claim_keeps_it(
+        ingress, send, monkeypatch, path):
+    """Review r1 P1-a, the exact reproduction: the adapter has accepted the message (an arrival on an
+    idle session, or a follow-up its queue gave up when the turn ahead of it ended) and the turn waits
+    at the topic-lobby check, before its claim, when stop(restart=True) runs. The record was stored
+    before the acceptance or the dequeue, so the next process answers the message once."""
+    follow_up = "owner: and another thing"
+    text = _OWNER_TEXT if path == "arrival" else follow_up
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    h.runner._restart_drain_timeout = 0.5
+    arm, paused, release = _pause_owner_turn_at(h, monkeypatch, "topic_lobby")
+    message = h.owner_event(text, message_id="m7")
+    sending, send_gate, plain_send = [], asyncio.Event(), h.adapter.send
+
+    async def held_send(chat_id, content, reply_to=None, metadata=None):
+        if _TERMINAL in content and not sending:
+            sending.append(content)
+            await send_gate.wait()
+        return await plain_send(chat_id, content, reply_to=reply_to, metadata=metadata)
+    monkeypatch.setattr(h.adapter, "send", held_send)
+
+    async def cut_off():
+        await h.warm()
+        if path == "drained_follow_up":
+            # The follow-up arrives while the first turn's reply is being sent: the adapter queues it
+            # and, once that send is done, takes it from the queue for a turn of its own.
+            await h.adapter.handle_message(h.owner_event())
+            await h.wait(lambda: sending, "the first owner turn's final send")
+            await h.adapter.handle_message(message)
+            await h.wait(lambda: h.adapter._pending_messages.get(h.key) is message, "the follow-up to be queued")
+            assert _record_texts(ingress) == []  # queued: the FIFO and its shutdown flush hold it
+            arm()
+            send_gate.set()
+        else:
+            send_gate.set()
+            arm()
+            await h.adapter.handle_message(message)
+        await h.wait(lambda: paused, "the accepted message to wait at the topic-lobby check")
+        assert message._gateway_accepted is True and h.queued() == [] and _record_texts(ingress) == [text]
+        try:
+            await asyncio.wait_for(h.runner.stop(restart=True), 60)
+        finally:
+            release()
+
+    asyncio.run(cut_off())
+    assert text not in h.actor.calls and _record_texts(ingress) == [text]
+    turns, inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch))
+    assert (turns, chats, left) == ([text], ["chat"], [])
+    assert not any(_RESUME_NOTE in model_input for model_input in inputs)
+
+
+def test_a_slow_durable_write_never_stalls_the_event_loop(ingress, send, monkeypatch):
+    """Review r1 P1-c: the record write (fsync included) takes 2 s. It runs off the loop, so a heartbeat
+    coroutine keeps ticking throughout, and the message is accepted and claimed only after it is on
+    disk."""
+    import time
+
+    from gateway import shutdown_flush
+
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    store, accepted_while_writing = shutdown_flush.store_inbound_record, []
+
+    def slow_disk(event, **kwargs):
+        accepted_while_writing.append(event._gateway_accepted)
+        time.sleep(2.0)
+        return store(event, **kwargs)
+    monkeypatch.setattr(shutdown_flush, "store_inbound_record", slow_disk)
+    seen, claim = [], h.runner._claim_active_session_slot
+    monkeypatch.setattr(h.runner, "_claim_active_session_slot",
+                        lambda key, source: seen.append(_record_texts(ingress)) or claim(key, source))
+
+    async def exercise():
+        await h.warm()
+        gaps, stop = [], asyncio.Event()
+
+        async def heartbeat():
+            last = time.monotonic()
+            while not stop.is_set():
+                await asyncio.sleep(0.05)
+                now = time.monotonic()
+                gaps.append(now - last)
+                last = now
+        beat = asyncio.ensure_future(heartbeat())
+        await asyncio.sleep(0.2)  # the heartbeat is ticking before the message arrives
+        message = h.owner_event()
+        await h.adapter.handle_message(message)
+        await h.settle()
+        stop.set()
+        await beat
+        return max(gaps), message._gateway_accepted
+
+    longest_gap, accepted = asyncio.run(exercise())
+    assert longest_gap < 0.5, f"the event loop stalled for {longest_gap:.2f}s"
+    assert (accepted_while_writing, accepted, seen) == ([False], True, [[_OWNER_TEXT]])
+    assert (h.actor.calls[-1], _records(ingress)) == (_OWNER_TEXT, [])
