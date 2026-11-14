@@ -17,6 +17,7 @@ from cron.jobs import (
     mark_job_run,
     note_fire_forward_failure,
 )
+from cron.jobs_public_status import public_fire_error
 
 
 @pytest.fixture()
@@ -80,5 +81,7 @@ class TestFormatJobSurfacesFireError:
 
         job = create_job(prompt="Daily invoice triage", schedule="every 1h")
         note_fire_forward_failure(job["id"], "gateway unreachable")
-        formatted = _format_job(get_job(job["id"]))
-        assert formatted["last_fire_error"]["detail"] == "gateway unreachable"
+        stored = get_job(job["id"])
+        formatted = _format_job(stored)
+        assert formatted["last_fire_error"] == public_fire_error(stored["last_fire_error"])
+        assert formatted["last_fire_error"]["at"] == stored["last_fire_error"]["at"]

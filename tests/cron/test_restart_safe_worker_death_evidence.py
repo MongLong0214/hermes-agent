@@ -13,7 +13,7 @@ import pytest
     "death", ["hard_exit", "payload_exception", "concurrent_recovery",
               "timeout_hard_exit", "timeout_payload_exception"]
 )
-def test_adopted_worker_failure_is_visible(tmp_path, monkeypatch, manual, death):
+def test_adopted_worker_failure_is_visible(tmp_path, monkeypatch, caplog, manual, death):
     from cron import executions
     from cron import scheduler
     from cron.jobs import claim_job_for_fire, create_job, get_job, use_cron_store
@@ -120,7 +120,12 @@ else:
         if death != "concurrent_recovery" and not death.startswith("timeout_"):
             assert "Scheduler restarted" not in row["error"]
         assert result["claim_released"], result
-        assert "worker-probe-startup-sentinel" in (result["job_error"] or ""), result
+        # The worker's stderr goes to the private gateway log (the ledger row never carried it);
+        # the job record serves closed labels.
+        from cron.jobs_public_status import public_run_error
+        assert "worker-probe-startup-sentinel" in caplog.text, result
+        assert result["job_error"] and public_run_error(result["job_error"]) == result["job_error"], result
+        assert "worker-probe-startup-sentinel" not in json.dumps(record), result
         assert len(delivered) == 1, result
         assert len(executions.list_executions()) <= executions.MAX_TERMINAL_EXECUTIONS
         from cron.scheduler_worker_failure import record_unknown_worker_outcome

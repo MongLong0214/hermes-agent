@@ -136,6 +136,8 @@ def test_inline_run_records_delivery_failed_not_ok(live_relay, tmp_path):
         error = _deliver_result(job, f"Q3 numbers are in.\n\nMEDIA:{pdf}",
                                 adapters={Platform.RELAY: adapter}, loop=loop)
     mark_job_run(job["id"], True, delivery_error=error)
+    from cron.jobs_public_status import public_delivery_error
     record = get_job(job["id"])
     assert record["last_status"] == "delivery_failed"
-    assert "403" in record["last_delivery_error"]
+    assert "403" in error, "the adapter's reason reaches the caller (and the log)"
+    assert record["last_delivery_error"] == public_delivery_error(error)
