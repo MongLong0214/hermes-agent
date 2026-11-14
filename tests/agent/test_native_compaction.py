@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent import native_compaction_grace as grace
 from agent.codex_responses_adapter import ResponsesEndpointQuirks
 from agent.native_compaction import (
     DEFAULT_COMPACT_THRESHOLD,
@@ -18,6 +19,9 @@ from agent.native_compaction import (
     is_native_compaction_rejection,
     native_compaction_context_management,
     resolve_compact_threshold,
+)
+from tests.agent.test_native_compaction_preflight_grace import (
+    TRIGGER, _Server, _history, _native_agent,
 )
 
 
@@ -746,3 +750,125 @@ class TestCheckpointGatedOnCurrentEligibility:
         assert seen.get("native_compaction_eligible") is False
         assert all(i.get("type") != "compaction" for i in seen["input"])
         assert {"type": "message", "role": "assistant", "content": _CODEX_ON_IT} in seen["input"]
+
+
+# One-shot preflight grace (agent/native_compaction_grace.py): the wire boundary and the usage
+# intake. The real-loop harness lives in test_native_compaction_preflight_grace.py.
+
+
+def test_grace_capture_then_replay_bills_below_both(tmp_path, monkeypatch):
+    server = _Server(["tool", "text", "text"])
+    agent = _native_agent(tmp_path / "home", monkeypatch, server, [])
+    first = agent.run_conversation("run the log tool", conversation_history=_history(30_000))
+
+    capture = next(w for w in server.wire if w["compacts"])
+    state = getattr(agent, grace._STATE_ATTR)
+    assert state["phase"] == grace._AWAITING_REPLAY
+    assert state["capture_prompt_tokens"] == capture["billed"]
+    baseline = state["baseline_prompt_tokens"]
+
+    agent.run_conversation("and now?", conversation_history=first["messages"])
+
+    replay = server.wire[-1]
+    assert replay["replays"] and replay["billed"] < min(baseline, capture["billed"])
+    assert getattr(agent, grace._STATE_ATTR) is None
+
+
+def test_grace_request_without_the_native_field_is_rebuilt_not_sent(tmp_path, monkeypatch):
+    # The payload builder drops the native field after the grace armed (the grace's own gate
+    # still sees the route as native): the over-trigger request has no native owner.
+    server, summaries = _Server(["tool", "text", "text"]), []
+    agent = _native_agent(tmp_path / "home", monkeypatch, server, summaries)
+    monkeypatch.setattr(
+        "agent.native_compaction.native_compaction_context_management", lambda *_a, **_k: None
+    )
+
+    agent.run_conversation("run the log tool", conversation_history=_history(30_000))
+
+    assert len(server.wire) >= 2 and not any(w["native"] for w in server.wire)
+    assert all(w["billed"] < TRIGGER for w in server.wire)
+    assert summaries  # rebuilt through local preflight
+
+
+def test_rate_limited_grace_request_is_retried_under_the_turn_budget(tmp_path, monkeypatch):
+    # Rate-limited with the summary provider down: the attempt is retried by the loop's own
+    # retries, never rebuilt around them.
+    server = _Server(["tool"] + ["429"] * 8)
+    agent = _native_agent(tmp_path / "home", monkeypatch, server, [], summary_fails=True)
+
+    agent.run_conversation("run the log tool", conversation_history=_history(30_000))
+
+    limited = [w for w in server.wire if w["action"] == "429"]
+    assert limited and len(limited) <= agent._api_max_retries
+    assert all(w["native"] and w["billed"] >= TRIGGER for w in limited)
+
+
+def _record(agent, response):
+    from agent.turn_usage import record_response_usage
+
+    record_response_usage(
+        agent, response, messages=[], api_call_count=1, api_duration=0.0,
+        compression_attempts=0, max_compression_attempts=3,
+    )
+
+
+def _in_flight(agent, request_phase, **extra):
+    setattr(agent, grace._STATE_ATTR, {
+        "phase": grace._IN_FLIGHT, "request_phase": request_phase, "identity": grace._identity(agent),
+        "baseline_prompt_tokens": 40_000, **extra,
+    })
+    return getattr(agent, grace._STATE_ATTR)
+
+
+def _usage(prompt):
+    return SimpleNamespace(input_tokens=prompt, output_tokens=20, total_tokens=prompt + 20)
+
+
+def test_usage_less_grace_responses_record_zero_prompt_tokens(tmp_path, monkeypatch):
+    agent = _native_agent(tmp_path / "home", monkeypatch, _Server([]), [])
+    checkpoint = SimpleNamespace(type="compaction", encrypted_content="sealed")
+
+    state = _in_flight(agent, grace._AWAITING_CAPTURE)
+    _record(agent, SimpleNamespace(output=[checkpoint], usage=None))
+    assert state["phase"] == grace._AWAITING_REPLAY and state["capture_prompt_tokens"] == 0
+
+    # A replay without a count cannot prove its reduction.
+    state.update(phase=grace._IN_FLIGHT, request_phase=grace._AWAITING_REPLAY)
+    _record(agent, SimpleNamespace(output=[], usage=None))
+    assert state["phase"] == grace._FALLBACK
+
+
+def test_replay_resolves_only_on_a_proven_reduction(tmp_path, monkeypatch):
+    agent = _native_agent(tmp_path / "home", monkeypatch, _Server([]), [])
+
+    _in_flight(agent, grace._AWAITING_REPLAY, capture_prompt_tokens=58_000)
+    _record(agent, SimpleNamespace(output=[], usage=_usage(12_000)))
+    assert getattr(agent, grace._STATE_ATTR) is None
+
+    state = _in_flight(agent, grace._AWAITING_REPLAY, capture_prompt_tokens=58_000)
+    _record(agent, SimpleNamespace(output=[], usage=_usage(41_000)))
+    assert state["phase"] == grace._FALLBACK
+
+    # A capture whose response carries no checkpoint has nothing to replay.
+    state = _in_flight(agent, grace._AWAITING_CAPTURE)
+    _record(agent, SimpleNamespace(output=[], usage=_usage(58_000)))
+    assert state["phase"] == grace._FALLBACK
+
+
+def test_turn_start_waits_for_an_owed_replay_even_on_an_anchored_figure(tmp_path, monkeypatch):
+    from agent.turn_context_compaction import _turn_start_deferral
+
+    agent = _native_agent(tmp_path / "home", monkeypatch, _Server([]), [])
+    agent._request_pressure_anchored = True  # real usage + delta: never deferred otherwise
+    compressor = agent.context_compressor
+    carrier = {"role": "assistant", "content": "answer", "codex_reasoning_items": [
+        {"type": "compaction", "id": "cmp_1", "encrypted_content": "sealed-1"}]}
+    messages = [{"role": "user", "content": "q"}, carrier, {"role": "user", "content": "and now?"}]
+
+    assert _turn_start_deferral(agent, compressor, TRIGGER + 8_000, messages) is None
+    _in_flight(agent, grace._AWAITING_REPLAY, capture_prompt_tokens=58_000)["phase"] = grace._AWAITING_REPLAY
+
+    assert _turn_start_deferral(agent, compressor, TRIGGER + 8_000, messages) is not None
+    # Turn start never arms: with nothing owed, the anchored figure is not deferred.
+    setattr(agent, grace._STATE_ATTR, None)
+    assert _turn_start_deferral(agent, compressor, TRIGGER + 8_000, messages) is None
