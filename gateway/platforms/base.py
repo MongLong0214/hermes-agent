@@ -1648,18 +1648,22 @@ def _component_outcome(component_done: Optional[Callable], ids: Any, result: Any
 
 class _OwedReply:
     """A reply whose components are stored (``BasePlatformAdapter.owe_explicit_reply``) and whose text
-    reaches the chat by other means: a stream, an edit, or the queued lane's ledgered send."""
+    reaches the chat by other means: a stream, an edit, or the queued lane's ledgered send. ``withheld``:
+    its components could not be stored, so nothing of it may be sent (delivery_ledger.ReplyNotStored)."""
 
     def __init__(self, adapter: "BasePlatformAdapter", source: Any, session_key: str,
-                 obligation_id: Optional[str], held: list, extracted: "_ExtractedResponse") -> None:
+                 obligation_id: Optional[str], held: list, extracted: "_ExtractedResponse", *,
+                 withheld: bool = False) -> None:
         self.adapter, self.source, self.session_key = adapter, source, session_key
         self.obligation_id, self.held, self.extracted = obligation_id, held, extracted
+        self.withheld = withheld
 
     async def finish(self, *, text_delivered: bool, metadata: Optional[Dict[str, Any]] = None) -> bool:
         """The text reached the chat (``text_delivered``): it is recorded delivered (a ledgered send's
         row is left as it is), then the attachments still owed are sent. A text that did not reach the
-        chat sends nothing more: the reply stays owed. True when every component was delivered."""
-        if not text_delivered:
+        chat, or a withheld reply, sends nothing more: the reply stays owed. True when every component
+        was delivered."""
+        if not text_delivered or self.withheld:
             return False
         if self.obligation_id and self.extracted.text_content:
             from gateway.delivery_ledger import record_delivered
@@ -4348,29 +4352,34 @@ class BasePlatformAdapter(ABC):
                 and str(event.text or "").lstrip().startswith(("/", self.typed_command_prefix or "!")))
 
     async def _record_reply_components(self, source: Any, session_key: str, answer_ref: Optional[str],
-                                       extracted: "_ExtractedResponse", *,
-                                       cut_short: bool = False) -> "tuple[Optional[str], list]":
+                                       extracted: "_ExtractedResponse", *, cut_short: bool = False,
+                                       kind: Optional[str] = None) -> "tuple[Optional[str], list]":
         """Store what the reply owed under *answer_ref* (an owner message's record and run, gateway/
         run_inbound.py) requires, before any of it is sent (delivery_ledger.record_components): its text
-        and every attachment, under component ids stable within the reply. ``cut_short``: the run did
-        not end its message (a restart cut it short; its record stays), so this reply is marked as one
-        that does not settle the message by itself. Returns the obligation id and the components it
-        holds, with their states (an earlier store of this reply, partly delivered, wins); ``(None,
-        [])`` with the ledger off, without a reference, or when the store failed: nothing can then prove
-        the reply delivered, and its record stays."""
+        and every attachment, under component ids stable within the reply, as the run's answer or as a
+        notice sent instead (*kind*, delivery_ledger.REPLY: each under its own obligation). ``cut_short``:
+        the run did not end its message (a restart cut it short; its record stays), so this reply is
+        marked as one that does not settle the message by itself. Returns the obligation id and the
+        components it holds, with their states (an earlier store of this reply, partly delivered, wins).
+        ``(None, [])`` only when nothing tracks the reply: it has no reference (not an owner message's),
+        or the ledger is off (the sends themselves are then the proof). Raises
+        ``delivery_ledger.ReplyNotStored`` when the store failed: nothing of the reply may be sent."""
         if not answer_ref:
             return None, []
-        from gateway.delivery_ledger import CUT_SHORT, InboundObligation, ledger_enabled, record_components
+        from gateway.delivery_ledger import (
+            CUT_SHORT, REPLY, REPLY_ANSWER, InboundObligation, ReplyNotStored, ledger_enabled, record_components)
+        kind = kind or REPLY_ANSWER
         try:
             if not await asyncio.to_thread(ledger_enabled):
                 return None, []
-            obligation_id = InboundObligation.to(session_key, answer_ref, source).obligation_id
-            components = [{**part, CUT_SHORT: True} if cut_short else part for part in extracted.components()]
+            obligation_id = InboundObligation.to(session_key, answer_ref, source).reply_id(kind)
+            components = [{**part, REPLY: kind, **({CUT_SHORT: True} if cut_short else {})}
+                          for part in extracted.components()]
             return obligation_id, await asyncio.to_thread(record_components, obligation_id, components)
-        except Exception:
-            logger.warning("[%s] Storing the components of an owner message's reply failed; its record stays",
-                           self.name, exc_info=True)
-            return None, []
+        except Exception as exc:
+            logger.warning("[%s] Storing the components of an owner message's reply failed; nothing of it is "
+                           "sent, and its record and its source stay for the next start", self.name, exc_info=True)
+            raise ReplyNotStored(str(exc)) from exc
 
     async def _mark_components(self, obligation_id: str, outcomes: Dict[str, str]) -> List[str]:
         """``delivery_ledger.mark_components`` off the loop; [] (logged) when it fails."""
@@ -4420,10 +4429,14 @@ class BasePlatformAdapter(ABC):
         if attachments and response:
             media, _rest = self.extract_media(response)
             media = BasePlatformAdapter.filter_media_delivery_paths(media)
+        from gateway.delivery_ledger import ReplyNotStored
         extracted = _ExtractedResponse(
             text_content=(text or "").strip(), images=[], media_files=media, local_files=[],
             force_document_attachments="[[as_document]]" in (response or ""), pre_extract=response or "")
-        obligation_id, held = await self._record_reply_components(source, session_key, answer_ref, extracted)
+        try:
+            obligation_id, held = await self._record_reply_components(source, session_key, answer_ref, extracted)
+        except ReplyNotStored:
+            return _OwedReply(self, source, session_key, None, [], extracted, withheld=True)
         return _OwedReply(self, source, session_key, obligation_id, held, extracted)
 
     async def redeliver_owed_attachments(self, source: Any, obligation_id: str, held: list, *,
@@ -4486,9 +4499,11 @@ class BasePlatformAdapter(ABC):
             _inbound_ref = getattr(event, "_inbound_ledger_ref", None) or (
                 str(_ledger_id)[len("inbound:"):] if str(_ledger_id or "").startswith("inbound:") else None)
             if _inbound_ref:
+                # Under the reply's own kind: a notice never takes the answer's obligation (delivery_ledger.REPLY).
                 obligation_id = inbound_obligation_id(
                     session_key, _inbound_ref, platform=platform, chat_id=source.chat_id,
-                    thread_id=getattr(source, "thread_id", None))
+                    thread_id=getattr(source, "thread_id", None),
+                    kind=getattr(event, "_inbound_reply_kind", None) or "answer")
             else:
                 if _handed_off:
                     # This reply answers something other than the managed task the event opened (a
@@ -4738,7 +4753,8 @@ class BasePlatformAdapter(ABC):
             try:
                 if await asyncio.to_thread(ledger_enabled):
                     await asyncio.to_thread(
-                        record_delivered, obligation_id=proof.obligation_id, session_key=session_key,
+                        record_delivered, obligation_id=proof.reply_id(getattr(event, "_inbound_reply_kind", None)),
+                        session_key=session_key,
                         platform=proof.platform, chat_id=event.source.chat_id,
                         thread_id=getattr(event.source, "thread_id", None), content=text_content,
                         adapter_profile=getattr(self, "_owner_profile", None))
@@ -4837,10 +4853,16 @@ class BasePlatformAdapter(ABC):
         """``_extract_response_content``'s split of a stored reply, for a later start that owes it
         (gateway/run_startup.py): MEDIA tags, image URLs, residual directives, bare local paths, an
         emptied response recovered as text. No history dedupe: nothing of this reply was delivered.
+        A MEDIA file that is gone from this host stays one of the reply's attachments: the reply
+        requires it, and the send records it ``missing`` (redeliver_owed_attachments), which keeps the
+        reply owed; only a path the delivery policy refuses is dropped, as the live final drops it.
         The caller holds the routed profile's media scope."""
         force_document = "[[as_document]]" in response
-        media_files, rest = cls.extract_media(response)
-        media_files = cls.filter_media_delivery_paths(media_files, session_key=session_key)
+        tagged, rest = cls.extract_media(response)
+        media_files = []
+        for path, is_voice in tagged:
+            allowed = cls.filter_media_delivery_paths([(path, is_voice)], session_key=session_key)
+            media_files += allowed or ([] if _existing_regular_file(str(path)) else [(str(path), bool(is_voice))])
         images, text_content = cls.extract_images(rest)
         text_content = _strip_media_directives(text_content).strip()
         local_files, text_content = cls.extract_local_files(text_content)
@@ -4960,6 +4982,8 @@ class BasePlatformAdapter(ABC):
         # Every attachment of an owner message's reply was delivered: with ``sent``, the ledger-off proof.
         # Set only by the attachment delivery of such a reply; nothing else reads it.
         _attachments_ok = False
+        _withheld = False  # the reply's components could not be stored, so none of it was sent
+        from gateway.delivery_ledger import ReplyNotStored
         try:
             # An owner message was stored on arrival and keeps its record while it waits in the queue,
             # so a follow-up taken from it here is already durable.
@@ -4993,15 +5017,21 @@ class BasePlatformAdapter(ABC):
                 # anything is sent, and a component an earlier send of it already delivered is not sent
                 # again.
                 _answer_ref = getattr(event, "_inbound_ledger_ref", None)
-                _owed_id, _held = await self._record_reply_components(
-                    event.source, session_key,
-                    None if self._final_unledgered(event, is_ephemeral_response) else _answer_ref, extracted,
-                    cut_short=bool(getattr(event, "_inbound_cut_short", False)))
+                try:
+                    _owed_id, _held = await self._record_reply_components(
+                        event.source, session_key,
+                        None if self._final_unledgered(event, is_ephemeral_response) else _answer_ref, extracted,
+                        cut_short=bool(getattr(event, "_inbound_cut_short", False)),
+                        kind=getattr(event, "_inbound_reply_kind", None))
+                except ReplyNotStored:
+                    # Not a normal result: nothing of the reply is sent (no text, voice or attachment), and
+                    # its record and marker stay; the next start owes it from its transcript.
+                    _owed_id, _held, _withheld = None, [], True
                 _text_done = any(c.get("id") == "text" and c.get("state") == "delivered" for c in _held)
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
                 _tts_paths, _tts_requested_path = [], None
-                if self._wants_auto_tts(
+                if not _withheld and self._wants_auto_tts(
                         event, session_key, interrupt_event, text_content, media_files):
                     _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(text_content)
                 # TTS plays before text; generated files are removed afterwards.
@@ -5029,11 +5059,13 @@ class BasePlatformAdapter(ABC):
                 if text_content or extracted.images or extracted.media_files or extracted.local_files \
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
-                if text_content and not _tts_caption_delivered and not _text_done:
+                if text_content and not _tts_caption_delivered and not _text_done and not _withheld:
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery)
-                if _answer_ref:
+                if _withheld:
+                    pass
+                elif _answer_ref:
                     _attachments_ok = await self._deliver_owed_attachments(
                         event, extracted, _final_thread_metadata, obligation_id=_owed_id, held=_held,
                         record_delivery=_record_delivery,
@@ -5051,7 +5083,7 @@ class BasePlatformAdapter(ABC):
                 event, session_key, response, text_content=text_content if response else "",
                 caption_delivered=bool(response) and _tts_caption_delivered,
                 sent=delivery_attempted and not delivery_failed and _attachments_ok)
-            reply_owed = reply_owed and delivery_attempted and not delivery_succeeded
+            reply_owed = reply_owed and (_withheld or (delivery_attempted and not delivery_succeeded))
             await self._release_turn_marker(event, owed=reply_owed, final=_final, session_key=session_key)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.
@@ -5112,7 +5144,7 @@ class BasePlatformAdapter(ABC):
             # had answered (it handed its records over). Both stay for the next start.
             await self._release_turn_marker(event, owed=reply_owed)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
-            event._inbound_ledger_ref = event._inbound_outcome = None
+            event._inbound_ledger_ref = event._inbound_outcome = event._inbound_reply_kind = None
             event._inbound_streamed_sent = event._inbound_cut_short = False
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.

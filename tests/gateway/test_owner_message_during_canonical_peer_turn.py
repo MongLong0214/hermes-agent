@@ -2198,12 +2198,13 @@ def test_a_turn_that_raises_after_its_answer_was_stored_keeps_its_record(ingress
 # fixed in the record before the turn's hooks. Each test below fails at ace7c2f5.
 
 
-def _inbound_obligation(ingress, answer_ref):
+def _inbound_obligation(ingress, answer_ref, kind="answer"):
+    """The obligation id of the run's answer, or (``kind="notice"``) of a notice it sent instead."""
     from gateway import delivery_ledger
     source = ingress.source
     return delivery_ledger.inbound_obligation_id(
         ingress.entry.session_key, answer_ref, platform=source.platform.value, chat_id=source.chat_id,
-        thread_id=source.thread_id)
+        thread_id=source.thread_id, **({} if kind == "answer" else {"kind": kind}))
 
 
 def _obligations(ingress):
@@ -2281,27 +2282,29 @@ def test_a_rerun_is_fixed_before_its_hooks_and_a_failed_lookup_or_read_back_neve
     """Slice 1 review P1-2 and P1-3, under the ledger-first recovery of the b9a08796 review: a stored
     message's earlier run left nothing in the ledger and only a truncated answer in the transcript, so
     the next process runs it again, under a run fixed in its record before the run's hooks: an
-    agent:start hook that raises makes the rerun's error notice owed under that run, where it is
-    delivered and settles the record (``agent_start``). A ledger lookup that fails at that start runs
-    nothing and keeps the record with its run unchanged (``ledger_lookup``: a failed lookup never
-    authorizes a transcript-based run). A read-back that fails after the rerun's reply was delivered
-    keeps the record, and the next start finds that run's obligation complete and only cleans up
-    (``read_back``). A run that cannot be written into the record admits nothing (``run_write``). Once
-    the failure clears, the next start closes the record, sending at most one reply in all."""
+    agent:start hook that raises makes the rerun's error notice owed under that run (as a notice, its
+    own obligation), where it is delivered and, the run having ended on it, settles the record
+    (``agent_start``). A ledger lookup that fails at that start runs nothing and keeps the record with
+    its run unchanged (``ledger_lookup``: a failed lookup never authorizes a transcript-based run). A
+    read-back that fails after the rerun's reply was delivered keeps the record, and the next start
+    finds that run's obligation complete and only cleans up (``read_back``). Lookup and read-back are
+    one decision (delivery_ledger.inbound_completion). A run that cannot be written into the record
+    admits nothing (``run_write``). Once the failure clears, the next start closes the record, sending
+    at most one reply in all."""
     import json
 
     from gateway import delivery_ledger, shutdown_flush
 
     _stored_turn(ingress, "rerun", "partial: I was about to", finish_reason="length")
     record_path = ingress.home / "pending_messages" / "inbound-rerun.json"
-    progress = getattr(delivery_ledger, "obligation_progress", None)
-    complete = getattr(delivery_ledger, "obligation_complete", None)
+    completion = delivery_ledger.inbound_completion
+    reply = "notice" if failure == "agent_start" else "answer"
 
-    def failing(fn, *, once):
+    def failing(fn, *, once, armed=lambda: True):
         calls = []
 
         def wrapped(*args, **kwargs):
-            if not (once and calls):
+            if armed() and not (once and calls):
                 calls.append(True)
                 raise OSError(f"transient {failure} failure")
             return fn(*args, **kwargs)
@@ -2318,22 +2321,21 @@ def test_a_rerun_is_fixed_before_its_hooks_and_a_failed_lookup_or_read_back_neve
                 return await emit(name, *args, **kwargs)
             monkeypatch.setattr(nxt.runner.hooks, "emit", failing_hook)
         elif failure == "ledger_lookup":  # every lookup of this process
-            monkeypatch.setattr(delivery_ledger, "obligation_progress",
-                                failing(progress, once=False), raising=False)
-        elif failure == "read_back":  # the boundary's read-back after the rerun's delivery
-            monkeypatch.setattr(delivery_ledger, "obligation_complete", failing(complete, once=True),
-                                raising=False)
+            monkeypatch.setattr(delivery_ledger, "inbound_completion", failing(completion, once=False))
+        elif failure == "read_back":  # the boundary's read-back, once the rerun has run and delivered
+            monkeypatch.setattr(delivery_ledger, "inbound_completion", failing(
+                completion, once=True, armed=lambda: any(actor.calls for actor in nxt.built)))
         else:
             monkeypatch.setattr(shutdown_flush, "set_inbound_record_run",
                                 failing(shutdown_flush.set_inbound_record_run, once=True))
 
     turns, _inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch, prepare=prepare))
-    monkeypatch.setattr(delivery_ledger, "obligation_progress", progress, raising=False)
-    monkeypatch.setattr(delivery_ledger, "obligation_complete", complete, raising=False)
+    monkeypatch.setattr(delivery_ledger, "inbound_completion", completion)
     owed = _obligations(ingress)
     assert _inbound_obligation(ingress, "rerun") not in owed
     if failure == "agent_start":  # its notice is the rerun's own reply, delivered: the record is settled
-        assert (turns, chats, left) == ([], [], []) and owed[_inbound_obligation(ingress, "rerun#1")][0] == "delivered"
+        assert (turns, chats, left) == ([], [], [])
+        assert owed[_inbound_obligation(ingress, "rerun#1", reply)][0] == "delivered"
     elif failure == "read_back":  # answered and delivered, but the read-back failed: kept
         assert (turns, chats, left) == ([_OWNER_TEXT], ["chat"], ["inbound-rerun.json"])
     else:  # nothing run, nothing admitted
@@ -2342,7 +2344,7 @@ def test_a_rerun_is_fixed_before_its_hooks_and_a_failed_lookup_or_read_back_neve
     nxt = _next_process(ingress, send, monkeypatch, prepare=lambda _nxt: _persisting_agents(monkeypatch))
     turns, _inputs, chats, left = _answered(ingress, nxt)
     owed = _obligations(ingress)
-    assert left == [] and owed[_inbound_obligation(ingress, "rerun#1")][0] == "delivered"
+    assert left == [] and owed[_inbound_obligation(ingress, "rerun#1", reply)][0] == "delivered"
     if failure in ("ledger_lookup", "run_write"):
         assert (turns, chats) == ([_OWNER_TEXT], ["chat"])
     else:  # nothing sent again, nothing run again
@@ -2578,10 +2580,10 @@ def _attachment_sends(monkeypatch, refused, order=None):
     return sent
 
 
-def _components(ingress, answer_ref):
+def _components(ingress, answer_ref, kind="answer"):
     from gateway import delivery_ledger
     return [(c["id"], c["kind"], c["state"])
-            for c in delivery_ledger.obligation_components(_inbound_obligation(ingress, answer_ref))]
+            for c in delivery_ledger.obligation_components(_inbound_obligation(ingress, answer_ref, kind))]
 
 
 def _recovery_id(record_file):
@@ -2881,3 +2883,231 @@ def test_one_refused_image_of_two_is_owed_alone_though_its_batch_reported_succes
     turns, _inputs, chats, left = _answered(ingress, nxt)
     assert (turns, chats, left) == ([], [], [])
     assert shown[2:] == [("https://example.invalid/table.png", True)]
+
+
+# ── Slice 1 review of 2aa38989: one completion decision ────────────────────────────────────────────────
+# Whether an owner message's reply is delivered is decided in one place (delivery_ledger.inbound_completion),
+# from what the reply is (its answer, or a notice sent instead, each its own obligation), the state of each
+# of its components, and its text's retry state. The settlement boundary and every recovery step read it.
+# The first five tests are the review's reproductions; each fails at 2aa38989.
+
+
+def test_a_notice_a_restart_cut_short_never_stands_in_for_the_answer_the_run_stored(ingress, send, monkeypatch):
+    """s1c review P1-1: the agent stored its completed answer, then a post-turn hook raises while the
+    gateway drains, so the turn's reply is an error notice from a run a restart cut short. The notice is
+    its own obligation (a notice, superseded), never the answer's: the record and the marker stay, and the
+    next start owes the stored answer under the answer's obligation, delivers it, runs nothing again, and
+    only then cleans up. The delivered notice's obligation stays as history."""
+    import run_agent
+
+    from gateway import delivery_ledger
+    from gateway.shutdown_flush import load_inbound_records
+
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    build = run_agent.AIAgent
+
+    def building(**kwargs):  # the agent's own flush: the turn's user row as handed to it, and its answer
+        actor = build(**kwargs)
+        run = actor.run_conversation
+
+        def writing(text, **kw):
+            result = run(text, **kw)
+            actor._session_db.append_messages_batch(kw["task_id"], [
+                result["messages"][-2], {"role": "assistant", "content": result["final_response"],
+                                         "finish_reason": "stop"}])
+            return result
+        actor.run_conversation = writing
+        return actor
+    monkeypatch.setattr(run_agent, "AIAgent", building)
+
+    async def draining_hook(*_args, **_kwargs):
+        h.runner._draining = True
+        await h.runner.async_session_store.mark_resume_pending(h.key)
+        raise RuntimeError("post-turn hook failed while draining")
+
+    async def exercise():
+        await h.warm()
+        monkeypatch.setattr(h.runner, "_hmwa_post_turn_hooks", draining_hook)
+        await h.adapter.handle_message(h.owner_event())
+        await h.settle()
+    asyncio.run(exercise())
+    [record] = load_inbound_records()
+    rid = record["recovery_id"]
+    assert [t for _c, t in h.owner_replies() if _TERMINAL in t] == [] and _marker(h) is not None
+    assert _components(ingress, rid) == []  # the notice never took the answer's obligation
+    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    turns, _inputs, chats, left = _answered(ingress, nxt)
+    assert (turns, chats, left) == ([], ["chat"], [])
+    assert _marker(nxt) is None and _components(ingress, rid) == [("text", "text", "delivered")]
+    notice = delivery_ledger.obligation_components(_inbound_obligation(ingress, rid, "notice"))
+    assert [(c["kind"], c["state"], c[delivery_ledger.REPLY], c.get(delivery_ledger.CUT_SHORT))
+            for c in notice] == [("text", "delivered", "notice", True)]  # kept, superseded
+
+
+def test_a_reply_whose_components_cannot_be_stored_sends_nothing_until_they_are(ingress, send, monkeypatch):
+    """s1c review P1-2: storing what an attachment-only reply requires fails. That is not a normal
+    result: nothing of the reply is sent (an untracked send could neither prove it delivered nor keep a
+    later start from sending it again), and the record and the marker stay. Once the store works again,
+    the next start owes the reply from its transcript, sends its image once and cleans up; the message is
+    not run again."""
+    from gateway import delivery_ledger
+
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    _answering_with(monkeypatch, _CHART, text=False)
+    sent = _attachment_sends(monkeypatch, set())
+    store = delivery_ledger.record_components
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("temporary ledger write failure")
+
+    async def exercise():
+        await h.warm()
+        monkeypatch.setattr(delivery_ledger, "record_components", unavailable)
+        await h.adapter.handle_message(h.owner_event())
+        await h.settle()
+    asyncio.run(exercise())
+    monkeypatch.setattr(delivery_ledger, "record_components", store)
+    assert sent == [] and len(_records(ingress)) == 1 and _marker(h) is not None
+    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    turns, _inputs, _chats, left = _answered(ingress, nxt)
+    assert (turns, left, sent) == ([], [], [("image", [_CHART_IMAGE], True)])
+    assert _marker(nxt) is None
+
+
+def test_a_stored_answer_whose_attachment_is_gone_keeps_it_owed_as_missing(ingress, send, monkeypatch, tmp_path):
+    """s1c review P1-3: a completed answer, text and a PDF, was stored before any of its components
+    were, then the PDF is deleted. The next start owes both: the text is delivered, the PDF stays one of
+    the reply's components, recorded missing (never dropped, never counted delivered), and the record
+    stays. Once the file is back, the start after that sends the PDF alone and cleans up. The message is
+    never run again."""
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-test")
+    _stored_turn(ingress, "missing", f"{_TERMINAL}\nMEDIA:{document}")
+    document.unlink()
+    sent = _attachment_sends(monkeypatch, set())
+    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    turns, _inputs, chats, left = _answered(ingress, nxt)
+    assert (turns, chats, left, sent) == ([], ["chat"], ["inbound-missing.json"], [])
+    assert _components(ingress, "missing") == [("text", "text", "delivered"), ("media:0", "media", "missing")]
+    document.write_bytes(b"%PDF-test")
+    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    turns, _inputs, chats, left = _answered(ingress, nxt)
+    assert (turns, chats, left) == ([], [], [])
+    assert [(kind, ok) for kind, _what, ok in sent] == [("document", True)]
+
+
+def test_a_stored_answer_that_is_only_an_attachment_is_delivered_and_never_run_again(
+        ingress, send, monkeypatch, tmp_path):
+    """s1c review P1-4: the completed answer in the transcript is a MEDIA: file alone. Its display text
+    is empty once the directive is stripped, which is no reason to call the message unanswered: the next
+    start reads the reply's components from the answer as stored, sends the PDF once and cleans up, and
+    runs nothing."""
+    document = tmp_path / "completed.pdf"
+    document.write_bytes(b"%PDF-test")
+    _stored_turn(ingress, "onlyfile", f"MEDIA:{document}")
+    sent = _attachment_sends(monkeypatch, set())
+    nxt = _next_process(ingress, send, monkeypatch)
+    turns, _inputs, chats, left = _answered(ingress, nxt)
+    assert (turns, chats, left, _texts_sent(nxt)) == ([], [], [], [])
+    assert [(kind, ok) for kind, _what, ok in sent] == [("document", True)]
+    assert _components(ingress, "onlyfile") == [("media:0", "media", "delivered")]
+
+
+@pytest.mark.parametrize("cause", ["stale", "attempts", "send_forbidden", "bound_spent"])
+def test_a_reply_whose_retry_budget_is_spent_is_reactivated_a_bounded_number_of_times(
+        ingress, send, monkeypatch, cause):
+    """s1c review P1-5: the stored answer's text row spent its retry budget undelivered (the 24-hour
+    cutoff, or the attempts cap) while the record still owes it, and the transport works again. The next
+    start reactivates it for one more send, reads it back delivered and cleans up. Reactivation is
+    bounded and selective: a row its chat refused for good (send-forbidden), or one already reactivated
+    MAX_REACTIVATIONS times, is never revived, not even after retention ran over its old row; it and
+    the record stay, and neither of two starts sends anything or runs the message again."""
+    import time
+
+    from gateway import delivery_ledger as ledger
+
+    _stored_turn(ingress, "expired", _TERMINAL)
+    oid, source = _inbound_obligation(ingress, "expired"), ingress.source
+    ledger.record_components(oid, [{"id": "text", "kind": "text", "text": _TERMINAL}])
+    ledger.record_obligation(obligation_id=oid, session_key=ingress.entry.session_key, platform="telegram",
+                             chat_id=source.chat_id, thread_id=source.thread_id, content=_TERMINAL)
+    stale, revived = cause == "stale", cause in ("stale", "attempts")
+    # A row that is never revived was abandoned long ago, past the ledger's retention.
+    age = ledger.STALE_AFTER_SECONDS + 1 if stale else (0 if revived else 8 * 24 * 60 * 60)
+    with ledger._connect() as conn:
+        conn.execute(
+            "UPDATE delivery_obligations SET state=?, attempts=?, created_at=?, updated_at=?, last_error=?, "
+            "owner_pid=NULL, owner_started_at=NULL WHERE obligation_id=?",
+            ("failed" if revived else "abandoned", 0 if stale else ledger.MAX_ATTEMPTS, time.time() - age,
+             time.time() - age, "Forbidden: bot was blocked by the user" if cause == "send_forbidden" else "Bad Gateway",
+             oid))
+        if cause == "bound_spent":
+            conn.execute("UPDATE delivery_obligations SET reactivations=? WHERE obligation_id=?",
+                         (ledger.MAX_REACTIVATIONS, oid))
+        conn.commit()
+    for start in range(2):
+        nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+        turns, _inputs, chats, left = _answered(ingress, nxt)
+        assert (turns, chats) == ([], ["chat"] if revived and start == 0 else [])
+        assert left == ([] if revived else ["inbound-expired.json"])
+        # Another reply is recorded meanwhile, so the ledger's retention runs over the old row.
+        ledger.record_obligation(obligation_id=f"other-{start}", session_key="other", platform="telegram",
+                                 chat_id="other", thread_id=None, content="another reply")
+    assert _components(ingress, "expired") == [("text", "text", "delivered" if revived else "pending")]
+
+
+def test_store_partial_delivery_interruption_restart_recovery_and_cleanup(ingress, send, monkeypatch, tmp_path):
+    """End-to-end acceptance. An owner message's answer is text and a PDF. Its components are stored
+    before the first send; the text is delivered; while the PDF is on its way the process is killed. The
+    record and the marker stay, the PDF still owed. The restart recovers only what is incomplete (the
+    PDF: never the delivered text, never a rerun), reads every component back delivered, and only then
+    deletes the record and the marker."""
+    from gateway import delivery_ledger
+
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-test")
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    _answering_with(monkeypatch, f"MEDIA:{document}")
+    order, sent = [], []
+    store = delivery_ledger.record_components
+
+    def recording(obligation_id, components):
+        order.append("stored")
+        return store(obligation_id, components)
+    monkeypatch.setattr(delivery_ledger, "record_components", recording)
+    send_with_retry = h.adapter._send_with_retry
+
+    async def text_send(*, chat_id, content, **kwargs):
+        if _TERMINAL in content:
+            order.append("text")
+        return await send_with_retry(chat_id=chat_id, content=content, **kwargs)
+    monkeypatch.setattr(h.adapter, "_send_with_retry", text_send)
+    from gateway.platforms.base import SendResult
+    in_flight = []
+
+    async def document_send(self, *, chat_id, file_path, **_kwargs):
+        sent.append(file_path)
+        if self is h.adapter:  # the first process dies while this send is on its way
+            order.append("document")
+            in_flight.append(True)
+            await asyncio.Event().wait()
+        return SendResult(success=True, message_id="doc")
+    monkeypatch.setattr(RestartTestAdapter, "send_document", document_send)
+
+    async def exercise():
+        await h.warm()
+        await h.adapter.handle_message(h.owner_event())
+        await h.wait(lambda: bool(in_flight), "the PDF send")
+        _crash_now(h, monkeypatch)  # killed: nothing more this process writes lands
+    asyncio.run(exercise())
+    [record_file] = _records(ingress)
+    rid = _recovery_id(record_file)
+    assert order[:3] == ["stored", "text", "document"]
+    assert [c for c, t in h.owner_replies() if _TERMINAL in t] == ["chat"] and _marker(h) is not None
+    assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "pending")]
+    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    turns, _inputs, chats, left = _answered(ingress, nxt)
+    assert (turns, chats, left, _texts_sent(nxt)) == ([], [], [], [])
+    assert sent == [str(document), str(document)]  # the interrupted send, then the recovery's alone
+    assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "delivered")]
+    assert _marker(nxt) is None

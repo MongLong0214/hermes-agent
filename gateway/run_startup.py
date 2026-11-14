@@ -857,13 +857,14 @@ class GatewayStartupMixin:
     async def _settle_stored_inbound(self, record: dict, adapter: Any = None) -> str:
         """Settle a stored message an earlier process left, through the boundary (gateway/run_inbound.py,
         _settle_inbound), from what the ledger, and only then its transcript, hold
-        (``_owe_stored_answer``): "settled" when its answer owes nothing, or every component its reply
-        requires reads back delivered (then only the record and marker are cleaned up); "owed" when
-        that reply is still incomplete: the ledger is redelivered (the text) and the attachments not
-        yet delivered are sent on *adapter* (never one already delivered), and the record stays until
-        a later read-back finds every component delivered; "unanswered" when nothing in the ledger
-        names this run's reply and the transcript holds no completed answer (it runs again);
-        "unknown" when a lookup or a write failed (it stays, and is not run)."""
+        (``_owe_stored_answer``): "settled" when its answer owes nothing, or its reply's completion
+        (delivery_ledger.inbound_completion) reads COMPLETE (then only the record and marker are cleaned
+        up); "owed" when that reply is still incomplete: the ledger is redelivered (the text), a text whose
+        retry budget is spent gets its bounded reactivation (``_reactivate_expired_reply``), the
+        attachments not yet delivered are sent on *adapter* (never one already delivered), and the record
+        stays until the decision reads COMPLETE; "unanswered" when nothing in the ledger names this run's
+        reply and the transcript holds no completed answer (it runs again); "unknown" when a lookup or a
+        write failed (it stays, and is not run)."""
         from gateway import shutdown_flush
         from gateway.delivery_ledger import InboundObligation
         from gateway.run_inbound import INBOUND_NO_REPLY
@@ -879,20 +880,43 @@ class GatewayStartupMixin:
         if status == "no_reply":
             settled = await self._settle_inbound([recovery_id], INBOUND_NO_REPLY)
         else:
+            obligation = InboundObligation.to(key, answer_ref, source)
             if status == "owed":
                 with _log_suppressed(logging.WARNING, "Redelivering an answered stored message failed: %s"):
                     await self._redeliver_pending_obligations()
+                with _log_suppressed(logging.WARNING, "Reactivating a stored message's expired reply failed: %s",
+                                     exc_info=True):
+                    await self._reactivate_expired_reply(obligation)
                 with _log_suppressed(logging.WARNING, "Redelivering a stored message's attachments failed: %s",
                                      exc_info=True):
-                    await self._redeliver_owed_attachments(key, answer_ref, source, adapter)
-            settled = await self._settle_inbound([recovery_id], InboundObligation.to(key, answer_ref, source))
+                    await self._redeliver_owed_attachments(obligation, source, adapter)
+            settled = await self._settle_inbound([recovery_id], obligation)
         return "settled" if settled else ("unknown" if settled is None else "owed")
 
-    async def _redeliver_owed_attachments(self, key: str, answer_ref: str, source: Any, adapter: Any) -> None:
-        """Send the attachments the stored reply under *answer_ref* still owes (platforms/base.py,
-        redeliver_owed_attachments), on the bot that received the message."""
-        from gateway.delivery_ledger import InboundObligation, obligation_components
-        obligation_id = InboundObligation.to(key, answer_ref, source).obligation_id
+    async def _reactivate_expired_reply(self, obligation: Any) -> None:
+        """The stored reply's text spent its retry budget undelivered (``EXPIRED``): this start, a sign
+        the fault may have cleared, gives it one more send (delivery_ledger.reactivate_expired, bounded
+        by MAX_REACTIVATIONS, never for a dead chat). Refused, the record and the reply stay, reported."""
+        from gateway.delivery_ledger import EXPIRED, inbound_completion, reactivate_expired
+        state, reply_id = await asyncio.to_thread(inbound_completion, obligation)
+        if state != EXPIRED:
+            return
+        claimed = await asyncio.to_thread(reactivate_expired, reply_id)
+        if claimed is None:
+            logger.error("Stored reply %s spent its retry budget undelivered and is not reactivated (its bound is "
+                         "reached, its chat refused it for good, or another process holds it); its record and "
+                         "its text stay", reply_id)
+            return
+        await self._redeliver_claimed_obligations([claimed])
+
+    async def _redeliver_owed_attachments(self, obligation: Any, source: Any, adapter: Any) -> None:
+        """Send the attachments the stored reply of *obligation* (its answer, or the notice that ends its
+        message) still owes (platforms/base.py, redeliver_owed_attachments), on the bot that received
+        the message."""
+        from gateway.delivery_ledger import inbound_completion, obligation_components
+        _state, obligation_id = await asyncio.to_thread(inbound_completion, obligation)
+        if obligation_id is None:
+            return
         held = await asyncio.to_thread(obligation_components, obligation_id)
         if not any(c.get("kind") != "text" and c.get("state") != "delivered" for c in held):
             return
@@ -924,129 +948,135 @@ class GatewayStartupMixin:
         return owed
 
     async def _owe_stored_answer(self, record: dict) -> Tuple[str, Optional[str]]:
-        """What a stored message's reply owes, read from the delivery ledger first and from the
-        transcript only when the ledger holds nothing for it. The ledger state checked first is the
-        obligation of this input, the run its record admitted, and its destination
-        (delivery_ledger.inbound_obligation_id), never the reply text: ``("complete", ref)`` when every
-        component that reply requires reads back delivered (an answer or an error notice alike: only
-        the record and marker are left to clean up, the message is never run again);
-        ``("owed", ref)`` when that obligation exists but is incomplete (``_resume_stored_obligation``).
-        Only with nothing in the ledger, or only the reply of a run a restart cut short (an interruption
-        notice: that run did not end the message), is the transcript read: the user row that names the
-        record, and the run it answered, may name another obligation (a message folded into another),
-        which is checked the same way; otherwise its completed answer is owed now, its components
-        stored before anything is sent and its text owed as a crash-left reply, under that record and
-        run (``("owed", ref)``). ``("no_reply", None)`` when that answer presents nothing (a muted or silent
-        machinery reply), ``("unanswered", None)`` when there is no completed answer or no ledger can
-        owe it (the message runs again). Raises when the ledger or the transcript cannot be read or
-        written: a failed lookup never authorizes a run, and is never "no answer"."""
+        """What a stored message's reply owes, decided by the delivery ledger first
+        (delivery_ledger.inbound_completion, the one decision the settlement boundary reads too) and
+        by the transcript only when the ledger holds nothing for it. The decision checked first is that
+        of this input, the run its record admitted, and its destination, never the reply text:
+        ``("complete", ref)`` when the reply is delivered (only the record and marker are left to clean
+        up, the message is never run again); ``("owed", ref)`` when it is stored and still owed
+        (``_resume_stored_obligation``). Only with nothing in the ledger, or only the reply of a run a
+        restart cut short (``OPEN``: a notice, which never stands in for the answer, or a provisional
+        answer), is the transcript read: the user row that names the record, and the run it answered,
+        may name another obligation (a message folded into another), which is decided the same way.
+        Otherwise that run's completed answer is owed now under its answer obligation, its components
+        read from the answer as stored (its ``MEDIA:`` files and images are attachments, never stripped
+        to decide that there is no answer) and stored before anything is sent, its text owed as a
+        crash-left reply (``("owed", ref)``); a provisional answer of that run is confirmed as it.
+        ``("no_reply", None)`` when that answer presents nothing (a muted or silent machinery reply),
+        ``("unanswered", None)`` when there is no completed answer or no ledger can owe it (the message
+        runs again). Raises when the ledger or the transcript cannot be read or written: a failed lookup
+        never authorizes a run, and is never "no answer"."""
         from gateway import shutdown_flush
         from gateway.delivery_ledger import (
-            inbound_answer_ref, inbound_obligation_id, ledger_enabled, obligation_progress, record_components,
-            record_crash_left_reply)
+            OPEN, REPLY, REPLY_ANSWER, InboundObligation, confirm_answer, inbound_answer_ref, inbound_completion,
+            ledger_enabled, obligation_components, record_components, record_crash_left_reply)
         from hermes_cli.timefmt import coerce_epoch
         key, recovery_id = record["session_key"], record["recovery_id"]
         source = shutdown_flush.inbound_event_from_record(record).source
         platform = str(getattr(source.platform, "value", source.platform))
-
-        def obligation_of(answer_ref: str) -> str:
-            return inbound_obligation_id(key, answer_ref, platform=platform, chat_id=source.chat_id,
-                                         thread_id=source.thread_id)
         enabled = await asyncio.to_thread(ledger_enabled)
-        own_ref = inbound_answer_ref(recovery_id, shutdown_flush.inbound_record_run(record))
+        own = InboundObligation.to(key, inbound_answer_ref(recovery_id, shutdown_flush.inbound_record_run(record)),
+                                   source)
         if enabled:
-            progress = await asyncio.to_thread(obligation_progress, obligation_of(own_ref))
-            if progress not in (None, "cut_short"):
-                return await self._resume_stored_obligation(record, own_ref, obligation_of(own_ref), progress)
+            decision = await asyncio.to_thread(inbound_completion, own)
+            if decision[0] not in (None, OPEN):
+                return await self._resume_stored_obligation(record, own, decision)
         # Nothing in the ledger settles it (or only what a run a restart cut short still sent): the
         # transcript says whether the run answered.
         found = await self._inbound_record_answer(record)
         if found is None:
             return "unanswered", None
         history, asked_at, origin, answered_as, answered_run = found
-        answer_ref = inbound_answer_ref(answered_as, answered_run)
-        obligation_id = obligation_of(answer_ref)
-        if enabled and answer_ref != own_ref:
-            progress = await asyncio.to_thread(obligation_progress, obligation_id)
-            if progress not in (None, "cut_short"):
-                return await self._resume_stored_obligation(record, answer_ref, obligation_id, progress, found)
-        text = self._crash_left_reply(history, 0.0, origin)
-        if text is None:
+        answered = InboundObligation.to(key, inbound_answer_ref(answered_as, answered_run), source)
+        if enabled and answered != own:
+            decision = await asyncio.to_thread(inbound_completion, answered)
+            if decision[0] not in (None, OPEN):
+                return await self._resume_stored_obligation(record, answered, decision, found)
+        content = self._crash_left_reply(history, 0.0, origin, keep_media=True)
+        if content is None:
             return "unanswered", None
-        if not text:
+        if not content:
             return "no_reply", None
         if not enabled:
             return "unanswered", None  # nothing could owe the answer: the message runs again instead
-        parts = self._stored_answer_parts(history, origin, text, key)
-        await asyncio.to_thread(record_components, obligation_id, parts.components())
+        answer_id = answered.obligation_id
+        if await asyncio.to_thread(obligation_components, answer_id):
+            # What that run sent before a restart cut it short was its answer: the transcript holds it.
+            await asyncio.to_thread(confirm_answer, answer_id)
+            return await self._resume_stored_obligation(
+                record, answered, await asyncio.to_thread(inbound_completion, answered), found)
+        parts = self._stored_answer_parts(content, origin, key)
+        await asyncio.to_thread(record_components, answer_id,
+                                [{**part, REPLY: REPLY_ANSWER} for part in parts.components()])
         if parts.text_content:
             # Keyed by the answered record alone: another message answered with the same text is its own
             # delivery.
             await asyncio.to_thread(
-                record_crash_left_reply, obligation_id=obligation_id, session_key=key, platform=platform,
+                record_crash_left_reply, obligation_id=answer_id, session_key=key, platform=platform,
                 chat_id=source.chat_id, thread_id=source.thread_id, content=parts.text_content,
                 since=coerce_epoch(asked_at) or 0.0, adapter_profile=record.get("transport_profile"),
                 same_reply_dedupe=False)
         logger.info("Stored owner message %s on %s was answered before the restart; its answer is owed "
                     "through the delivery ledger", recovery_id, key)
-        return "owed", answer_ref
+        return "owed", answered.answer_ref
 
-    async def _resume_stored_obligation(self, record: dict, answer_ref: str, obligation_id: str, progress: str,
+    async def _resume_stored_obligation(self, record: dict, obligation: Any, decision: tuple,
                                         found: Any = None) -> Tuple[str, Optional[str]]:
-        """A stored message's reply already in the ledger (``obligation_progress``). Complete: nothing is
-        sent, the record and marker are only cleaned up. Incomplete: a text component that has no row
-        any more (the text's own ledger write failed) is owed again from the stored text, as a reply
-        that may already be on screen; attachments are sent later from their stored components. A row
-        that carries only the text, from before components were stored, is never taken as complete:
-        what else its reply required is read from the transcript answer of that very run and stored
-        beside the row; with no such answer it is kept and reported, never run again."""
+        """A stored message's reply already in the ledger, as ``inbound_completion`` decided it
+        (*decision*: its state and the obligation that holds the reply). COMPLETE: nothing is sent, the
+        record and marker are only cleaned up. OWED, MISSING or EXPIRED: a text component that has no row
+        any more (the text's own ledger write failed) is owed again from the stored text, as a reply that
+        may already be on screen; attachments, and an expired text's reactivation, follow in
+        ``_settle_stored_inbound``. A row that carries only the text, from before components were stored
+        (UNTRACKED), is never taken as complete: what else its reply required is read from the
+        transcript answer of that very run and stored beside the row; with no such answer it is kept
+        and reported, never run again."""
         from gateway import shutdown_flush
-        from gateway.delivery_ledger import obligation_components, record_components, record_crash_left_reply
-        if progress == "complete":
-            return "complete", answer_ref
+        from gateway.delivery_ledger import (
+            COMPLETE, REPLY, REPLY_ANSWER, UNTRACKED, InboundObligation, inbound_answer_ref, obligation_components,
+            record_components, record_crash_left_reply)
+        state, reply_id = decision
+        if state == COMPLETE:
+            return "complete", obligation.answer_ref
         key = record["session_key"]
         source = shutdown_flush.inbound_event_from_record(record).source
         platform = str(getattr(source.platform, "value", source.platform))
-        if progress == "untracked":
+        if state == UNTRACKED:
             found = found if found is not None else await self._inbound_record_answer(record)
-            from gateway.delivery_ledger import inbound_answer_ref
-            text = None
-            if found is not None and inbound_answer_ref(found[3], found[4]) == answer_ref:
-                text = self._crash_left_reply(found[0], 0.0, found[2])
-            if not text:
+            content = None
+            if found is not None and InboundObligation.to(
+                    key, inbound_answer_ref(found[3], found[4]), source) == obligation:
+                content = self._crash_left_reply(found[0], 0.0, found[2], keep_media=True)
+            if not content:
                 logger.error("Stored owner message %s on %s: the ledger holds a reply for it without the "
                              "components that reply requires, and its transcript has no answer to read them "
                              "from; its record is kept and it is not run again", record["recovery_id"], key)
-                return "owed", answer_ref
-            parts = self._stored_answer_parts(found[0], found[2], text, key)
-            components = parts.components()
+                return "owed", obligation.answer_ref
+            parts = self._stored_answer_parts(content, found[2], key)
+            components = [{**part, REPLY: REPLY_ANSWER} for part in parts.components()]
             if not any(part["kind"] == "text" for part in components):
-                components.insert(0, {"id": "text", "kind": "text", "text": text})
-            await asyncio.to_thread(record_components, obligation_id, components)
-            return "owed", answer_ref
-        for part in await asyncio.to_thread(obligation_components, obligation_id):
+                components.insert(0, {"id": "text", "kind": "text", "text": content, REPLY: REPLY_ANSWER})
+            await asyncio.to_thread(record_components, reply_id, components)
+            return "owed", obligation.answer_ref
+        for part in await asyncio.to_thread(obligation_components, reply_id):
             if part.get("kind") == "text" and part.get("state") != "delivered" and part.get("text"):
                 await asyncio.to_thread(
-                    record_crash_left_reply, obligation_id=obligation_id, session_key=key, platform=platform,
+                    record_crash_left_reply, obligation_id=reply_id, session_key=key, platform=platform,
                     chat_id=source.chat_id, thread_id=source.thread_id, content=part["text"], since=0.0,
                     adapter_profile=record.get("transport_profile"), same_reply_dedupe=False)
-        return "owed", answer_ref
+        return "owed", obligation.answer_ref
 
-    def _stored_answer_parts(self, history: list, origin: Any, text: str, key: str):
-        """The components of a stored answer as the adapter's final would deliver it (platforms/base.py,
-        extract_reply_parts) of the reply's own stored content, so its MEDIA: files and images are owed
-        as attachments, not shown as text. A silence marker's notice is text only."""
-        from gateway.response_filters import is_intentional_silence_response
-        from gateway.run import _sanitize_gateway_final_response
-        visible = [m for m in history if m.get("role") not in ("session_meta", "system")]
-        raw = str((visible[-1] if visible else {}).get("content") or "")
-        raw = text if is_intentional_silence_response(raw) else _sanitize_gateway_final_response(origin.platform, raw)
+    def _stored_answer_parts(self, content: str, origin: Any, key: str):
+        """The components of a stored answer's presented content (``_crash_left_reply`` with its media
+        kept) as the adapter's final would deliver it (platforms/base.py, extract_reply_parts), so its
+        MEDIA: files and images are owed as attachments, not shown as text, and one whose file is gone
+        is still owed. A silence marker's notice is text only."""
         try:
             scope = self._media_delivery_scope_for_source(origin)
         except Exception:
             scope = nullcontext()
         with scope:
-            return BasePlatformAdapter.extract_reply_parts(raw, session_key=key)
+            return BasePlatformAdapter.extract_reply_parts(content, session_key=key)
 
     async def _inbound_record_answer(self, record: dict):
         """``(history up to the answer, asked-at timestamp, origin, answered record id, its run)`` when
@@ -1363,11 +1393,13 @@ class GatewayStartupMixin:
                 ledgered += 1
         return ledgered
 
-    def _crash_left_reply(self, history: list, started: float, origin) -> Optional[str]:
+    def _crash_left_reply(self, history: list, started: float, origin, *, keep_media: bool = False) -> Optional[str]:
         """What a crash-left turn owes, judged as live delivery would have: ``None`` when it never
         persisted a final reply after *started*; ``""`` when nothing would have been presented (a
         silence marker on a machinery turn, a muted diagnostic wake); else the text to send, with a
-        human turn's bare silence marker replaced by the same notice the live path sends."""
+        human turn's bare silence marker replaced by the same notice the live path sends. With
+        ``keep_media`` the reply as stored, its ``MEDIA:`` directives in place: an answer that is only
+        an attachment is still an answer (its components are read from it, ``_stored_answer_parts``)."""
         from gateway.platforms.base import _strip_media_directives
         from gateway.response_filters import is_intentional_silence_response, is_machinery_display_kind
         from gateway.run import _sanitize_gateway_final_response
@@ -1392,7 +1424,8 @@ class GatewayStartupMixin:
                     return ""
         if is_intentional_silence_response(last["content"]):
             return "" if machinery else _UNEXPECTED_SILENCE_REPLY
-        return _strip_media_directives(_sanitize_gateway_final_response(origin.platform, last["content"])).strip() or None
+        presented = _sanitize_gateway_final_response(origin.platform, last["content"])
+        return (presented if keep_media else _strip_media_directives(presented)).strip() or None
 
     @staticmethod
     def _start_hosted_room_worker_sync():

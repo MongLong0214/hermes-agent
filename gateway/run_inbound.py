@@ -1453,6 +1453,7 @@ class GatewayInboundMixin:
         event._inbound_run = getattr(_settled_event, "_inbound_run", 0)
         event._inbound_answer_ref = event._inbound_row_ref = (
             inbound_answer_ref(event._inbound_row_id, event._inbound_run) if event._inbound_row_id else None)
+        event._inbound_reply_kind = None  # the run's answer unless the turn says its reply is a notice
 
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:
@@ -1505,6 +1506,9 @@ class GatewayInboundMixin:
                 # and marker go only once that obligation reads back delivered (platforms/base.py,
                 # _release_turn_marker, through _settle_inbound).
                 _incoming._inbound_ledger_ref = getattr(event, "_inbound_answer_ref", None)
+                # Whether that reply is the run's answer or a notice sent instead (run_turn.py): each is
+                # owed under its own obligation (delivery_ledger.REPLY).
+                _incoming._inbound_reply_kind = getattr(event, "_inbound_reply_kind", None)
                 if event is not _incoming:
                     _incoming._inbound_outcome = getattr(event, "_inbound_outcome", None)
                     _incoming._inbound_streamed_sent = getattr(event, "_inbound_streamed_sent", False)
@@ -1622,11 +1626,13 @@ class GatewayInboundMixin:
     def _inbound_release_proven(self, proof: Any) -> Optional[bool]:
         """True when *proof* allows releasing the records it settles; False when it does not; None when
         the ledger could not be read (never taken as either). *proof* is an explicit end
-        (``INBOUND_NO_REPLY``, ``INBOUND_DROPPED``) or a ``delivery_ledger.InboundObligation``: every
-        component of its reply must read back delivered (``obligation_complete``). With the delivery
-        ledger off nothing can be read back, so this process's own sends of every component of the
-        reply (``sent``) are the proof."""
-        from gateway.delivery_ledger import InboundObligation, ledger_enabled, obligation_complete
+        (``INBOUND_NO_REPLY``, ``INBOUND_DROPPED``) or a ``delivery_ledger.InboundObligation``, decided
+        by ``delivery_ledger.inbound_completion`` alone: only ``COMPLETE`` releases (every component of
+        the run's answer, or of the notice that terminated the message, delivered; never a notice a
+        restart cut short, a missing attachment or an expired text). With the delivery ledger off
+        nothing can be read back, so this process's own sends of every component of the reply
+        (``sent``) are the proof."""
+        from gateway.delivery_ledger import COMPLETE, InboundObligation, inbound_completion, ledger_enabled
         if isinstance(proof, str) and proof in (INBOUND_NO_REPLY, INBOUND_DROPPED):
             return True
         if not isinstance(proof, InboundObligation):
@@ -1634,7 +1640,7 @@ class GatewayInboundMixin:
         try:
             if not ledger_enabled():
                 return bool(proof.sent)
-            return obligation_complete(proof.obligation_id)
+            return inbound_completion(proof)[0] == COMPLETE
         except Exception:
             logger.warning("Reading the delivery obligation of an inbound record failed; the record stays",
                            exc_info=True)

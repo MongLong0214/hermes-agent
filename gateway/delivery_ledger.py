@@ -7,7 +7,9 @@ only on SendResult.success | mark_failed() 'failed' on a definitive rejection. C
 = crashed mid-await, platform MAY have it, redeliver WITH a visible recovered marker; failed =
 rejected once, restart is a retry boundary, also marked; delivered = prune. Attempts are capped
 and stale rows expire, both -> 'abandoned' (kept briefly, then pruned). Everything is
-best-effort: ledger failures must never block a send; callers wrap every call in try/except.
+best-effort: ledger failures must never block a send; callers wrap every call in try/except. The
+one exception is an owner message's reply: it is sent only once what it requires is stored
+(record_components, ReplyNotStored), and its delivery is decided by inbound_completion.
 """
 
 from __future__ import annotations
@@ -224,9 +226,14 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         # the same UPDATE that marks the row delivered: an /acp receipt's delivery evidence.
         add_column_if_missing(conn, "delivery_obligations", "delivered_message_ids",
                               "delivered_message_ids TEXT")
+    if "reactivations" not in columns:
+        # How often a later start gave an owner message's reply another send after its retry budget was
+        # spent (reactivate_expired); bounded by MAX_REACTIVATIONS.
+        add_column_if_missing(conn, "delivery_obligations", "reactivations",
+                              "reactivations INTEGER NOT NULL DEFAULT 0")
     # The components an owner message's reply requires (record_components): its text, whose delivery is
     # the delivery_obligations row of the same id (mirrored here), and each attachment, which no row
-    # carries. A reply is delivered only when every one of them is (obligation_complete).
+    # carries. A reply is delivered only when every one of them is (inbound_completion).
     conn.execute(
         """CREATE TABLE IF NOT EXISTS delivery_components (
             obligation_id TEXT NOT NULL,
@@ -308,24 +315,36 @@ def inbound_answer_ref(recovery_id: str, run: Any = 0) -> str:
     return f"{recovery_id}#{run}" if isinstance(run, int) and run > 0 else str(recovery_id)
 
 
+# What a reply is to the owner message it goes to (``REPLY`` on each of its stored components). An answer
+# is the run's answer. A notice is what a run sends instead of one (an error or interruption notice): it has
+# an obligation of its own, so it never stands in for the answer of the same message and run. A notice
+# *terminates* the message when the run that sent it ended (delivered, the message owes nothing more); one
+# whose run a restart cut short (``CUT_SHORT``) is *superseded*: the message stays owed until the answer
+# its transcript holds, or a rerun's reply, is delivered, and the notice's obligation is kept as history.
+REPLY = "reply"
+REPLY_ANSWER = "answer"
+REPLY_NOTICE = "notice"
+
+
 def inbound_obligation_id(session_key: str, answer_ref: str, *, platform: str, chat_id: Any,
-                          thread_id: Any) -> str:
+                          thread_id: Any, kind: str = REPLY_ANSWER) -> str:
     """Id of the reply owed to the owner message whose inbound record (gateway/shutdown_flush.py) and
-    run *answer_ref* names (``inbound_answer_ref``): that and where the reply goes, never the reply's
-    text. Normal delivery (platforms/base.py, _record_delivery_obligation) and startup recovery of an
-    answered record (gateway/run_startup.py, _owe_stored_answer) agree on it even when the delivered
-    text is not the transcript's (a runtime footer added at delivery), and two records answered alike
-    stay two."""
-    return compute_obligation_id(session_key, f"inbound:{answer_ref}|{platform}|{chat_id}|{thread_id or ''}", "")
+    run *answer_ref* names (``inbound_answer_ref``): that, where the reply goes and what it is (*kind*:
+    the answer, or a notice sent instead of it), never the reply's text. Normal delivery (platforms/
+    base.py, _record_delivery_obligation) and startup recovery of an answered record (gateway/
+    run_startup.py, _owe_stored_answer) agree on it even when the delivered text is not the transcript's
+    (a runtime footer added at delivery), and two records answered alike stay two."""
+    ref = f"inbound:{answer_ref}|{platform}|{chat_id}|{thread_id or ''}"
+    return compute_obligation_id(session_key, ref if kind == REPLY_ANSWER else f"{ref}|{kind}", "")
 
 
 @dataclasses.dataclass(frozen=True)
 class InboundObligation:
-    """The reply one run of one owner message owes one destination (``inbound_obligation_id``): the proof
-    the settlement boundary reads back before it deletes the message's inbound record (gateway/
-    run_inbound.py, _settle_inbound_records), through ``obligation_complete``: every component the reply
-    requires (record_components) reads back delivered. ``sent``: every component of the reply was sent
-    successfully here, the only proof there is with the ledger off."""
+    """What one run of one owner message owes one destination: its answer, or a notice the run sent
+    instead (each under its own ``inbound_obligation_id``). The settlement boundary (gateway/
+    run_inbound.py, _settle_inbound_records) and startup recovery read both through one decision,
+    ``inbound_completion``. ``sent``: every component of the reply was sent successfully here, the only
+    proof there is with the ledger off."""
     session_key: str
     answer_ref: str
     platform: str
@@ -338,10 +357,15 @@ class InboundObligation:
         return cls(session_key, str(answer_ref), str(getattr(source.platform, "value", source.platform)),
                    source.chat_id, getattr(source, "thread_id", None), **outcome)
 
+    def reply_id(self, kind: Optional[str] = REPLY_ANSWER) -> str:
+        """The obligation id of this run's reply of *kind* (``REPLY_ANSWER`` or ``REPLY_NOTICE``)."""
+        return inbound_obligation_id(self.session_key, self.answer_ref, platform=self.platform,
+                                     chat_id=self.chat_id, thread_id=self.thread_id, kind=kind or REPLY_ANSWER)
+
     @property
     def obligation_id(self) -> str:
-        return inbound_obligation_id(self.session_key, self.answer_ref, platform=self.platform,
-                                     chat_id=self.chat_id, thread_id=self.thread_id)
+        """The answer's obligation id."""
+        return self.reply_id(REPLY_ANSWER)
 
 
 def obligation_state(obligation_id: str) -> Optional[str]:
@@ -357,10 +381,22 @@ def obligation_state(obligation_id: str) -> Optional[str]:
 # A component's states: ``pending`` (not sent yet), ``failed`` (a send was refused), ``missing`` (its source
 # was gone when a later start went to send it), ``delivered``. Only ``delivered`` is ever final.
 COMPONENT_DELIVERED = "delivered"
+COMPONENT_MISSING = "missing"
 # Payload flag of every component of a reply sent by a run that did not end its message (a restart cut it
-# short and its record stays for the next process): such a reply, an interruption notice, never settles
-# the message by itself (obligation_progress).
+# short and its record stays for the next process): such a reply never settles the message by itself
+# (inbound_completion). A notice of such a run is superseded; an answer is provisional until the next start
+# finds the run's completed answer in its transcript (confirm_answer).
 CUT_SHORT = "run_cut_short"
+
+# The answers of inbound_completion, the one decision on whether an owner message's reply is delivered.
+COMPLETE = "complete"    # every component of the reply delivered: the record and marker may go
+OWED = "owed"            # stored and not yet delivered: a component pending or refused, within its retries
+MISSING = "missing"      # a required attachment's source is gone: blocks completion and deletion
+EXPIRED = "expired"      # the text's retry budget is spent (abandoned, attempts cap, stale) undelivered
+OPEN = "open"            # only a reply of a run a restart cut short: the transcript decides what is owed
+UNTRACKED = "untracked"  # a text row without components (written before components were): never complete
+# How many later starts may each give an expired reply one more send (reactivate_expired).
+MAX_REACTIVATIONS = 3
 
 
 def _components_unlocked(conn, obligation_id: str) -> List[Dict[str, Any]]:
@@ -397,6 +433,12 @@ def record_components(obligation_id: str, components: List[Dict[str, Any]]) -> L
         return _components_unlocked(conn, obligation_id)
 
 
+class ReplyNotStored(RuntimeError):
+    """What an owner message's reply requires could not be stored (``record_components`` failed). Nothing
+    of the reply may then be sent: an untracked send can neither prove the reply delivered nor stop a
+    later start sending it again. The message's record and the reply's source (its transcript) stay."""
+
+
 def obligation_components(obligation_id: str) -> List[Dict[str, Any]]:
     """The components stored for *obligation_id* (``record_components``) with their states; ``[]`` when
     none were. Raises when the ledger cannot be read."""
@@ -421,28 +463,104 @@ def mark_components(obligation_id: str, outcomes: Dict[str, str]) -> List[str]:
     return changed
 
 
-def obligation_complete(obligation_id: str) -> bool:
-    """True only when the reply's components were stored and every one reads back delivered. No stored
-    components (an older row that carries only text, or nothing at all) is never complete. Raises when
+def _retry_spent(attempts: Any, created_at: Any, now: float) -> bool:
+    """A row's redelivery budget is spent: the attempts cap, or the stale cutoff. The sweeps abandon such a
+    row; for an owner message's reply that is not the end (inbound_completion, reactivate_expired)."""
+    return int(attempts or 0) >= MAX_ATTEMPTS or (now - float(created_at or 0.0)) > STALE_AFTER_SECONDS
+
+
+def _text_expired_unlocked(conn, obligation_id: str, now: float) -> bool:
+    row = conn.execute("SELECT state, attempts, created_at FROM delivery_obligations WHERE obligation_id=?",
+                       (obligation_id,)).fetchone()
+    return row is not None and (row[0] == "abandoned" or (row[0] != "delivered" and _retry_spent(row[1], row[2], now)))
+
+
+def inbound_completion(obligation: InboundObligation, *, now: Optional[float] = None
+                       ) -> "tuple[Optional[str], Optional[str]]":
+    """The one decision on an owner message's reply, for one run and destination: ``(state, id)``, where
+    *id* is the obligation the reply was decided on, its answer's when one is stored, else its notice's.
+    Every caller reads it: the settlement boundary (gateway/run_inbound.py, _inbound_release_proven),
+    which releases only on ``COMPLETE``, and startup recovery (gateway/run_startup.py, _owe_stored_answer).
+
+    It weighs what the reply is (``REPLY``), what each component's state is, and the text's retry state:
+    ``OPEN`` when the reply was sent by a run a restart cut short (``CUT_SHORT``: a superseded notice or a
+    provisional answer, never completion by itself); ``COMPLETE`` when every component is delivered (an
+    answer, or with no answer stored a notice that terminated the message); else ``EXPIRED`` when the
+    undelivered text's retry budget is spent, ``MISSING`` when an attachment's source is gone, ``OWED``
+    otherwise. ``UNTRACKED`` for a text row without components, ``(None, None)`` for nothing. Raises when
     the ledger cannot be read: a failed read is never an answer."""
-    components = obligation_components(obligation_id)
-    return bool(components) and all(c["state"] == COMPONENT_DELIVERED for c in components)
-
-
-def obligation_progress(obligation_id: str) -> Optional[str]:
-    """What the ledger holds for *obligation_id*: ``complete`` (every stored component delivered),
-    ``incomplete`` (components stored, one not delivered), ``cut_short`` (the components of a reply a
-    run sent after a restart cut it short: whether that run answered is not the ledger's to say),
-    ``untracked`` (a text row with no stored components, written before components were: never taken
-    as complete), or None (nothing at all). Raises when the ledger cannot be read."""
+    now = time.time() if now is None else now
     with _DB_LOCK, _transaction() as conn:
-        components = _components_unlocked(conn, obligation_id)
-        if any(c.get(CUT_SHORT) for c in components):
-            return "cut_short"
-        if components:
-            return "complete" if all(c["state"] == COMPONENT_DELIVERED for c in components) else "incomplete"
-        row = conn.execute("SELECT 1 FROM delivery_obligations WHERE obligation_id=?", (obligation_id,)).fetchone()
-    return None if row is None else "untracked"
+        for reply_id in (obligation.reply_id(REPLY_ANSWER), obligation.reply_id(REPLY_NOTICE)):
+            parts = _components_unlocked(conn, reply_id)
+            if parts:
+                break
+        else:
+            answer_id = obligation.reply_id(REPLY_ANSWER)
+            row = conn.execute("SELECT 1 FROM delivery_obligations WHERE obligation_id=?", (answer_id,)).fetchone()
+            return (UNTRACKED, answer_id) if row is not None else (None, None)
+        if any(part.get(CUT_SHORT) for part in parts):
+            return OPEN, reply_id
+        owed = [part for part in parts if part["state"] != COMPONENT_DELIVERED]
+        if not owed:
+            return COMPLETE, reply_id
+        if any(part["kind"] == "text" for part in owed) and _text_expired_unlocked(conn, reply_id, now):
+            return EXPIRED, reply_id
+        if any(part["state"] == COMPONENT_MISSING for part in owed):
+            return MISSING, reply_id
+        return OWED, reply_id
+
+
+def confirm_answer(obligation_id: str) -> None:
+    """The transcript holds the completed answer of the run whose provisional answer (a reply a restart
+    cut short, ``CUT_SHORT``) is stored under *obligation_id*: that reply carried it, so it is the run's
+    answer from now on and settles the message once delivered. A notice is never confirmed."""
+    import json as _json
+    with _DB_LOCK, _transaction() as conn:
+        for part in _components_unlocked(conn, obligation_id):
+            if part.get(CUT_SHORT) and part.get(REPLY, REPLY_ANSWER) == REPLY_ANSWER:
+                payload = {k: v for k, v in part.items() if k not in ("id", "kind", "state", CUT_SHORT)}
+                conn.execute("UPDATE delivery_components SET payload=? WHERE obligation_id=? AND component_id=?",
+                             (_json.dumps(payload, sort_keys=True), obligation_id, part["id"]))
+
+
+def reactivate_expired(obligation_id: str, *, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """Bounded reactivation of an owner message's reply whose text spent its retry budget undelivered
+    (``EXPIRED``): called by a later start, the signal that the fault may have cleared, while the message's
+    record still owes the reply. The row is claimed for exactly one send by this process (``attempting``,
+    attempts + 1, the duplicate marker) and its ``reactivations`` count goes up; the caller sends it like a
+    boot claim. Never for a row that is not expired, belongs to a managed /acp answer, is held by a live
+    process, whose target refused it for good (a dead chat: send-forbidden), or that was reactivated
+    ``MAX_REACTIVATIONS`` times already: those stay as they are, with the record. Returns the claimed row,
+    or None."""
+    now = time.time() if now is None else now
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
+                      owner_pid, owner_started_at, adapter_profile, last_error, reactivations
+               FROM delivery_obligations WHERE obligation_id=? AND acp_update_id IS NULL""",
+            (obligation_id,)).fetchone()
+        if row is None or not _text_expired_unlocked(conn, obligation_id, now):
+            return None
+        (session_key, platform, chat_id, thread_id, content, state, attempts, _created, owner_pid, owner_started,
+         profile, last_error, reactivations) = row
+        if (int(reactivations or 0) >= MAX_REACTIVATIONS or classify_dead_error(str(last_error or ""))
+                or (state != "abandoned" and _owner_alive(owner_pid, owner_started))):
+            return None
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state='attempting', attempts=attempts+1, updated_at=?, owner_pid=?, owner_started_at=?,
+                   adapter_profile=COALESCE(adapter_profile, 'default'), last_error=NULL,
+                   reactivations=reactivations+1
+               WHERE obligation_id=? AND state=? AND attempts=?""",
+            (now, pid, started, obligation_id, state, attempts))
+        if not cursor.rowcount:
+            return None
+    logger.warning("delivery obligation %s to %s:%s spent its retry budget undelivered; reactivated for one more "
+                   "send (%d of %d)", obligation_id, platform, chat_id, int(reactivations or 0) + 1, MAX_REACTIVATIONS)
+    return _claimed_row(obligation_id, session_key, platform, chat_id, thread_id, content, attempts,
+                        profile or "default", needs_marker=True, last_error=last_error)
 
 
 def _mirror_text_delivered(conn, obligation_id: str, now: float) -> None:
@@ -654,7 +772,7 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
              owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
-            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
+            if _retry_spent(attempts, created_at, now):  # exhausted -> abandoned
                 conn.execute(
                     """UPDATE delivery_obligations
                        SET state='abandoned', updated_at=? WHERE obligation_id=?""", (now, oid))
@@ -736,7 +854,7 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
             if due is None:
                 continue
             owner_guard = (now, oid, owner_pid, owner_started_at)
-            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
+            if _retry_spent(attempts, created_at, now):  # exhausted -> abandoned
                 if conn.execute(
                         """UPDATE delivery_obligations
                            SET state='abandoned', updated_at=?
@@ -784,7 +902,7 @@ def pending_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
         if is_reconnect_only(last_error):
             continue
         due = retry_not_before(updated_at, last_error, attempts)
-        if due is None or attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
+        if due is None or _retry_spent(attempts, created_at, now):
             continue
         key = (platform, adapter_profile or "default")
         if key not in earliest or due < earliest[key]:
@@ -793,14 +911,20 @@ def pending_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
             for (platform, profile), due in sorted(earliest.items())]
 
 
+_NOT_OWED = """NOT EXISTS (SELECT 1 FROM delivery_components c
+                        WHERE c.obligation_id = delivery_obligations.obligation_id AND c.state != 'delivered')"""
+
+
 def _prune_unlocked(conn, now: float) -> None:
     """Retention DELETEs on the caller's open connection — must run inside the caller's transaction."""
     # An /acp answer row is the evidence its receipt settles from (and the startup sweep reads before
-    # declaring a death before answer), so it outlives the ordinary retention and the row cap.
+    # declaring a death before answer), so it outlives the ordinary retention and the row cap. The row of a
+    # reply whose components are still owed is kept too (abandoned or not): it is that reply's retry state
+    # and its source, which a later start reactivates (reactivate_expired).
     conn.execute(
-        """DELETE FROM delivery_obligations
+        f"""DELETE FROM delivery_obligations
            WHERE state IN ('delivered', 'abandoned') AND updated_at < ?
-             AND (acp_update_id IS NULL OR updated_at < ?)""",
+             AND (acp_update_id IS NULL OR updated_at < ?) AND {_NOT_OWED}""",
         (now - _RETENTION_SECONDS, now - _ACP_RETENTION_SECONDS))
     # A reply's components go together, once every one has been delivered for the retention period; one
     # still owed keeps them all.
@@ -811,8 +935,8 @@ def _prune_unlocked(conn, now: float) -> None:
     total = conn.execute("SELECT COUNT(*) FROM delivery_obligations WHERE acp_update_id IS NULL").fetchone()[0]
     if total > _MAX_ROWS:
         conn.execute(
-            """DELETE FROM delivery_obligations WHERE obligation_id IN (
-                 SELECT obligation_id FROM delivery_obligations WHERE acp_update_id IS NULL
+            f"""DELETE FROM delivery_obligations WHERE obligation_id IN (
+                 SELECT obligation_id FROM delivery_obligations WHERE acp_update_id IS NULL AND {_NOT_OWED}
                  ORDER BY CASE state
                             WHEN 'delivered' THEN 0
                             WHEN 'abandoned' THEN 1

@@ -191,6 +191,17 @@ def _inbound_owes_nothing(event: Any) -> None:
         event._inbound_outcome = INBOUND_NO_REPLY
 
 
+def _inbound_reply_kind(agent_result: Any, failed_early: bool = False) -> str:
+    """What the turn's reply is to its owner message (delivery_ledger.REPLY): the run's answer, or a
+    notice when the run produced none (it failed, was interrupted, or stopped part-way). Each is owed
+    under its own obligation, so a notice never stands in for an answer the transcript holds."""
+    from gateway.delivery_ledger import REPLY_ANSWER, REPLY_NOTICE
+    if failed_early or not isinstance(agent_result, dict) or any(
+            agent_result.get(key) for key in ("failed", "interrupted", "partial")):
+        return REPLY_NOTICE
+    return REPLY_ANSWER
+
+
 def _owes_tracked_reply(adapter: Any, answer_ref: Optional[str]) -> bool:
     """The reply is an owner message's (it has an answer reference) and goes out through an adapter
     that tracks its components (platforms/base.py, owe_explicit_reply)."""
@@ -2095,6 +2106,8 @@ class GatewayTurnMixin:
             # A queued chain raised past an answer it had already sent: the notice is owed under the
             # follow-up it failed on ("" when that follow-up has no record: owed under none).
             event._inbound_answer_ref = e._inbound_answer_ref or None
+        # This reply is a notice, never the run's answer, even when the agent had already stored one.
+        event._inbound_reply_kind = _inbound_reply_kind(None)
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)
@@ -2503,6 +2516,7 @@ class GatewayTurnMixin:
             agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure = (
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
             )
+            event._inbound_reply_kind = _inbound_reply_kind(agent_result, agent_failed_early)
             if not self._acp_is_model_answer(agent_result, self._acp_final_send_text):
                 # No model answer (failure, timeout, overflow, interruption, empty or silent reply):
                 # what goes out is a notice, not the managed task's answer.
@@ -4113,36 +4127,42 @@ class GatewayTurnMixin:
                     first_response if _already_streamed
                     else _strip_response_attachments_for_direct_send(first_response, adapter),
                     first_response, attachments=_deliver_media)
-            try:
-                _text_delivered = await self._deliver_queued_first_response(
-                    first_response, source=turn_ctx.source, adapter=adapter,
-                    metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
-                    text_already_delivered=_already_streamed,
-                    deliver_media=_deliver_media and _owed is None, stream_consumer=_sc,
-                    # The text send records a delivery-ledger obligation under this key, keyed on
-                    # the raw inbound id (the anchor above is only the reply target).
-                    session_key=session_key,
-                    inbound_message_id=f"inbound:{_row_ref}" if _row_ref else turn_ctx.inbound_message_id,
-                    acp_admission=await self._acp_first_response_admission(turn_ctx, _delivery_result),
-                )
-            except Exception as e:
-                logger.warning("Failed to send first response before queued message: %s", e)
+            if _owed is not None and _owed.withheld:
+                # Its components could not be stored: nothing of it is sent (delivery_ledger.
+                # ReplyNotStored). The message's record stays, and the next start owes it from its transcript.
+                logger.warning("Queued follow-up for session %s: the first response was not stored, so it is "
+                               "not sent", session_key or "?")
             else:
-                # One source of truth for "this turn's final already reached the chat": the normal
-                # completion path (`_hmwa_deliver_turn_response`) consults ``already_sent`` on the
-                # result the queued lane hands back. Every early `return result` after this point
-                # (follow-up text refused, stale goal continuation) otherwise re-sends the text the
-                # fallback just delivered — the #81052 duplicate. A REFUSED send reports False, and
-                # the completion send stays the fallback so the user is not left with nothing.
-                if _owed is not None:
-                    # A refused text sends nothing more: the uploads stay owed with it.
-                    _owed_delivered = await _owed.finish(text_delivered=_text_delivered,
-                                                         metadata=turn_ctx._status_thread_metadata)
-                if _text_delivered and isinstance(result, dict):
-                    result["already_sent"] = True
-                    # The queued lane already uploaded this response's MEDIA: attachments; without
-                    # this the completion path's already_sent rescan uploads every file twice.
-                    result["media_already_delivered"] = _deliver_media
+                try:
+                    _text_delivered = await self._deliver_queued_first_response(
+                        first_response, source=turn_ctx.source, adapter=adapter,
+                        metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
+                        text_already_delivered=_already_streamed,
+                        deliver_media=_deliver_media and _owed is None, stream_consumer=_sc,
+                        # The text send records a delivery-ledger obligation under this key, keyed on
+                        # the raw inbound id (the anchor above is only the reply target).
+                        session_key=session_key,
+                        inbound_message_id=f"inbound:{_row_ref}" if _row_ref else turn_ctx.inbound_message_id,
+                        acp_admission=await self._acp_first_response_admission(turn_ctx, _delivery_result),
+                    )
+                except Exception as e:
+                    logger.warning("Failed to send first response before queued message: %s", e)
+                else:
+                    # One source of truth for "this turn's final already reached the chat": the normal
+                    # completion path (`_hmwa_deliver_turn_response`) consults ``already_sent`` on the
+                    # result the queued lane hands back. Every early `return result` after this point
+                    # (follow-up text refused, stale goal continuation) otherwise re-sends the text the
+                    # fallback just delivered — the #81052 duplicate. A REFUSED send reports False, and
+                    # the completion send stays the fallback so the user is not left with nothing.
+                    if _owed is not None:
+                        # A refused text sends nothing more: the uploads stay owed with it.
+                        _owed_delivered = await _owed.finish(text_delivered=_text_delivered,
+                                                             metadata=turn_ctx._status_thread_metadata)
+                    if _text_delivered and isinstance(result, dict):
+                        result["already_sent"] = True
+                        # The queued lane already uploaded this response's MEDIA: attachments; without
+                        # this the completion path's already_sent rescan uploads every file twice.
+                        result["media_already_delivered"] = _deliver_media
         # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
         _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
         if callable(_bg_cb):
