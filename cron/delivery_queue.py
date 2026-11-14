@@ -34,6 +34,8 @@ _ACTIVE_DELIVERIES: set[str] = set()
 _TERMINAL = ("delivered", "failed", "unknown", "suppressed")
 MAX_TERMINAL_DELIVERIES = 1000
 DEFAULT_DELIVERY_WAIT_TIMEOUT_SECONDS = 300.0
+# Row error of a send that began and never confirmed; any partial error follows after "; ".
+UNCERTAIN_SEND_ERROR = "send began but was not confirmed; outcome is unknown and was not retried"
 
 
 def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
@@ -254,13 +256,20 @@ def claim_next() -> Optional[dict]:
     return result
 
 
-def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False) -> bool:
-    status = "failed" if error else "suppressed" if suppressed else "delivered"
+def _finish(
+    execution_id: str, *, error: Optional[str], suppressed: bool = False, uncertain: bool = False,
+) -> bool:
+    # ``uncertain``: a send began and never confirmed. It is not resent, so it is neither delivered
+    # nor failed: the same ``unknown`` a gateway that died mid-send leaves. It outranks a partial
+    # error (skipped media, another target), which is kept after the fixed prefix.
+    status = "unknown" if uncertain else "failed" if error else "suppressed" if suppressed else "delivered"
     safe_error = (
         redact_sensitive_text(str(error), force=True, redact_url_credentials=True)
         if error
         else None
     )
+    if uncertain:
+        safe_error = UNCERTAIN_SEND_ERROR + (f"; {safe_error}" if safe_error else "")
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE deliveries SET status=?, finished_at=?, error=?
@@ -345,7 +354,8 @@ def drain(
             except BaseException as exc:
                 error = f"{type(exc).__name__}: {exc}"
             if _finish(row["execution_id"], error=error,
-                       suppressed=bool(row["job"].get("_notification_all_targets_suppressed"))):
+                       suppressed=bool(row["job"].get("_notification_all_targets_suppressed")),
+                       uncertain=bool(row["job"].get("_delivery_uncertain"))):
                 from cron.delivery_outcome import settle_quietly
 
                 settle_quietly(row["job"].get("id"), row["execution_id"])

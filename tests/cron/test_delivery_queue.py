@@ -234,3 +234,83 @@ def test_same_gateway_recovers_terminalization_failure_without_resending(
     status = queue.get_status("exec-4")
     assert status["status"] == "unknown"
     assert "not retried" in status["error"]
+
+
+def _uncertain_send(error=None):
+    """A gateway send whose live attempt began and never confirmed (``_deliver_result`` flags it)."""
+    def send(job, content, for_failure):
+        job["_delivery_uncertain"] = ["telegram:123"]
+        return error
+
+    return Mock(side_effect=send)
+
+
+def test_send_that_began_unconfirmed_ends_unknown_and_is_never_replayed(tmp_path, monkeypatch):
+    import cron.delivery_queue as queue
+
+    monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "deliveries.db")
+    queue.enqueue("exec-u", {"id": "job-u"}, "brief")
+    send = _uncertain_send()
+
+    assert queue.drain(send) == 1
+    assert queue.drain(send) == 0
+    send.assert_called_once()
+    status = queue.get_status("exec-u")
+    assert status["status"] == "unknown", status
+    assert status["error"] == queue.UNCERTAIN_SEND_ERROR
+    # A worker waiting on the row reads the same terminal outcome, never a resend.
+    assert queue.enqueue_and_wait("exec-u", {"id": "job-u"}, "brief", timeout=0) == \
+        queue.UNCERTAIN_SEND_ERROR
+    send.assert_called_once()
+
+
+def test_uncertain_send_keeps_its_partial_error_redacted_behind_the_fixed_prefix(
+    tmp_path, monkeypatch
+):
+    import cron.delivery_queue as queue
+
+    monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "deliveries.db")
+    queue.enqueue("exec-p", {"id": "job-p"}, "brief")
+
+    assert queue.drain(_uncertain_send("telegram:456: https://example.test/?token=TOKEN123")) == 1
+
+    status = queue.get_status("exec-p")
+    assert status["status"] == "unknown", status
+    error = status["error"]
+    assert error.startswith(queue.UNCERTAIN_SEND_ERROR + "; telegram:456: ")
+    assert "TOKEN123" not in error
+
+
+def test_uncertain_send_settles_its_run_uncertain_not_failed(tmp_path, monkeypatch):
+    """The drain writes the outcome back: ledger ``uncertain`` and a job that is neither
+    ``delivery_failed`` nor carrying a delivery error, unlike a dead owner's fence."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from cron import delivery_queue as queue, executions, jobs, scheduler
+
+    monkeypatch.setattr(scheduler, "run_job", lambda job, **kw: (True, "raw", "the result", None))
+    job = jobs.create_job(prompt="p", schedule="every 1h", deliver="telegram:fixture")
+    scheduler.run_one_job(job)
+    execution = executions.latest_execution(job["id"])
+    assert execution["delivery_outcome"] == "queued"
+
+    assert queue.drain(_uncertain_send()) == 1
+
+    assert executions.get_execution(execution["id"])["delivery_outcome"] == "uncertain"
+    saved = jobs.get_job(job["id"])
+    assert (saved["last_status"], saved["last_delivery_error"]) == ("ok", None), saved
+
+
+def test_dead_owner_fence_stays_unknown_and_is_not_the_uncertain_send_text(tmp_path, monkeypatch):
+    import cron.delivery_queue as queue
+
+    monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "deliveries.db")
+    queue.enqueue("exec-d", {"id": "job-d"}, "brief")
+    assert queue.claim_next() is not None
+    monkeypatch.setattr(queue, "_PROCESS_ID", "replacement-gateway")
+    monkeypatch.setattr(queue, "_owner_is_live", lambda _pid, _started: False)
+
+    assert queue.recover_abandoned() == 1
+
+    status = queue.get_status("exec-d")
+    assert status["status"] == "unknown"
+    assert not status["error"].startswith(getattr(queue, "UNCERTAIN_SEND_ERROR", "\0"))
