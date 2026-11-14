@@ -228,9 +228,10 @@ def fork_1030_store(path: Path) -> dict:
 
 
 def run_input(db, session_id: str, request_id: str, text: str, *, transcript: bool, outcome="completed",
-              payload=None, cancel=False) -> int:
+              payload=None, cancel=False, stored=None, platform_message_id=None) -> int:
     """One input through this build's real admission APIs: admitted, then cancelled before it runs, or claimed
-    and settled with *outcome* (its turn's user message written first when *transcript*). Returns the epoch."""
+    and settled with *outcome* (its turn's user message written first when *transcript*: *stored* as its content
+    when the turn records more than the text, with the platform's message id when it has one). Returns the epoch."""
     from hermes_state_runtime import (admit_session_input, begin_runtime_epoch, cancel_session_input,
                                       claim_session_input, settle_session_input)
 
@@ -243,7 +244,8 @@ def run_input(db, session_id: str, request_id: str, text: str, *, transcript: bo
     claim = claim_session_input(db, epoch=epoch, session_id=session_id)
     assert claim["admission_id"] == admission["admission_id"]
     if transcript:
-        db.append_message(session_id, role="user", content=text)
+        db.append_message(session_id, role="user", content=text if stored is None else stored,
+                          platform_message_id=platform_message_id)
         db.append_message(session_id, role="assistant", content=f"answered: {text}")
     settle_session_input(db, epoch=epoch, admission_id=claim["admission_id"], generation=claim["generation"],
                          outcome=outcome)
@@ -356,8 +358,9 @@ def test_returned_store_is_the_forks_own_shape_with_every_row(stores):
         **{f"{t}.{c}": "converted" for t, c in _UPSTREAM_ADDED_COLUMNS}, **removed}
     assert columns["session_admissions.payload_json"]["non_default_rows"] == 1
     # The finished input is matched to its turn's user message, not assumed to be there.
-    assert tables["session_admissions"]["inputs"] == {"matched_to_messages": 1, "lossless_return_impossible": 0,
-                                                      "no_rule": 0}
+    assert tables["session_admissions"]["inputs"] == {
+        "matched_to_messages": 1, "lossless_return_impossible": 0, "no_rule": 0,
+        "by_kind": {"text": {"matched": 1, "lossless_return_impossible": 0, "no_rule": 0}}}
     assert "message_uid_backfill" in report["state_meta"]
     assert _rows(output, "SELECT key FROM state_meta WHERE key LIKE 'message_uid_backfill%' "
                          "OR key LIKE 'legacy_refusal_repair%'") == []
@@ -833,16 +836,111 @@ def test_inputs_each_matched_to_their_own_message_return(stores):
     assert report["published"] and report["tables"]["session_admissions"]["inputs"]["matched_to_messages"] == 3
 
 
-@pytest.mark.parametrize("act, match", [
-    (lambda db: (run_input(db, "s3", "r9", "x", transcript=True), _set_outcome(db, "r9", "superseded")),
-     r"session_admissions rows no rule carries to the fork: \w+: outcome 'superseded'"),
-    (lambda db: run_input(db, "s3", "r9", "with envelope", transcript=True,
-                          payload={"text": "with envelope", "native_text_v1": {"event": {"message_id": "m1"}}}),
-     r"no rule carries to the fork: \w+: payload \['native_text_v1', 'text'\] is more than its text"),
-], ids=["an unknown outcome", "a payload with more than its text"])
-def test_an_admission_no_rule_carries_refuses(stores, act, match):
+def native_payload(monkeypatch, tmp_path, text: str, message_id) -> dict:
+    """A native admission payload from the gateway's own builder (``snapshot_native``) for an A2A peer's message."""
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.run import GatewayRunner
+    from gateway.session_envelope import snapshot_native
+    from plugins.platforms.a2a.adapter import A2AAdapter
+
+    for key in ("A2A_ALLOWED_USERS", "A2A_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS"):
+        monkeypatch.delenv(key, raising=False)
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "gateway-sessions"))
+    adapter = A2AAdapter(PlatformConfig(enabled=True))
+    runner.adapters = {Platform("a2a"): adapter}
+    source = adapter.build_source(chat_id="ctx-1", chat_name="a2a:peer", chat_type="dm", user_id="peer",
+                                  user_name="peer")
+    payload = snapshot_native(runner, MessageEvent(text=text, message_type=MessageType.TEXT, message_id=message_id,
+                                                   source=source))
+    assert set(payload) == {"text", "native_text_v1"} and payload["native_text_v1"]["event"]["message_id"] == message_id
+    return payload
+
+
+def api_payload(text, **fields) -> dict:
+    """An API admission payload as ``session_api_turn`` builds it."""
+    return {"text": text, "api_turn_v1": {"history": None, "settings": {"requested_model": "m"}, **fields}}
+
+
+# Finished inputs whose envelope has a rule, matched by the field the turn stores from it.
+_MATCHED = {
+    "native: its platform message id, the text inside the stored row": lambda db, native: run_input(
+        db, "s3", "r9", "hi there", transcript=True, payload=native("hi there", "m-7"),
+        stored="[voice message] hi there", platform_message_id="m-7"),
+    "native without a platform id: exactly its text": lambda db, native: run_input(
+        db, "s3", "r9", "an automation wake", transcript=True, payload=native("an automation wake", None)),
+    "api: exactly its text": lambda db, native: run_input(
+        db, "s3", "r9", "an api question", transcript=True, payload=api_payload("an api question")),
+    "api: a resumed unanswered turn adopts its failed attempt's row": lambda db, native: (
+        run_input(db, "s3", "r8", "unanswered", transcript=True, outcome="failed", payload=api_payload("unanswered")),
+        run_input(db, "s3", "r9", "unanswered", transcript=False,
+                  payload=api_payload("unanswered", resume_unanswered=True))),
+}
+
+
+@pytest.mark.parametrize("case", list(_MATCHED))
+def test_a_finished_input_with_its_envelope_returns(stores, monkeypatch, tmp_path, case):
     source, _, output = stores
-    _runtime_write(source, act)
+    _runtime_write(source, lambda db: _MATCHED[case](
+        db, lambda text, mid: native_payload(monkeypatch, tmp_path, text, mid)))
+    report = _export(source, output)
+    inputs = report["tables"]["session_admissions"]["inputs"]
+    assert report["published"] and inputs["lossless_return_impossible"] == inputs["no_rule"] == 0
+    assert inputs["matched_to_messages"] == len(_rows(source, "SELECT 1 FROM session_admissions"))
+    assert set(inputs["by_kind"]) == {"text", "api_turn_v1" if case.startswith("api") else "native_text_v1"}
+
+
+_UNMATCHED = {
+    "native: its text, but in another message's row": lambda db, native: (
+        db.append_message("s3", role="user", content="hi there", platform_message_id="m-6"),
+        run_input(db, "s3", "r9", "hi there", transcript=False, payload=native("hi there", "m-7"))),
+    "native: its platform id, but its text withheld": lambda db, native: run_input(
+        db, "s3", "r9", "hi there", transcript=True, payload=native("hi there", "m-7"),
+        stored="[prompt withheld]", platform_message_id="m-7"),
+    "api: its text in no row": lambda db, native: run_input(
+        db, "s3", "r9", "an api question", transcript=False, payload=api_payload("an api question")),
+}
+
+
+@pytest.mark.parametrize("case", list(_UNMATCHED))
+def test_a_finished_input_with_its_envelope_but_no_row_refuses(stores, monkeypatch, tmp_path, case):
+    source, _, output = stores
+    _runtime_write(source, lambda db: _UNMATCHED[case](
+        db, lambda text, mid: native_payload(monkeypatch, tmp_path, text, mid)))
+    report = _assert_refused(source, output, r"lossless return impossible: 1 session_admissions inputs")
+    kind = "api_turn_v1" if case.startswith("api") else "native_text_v1"
+    assert report["tables"]["session_admissions"]["inputs"]["by_kind"][kind]["lossless_return_impossible"] == 1
+
+
+def _with_unknown_envelope_key(payload: dict, key: str) -> dict:
+    payload[key]["later"] = 1
+    return payload
+
+
+@pytest.mark.parametrize("act, match", [
+    (lambda db, native: (run_input(db, "s3", "r9", "x", transcript=True), _set_outcome(db, "r9", "superseded")),
+     r"session_admissions rows no rule carries to the fork: \w+ \(text\): outcome 'superseded'"),
+    (lambda db, native: run_input(db, "s3", "r9", "op", transcript=True,
+                                  payload={"text": "op", "local_operator_v1": {"profile_id": "p"}}),
+     r"no rule carries to the fork: \w+ \(local_operator_v1\): payload \['local_operator_v1', 'text'\] has no rule"),
+    (lambda db, native: run_input(db, "s3", "r9", "hi", transcript=True,
+                                  payload=_with_unknown_envelope_key(native("hi", "m-7"), "native_text_v1")),
+     r"\(native_text_v1\): native_text_v1 carries \['later'\]"),
+    (lambda db, native: run_input(db, "s3", "r9", "q", transcript=True,
+                                  payload=_with_unknown_envelope_key(api_payload("q"), "api_turn_v1")),
+     r"\(api_turn_v1\): api_turn_v1 carries \['later'\]"),
+    (lambda db, native: run_input(db, "s3", "r9", "parts", transcript=True,
+                                  payload={"text": [{"type": "text", "text": "parts"}], "api_turn_v1": {
+                                      "history": None, "settings": {}}}),
+     r"\(api_turn_v1\): its text is a list"),
+    (lambda db, native: run_input(db, "s3", "r9", "hi", transcript=True,
+                                  payload={"text": "hi", "native_text_v1": {"route": "r"}}),
+     r"\(native_text_v1\): payload \['native_text_v1', 'text'\] has no rule"),
+], ids=["an unknown outcome", "an envelope with no rule", "an unknown native field", "an unknown api field",
+        "multimodal api input", "a native envelope without its event"])
+def test_an_admission_no_rule_carries_refuses(stores, monkeypatch, tmp_path, act, match):
+    source, _, output = stores
+    _runtime_write(source, lambda db: act(db, lambda text, mid: native_payload(monkeypatch, tmp_path, text, mid)))
     report = _assert_refused(source, output, match)
     assert report["tables"]["session_admissions"]["inputs"]["no_rule"] == 1
 

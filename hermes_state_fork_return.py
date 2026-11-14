@@ -292,53 +292,91 @@ def _non_default_rows(conn, table: str, column: str, default) -> int:
     return conn.execute(f"SELECT count(*) FROM {_q(table)} WHERE {differs}").fetchone()[0]
 
 
+# The envelopes a finished admission's payload may carry beside its text, by the key that names them. Each one is
+# the context the turn was built from (the platform event, the API request); the build's own retirement keeps
+# none of it (payload_json becomes '{}'), so its lasting record is the user row the turn stored, matched here.
+_NATIVE_KEYS = frozenset(("source", "route", "event", "timestamp", "webhook_delivery", "webhook_route", "reauthorize",
+                          "provenance", "message_type", "media", "automation", "ingress_sha256"))
+_API_KEYS = frozenset(("history", "settings", "turn_author", "media", "run_owner_scope", "browser_control",
+                       "relay_metadata", "resume_unanswered"))
+
+
 def _admission_input(payload_json, target, lineage_json) -> tuple:
-    """``(text, sessions, None)`` for an input this export can match, else ``(None, None, why not)``."""
+    """``(kind, match, None)`` for an input this export can match, else ``(kind, None, why not)``. *match* is
+    ``(sessions, text, platform_message_id or None, may share a row)``."""
     try:
         payload, lineage = json.loads(payload_json), json.loads(lineage_json)
     except (TypeError, ValueError):
-        return None, None, "payload or lineage is not JSON"
-    if not isinstance(payload, dict) or set(payload) != {"text"} or not isinstance(payload["text"], str):
-        shape = sorted(payload) if isinstance(payload, dict) else type(payload).__name__
-        return None, None, f"payload {shape} is more than its text"
+        return "unreadable", None, "payload or lineage is not JSON"
+    if not isinstance(payload, dict):
+        return "unreadable", None, f"payload is a {type(payload).__name__}"
+    extra = sorted(set(payload) - {"text"})
+    kind = "+".join(extra) or "text"
     if not isinstance(lineage, list) or not all(isinstance(s, str) for s in lineage):
-        return None, None, "lineage is not a list of session ids"
-    return payload["text"], sorted({target, *lineage}), None
+        return kind, None, "lineage is not a list of session ids"
+    if not isinstance(payload.get("text"), str):
+        return kind, None, f"its text is a {type(payload.get('text')).__name__}"
+    sessions, text = sorted({target, *lineage}), payload["text"]
+    if not extra:
+        return kind, (sessions, text, None, False), None
+    envelope = payload[extra[0]]
+    if extra == ["native_text_v1"] and isinstance(envelope, dict) and isinstance(envelope.get("event"), dict):
+        if unknown := sorted(set(envelope) - _NATIVE_KEYS):
+            return kind, None, f"native_text_v1 carries {unknown}"
+        message_id = envelope["event"].get("message_id")
+        return kind, (sessions, text, None if message_id in (None, "") else str(message_id), False), None
+    if extra == ["api_turn_v1"] and isinstance(envelope, dict):
+        if unknown := sorted(set(envelope) - _API_KEYS):
+            return kind, None, f"api_turn_v1 carries {unknown}"
+        # A re-run of an unanswered turn adopts the transcript's tail row instead of writing it again.
+        return kind, (sessions, text, None, envelope.get("resume_unanswered") is True), None
+    return kind, None, f"payload {sorted(payload)} has no rule"
+
+
+def _admission_row(conn, match: tuple, taken: set):
+    """The kept user row that is this input: in its sessions, with its platform message id and its text inside
+    when the platform gave one, else with exactly its text. Each row is one admission's, unless it may share."""
+    sessions, text, platform_id, share = match
+    marks = ", ".join("?" * len(sessions))
+    if platform_id is None:
+        sql, args = "typeof(content) = 'text' AND content = ?", (text,)
+    else:
+        sql, args = ("CAST(platform_message_id AS TEXT) = ? AND typeof(content) = 'text' AND instr(content, ?) > 0",
+                     (platform_id, text))
+    hits = conn.execute(f"SELECT id FROM messages WHERE role = 'user' AND {sql} AND session_id IN ({marks}) "
+                        "ORDER BY id", (*args, *sessions)).fetchall()
+    return next((mid for (mid,) in hits if share or mid not in taken), None)
 
 
 def _plan_admissions(conn, refused: list) -> dict:
-    """Each terminal admission's input against the user messages the output keeps: a run's input must be one
-    of them (each message answers one admission), an input that never ran refuses the export."""
-    taken, matched, lost, unruled = set(), 0, [], []
+    """Each terminal admission's input against the user rows the output keeps: a run's input must be one of them,
+    an input that never ran refuses the export. Counted per payload kind."""
+    taken, kinds, lost, unruled = set(), {}, [], []
     for admission_id, target, lineage, payload, outcome in conn.execute(
             "SELECT admission_id, target_session_id, lineage_json, payload_json, outcome FROM session_admissions "
             "WHERE status = 'terminal' ORDER BY seq").fetchall():
+        kind, match, why = _admission_input(payload, target, lineage)
+        counts = kinds.setdefault(kind, {"matched": 0, "lossless_return_impossible": 0, "no_rule": 0})
         if outcome in _ADMISSION_NEVER_RAN:
-            lost.append(f"{admission_id} ({_ADMISSION_NEVER_RAN[outcome]})")
-            continue
-        if outcome not in _ADMISSION_RAN:
-            unruled.append(f"{admission_id}: outcome {outcome!r}")
-            continue
-        text, sessions, why = _admission_input(payload, target, lineage)
-        if why:
-            unruled.append(f"{admission_id}: {why}")
-            continue
-        hits = conn.execute(
-            f"SELECT id FROM messages WHERE role = 'user' AND typeof(content) = 'text' AND content = ? "
-            f"AND session_id IN ({', '.join('?' * len(sessions))}) ORDER BY id", (text, *sessions)).fetchall()
-        hit = next((mid for (mid,) in hits if mid not in taken), None)
-        if hit is None:
-            lost.append(f"{admission_id} ({outcome}; no kept user message of its sessions carries its input)")
-            continue
-        taken.add(hit)
-        matched += 1
+            lost.append(f"{admission_id} ({kind}; {_ADMISSION_NEVER_RAN[outcome]})")
+            counts["lossless_return_impossible"] += 1
+        elif outcome not in _ADMISSION_RAN or why:
+            unruled.append(f"{admission_id} ({kind}): {why or f'outcome {outcome!r}'}")
+            counts["no_rule"] += 1
+        elif (row := _admission_row(conn, match, taken)) is None:
+            lost.append(f"{admission_id} ({kind}, {outcome}; no kept user message of its sessions is its input)")
+            counts["lossless_return_impossible"] += 1
+        else:
+            taken.add(row)
+            counts["matched"] += 1
     if lost:
         refused.append(f"lossless return impossible: {len(lost)} session_admissions inputs exist only in "
                        f"session_admissions: {'; '.join(lost[:10])}{' ...' if len(lost) > 10 else ''}")
     if unruled:
         refused.append(f"session_admissions rows no rule carries to the fork: "
                        f"{'; '.join(unruled[:10])}{' ...' if len(unruled) > 10 else ''}")
-    return {"matched_to_messages": matched, "lossless_return_impossible": len(lost), "no_rule": len(unruled)}
+    return {"matched_to_messages": sum(c["matched"] for c in kinds.values()), "lossless_return_impossible": len(lost),
+            "no_rule": len(unruled), "by_kind": kinds}
 
 
 def _plan_runtime_table(conn, name: str, info: dict, columns: dict, refused: list) -> dict:
