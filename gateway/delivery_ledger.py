@@ -306,13 +306,15 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
 
 def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
                             thread_id: Optional[str], content: str, since: float,
-                            adapter_profile: Optional[str] = None) -> None:
+                            adapter_profile: Optional[str] = None, same_reply_dedupe: bool = True) -> None:
     """Adopt a reply a killed process persisted but never ledgered. Unowned, so this boot's sweep
     claims it, and 'attempting', because a streamed reply may already be on screen: it is
     redelivered once, with the recovered marker. A no-op when the same reply was already ledgered
     since *since* (the turn start), and idempotent across boots that die before their sweep. A managed
     /acp answer's row is never "the same reply": an ordinary reply with identical text is its own
-    delivery."""
+    delivery. ``same_reply_dedupe=False`` is for a caller whose *obligation_id* already names the one
+    message the reply answers (an inbound record's recovery id): only that id is deduplicated, so two
+    messages answered with the same text stay two deliveries."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
@@ -321,12 +323,12 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
                 content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at, adapter_profile)
                SELECT ?, ?, ?, ?, ?, ?, 'attempting', 0, ?, ?, NULL, NULL, ?
-               WHERE NOT EXISTS (SELECT 1 FROM delivery_obligations
-                                 WHERE session_key = ? AND content = ? AND created_at >= ?
-                                   AND acp_update_id IS NULL)""",
+               WHERE ? OR NOT EXISTS (SELECT 1 FROM delivery_obligations
+                                      WHERE session_key = ? AND content = ? AND created_at >= ?
+                                        AND acp_update_id IS NULL)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
              content, now, now, str(adapter_profile).strip() if adapter_profile else "default",
-             session_key, content, since))
+             0 if same_reply_dedupe else 1, session_key, content, since))
 
 
 def mark_attempting(obligation_id: str) -> None:

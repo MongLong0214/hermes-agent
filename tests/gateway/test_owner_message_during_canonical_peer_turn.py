@@ -330,6 +330,7 @@ def test_owner_text_during_an_owner_turn_keeps_its_busy_mode(ingress, send, monk
         return seen, queued
 
     (steered, redirected), queued = asyncio.run(exercise())
+    assert _records(ingress) == []  # queued, steered or redirected: settled with the turn that ran it
     if mode == "queue":
         assert (steered, redirected, queued) == ([], [], True)
         assert h.actor.calls == ["hello", _OWNER_TEXT, "owner: second"]
@@ -712,6 +713,8 @@ def _next_process(ingress, send, monkeypatch, *, crashed=False, prepare=None, du
         prepare(nxt)
 
     async def start():
+        # As _start_recover_previous_run: answered records go to the ledger before marker recovery.
+        await nxt.runner._ledger_answered_inbound_records()
         if crashed:
             await nxt.runner._recover_unclean_sessions()
         if during is not None:
@@ -747,9 +750,10 @@ def _crash_now(h, monkeypatch):
     monkeypatch.setattr(h.runner, "_settle_inbound_record", lambda *args, **kwargs: None, raising=False)
 
 
-def _persisting_agents(monkeypatch):
+def _persisting_agents(monkeypatch, fragment=None):
     """Agents that write each turn's user row (with its platform message id) and answer, as the real
-    agent's turn-start and final flushes do."""
+    agent's turn-start and final flushes do. With ``fragment``, an owner turn writes only that partial
+    reply (finish_reason "length"), as a turn cut off mid-answer leaves it."""
     from types import SimpleNamespace
 
     import run_agent
@@ -766,8 +770,13 @@ def _persisting_agents(monkeypatch):
             flusher = SimpleNamespace(_persist_user_message_override=kw.get("persist_user_message"),
                                       _persist_user_message_timestamp=None)
             user = {"role": "user", "content": text, "platform_message_id": kw.get("persist_user_platform_id")}
-            actor._session_db.append_messages_batch(task_id, [
-                _db_flush_row(flusher, user, True), {"role": "assistant", "content": result["final_response"]}])
+            recovery_id = (kw.get("persist_user_display_metadata") or {}).get("inbound_recovery_id")
+            if recovery_id:  # the agent writes the turn's display metadata on its user row
+                user["display_metadata"] = {"inbound_recovery_id": recovery_id}
+            answer = {"role": "assistant", "content": result["final_response"], "finish_reason": "stop"}
+            if fragment is not None and recovery_id:  # an owner turn cut off with only a partial reply
+                answer = {"role": "assistant", "content": fragment, "finish_reason": "length"}
+            actor._session_db.append_messages_batch(task_id, [_db_flush_row(flusher, user, True), answer])
             return result
         actor.run_conversation = writing
         return actor
@@ -1260,21 +1269,30 @@ def test_a_record_is_readmitted_once_however_often_the_resume_scheduler_runs(
 
 def test_a_crash_after_the_turn_completed_before_its_record_was_consumed_runs_no_second_turn(
         ingress, send, monkeypatch):
-    """The turn-completion boundary: the turn wrote its answer and delivered it, and the process died
-    before the record was deleted. The transcript shows the message answered: no second turn."""
+    """The turn-completion boundary: the turn has written its answer and returned, and the process dies
+    before the record is deleted and before the reply is ledgered (the marker is still held). The
+    answer is owed once through the ledger, the marker's own recovery finds it owed, and no second
+    turn runs."""
     h = _Harness(ingress, send, monkeypatch, "queue")
     _persisting_agents(monkeypatch)
     monkeypatch.setattr(h.runner, "_settle_inbound_record", lambda *args, **kwargs: None, raising=False)
+    returned, never = asyncio.Event(), asyncio.Event()
+
+    async def before_delivery(*args, **kwargs):
+        returned.set()
+        await never.wait()
+    monkeypatch.setattr(h.adapter, "_extract_response_content", before_delivery)
 
     async def run_once():
         await h.warm()
         await h.adapter.handle_message(h.owner_event())
-        await h.settle()
+        await h.wait(returned.is_set, "the owner turn to return its reply to the adapter")
         _crash_now(h, monkeypatch)
     asyncio.run(run_once())
-    assert h.owner_replies() == [("chat", _TERMINAL)] and len(_records(ingress)) == 1
+    entry = h.runner.session_store.lookup_by_session_key_existing(h.key)
+    assert h.owner_replies() == [] and len(_records(ingress)) == 1 and entry.active_turn_token is not None
     turns, _inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch, crashed=True))
-    assert (turns, chats, left, _owner_rows(ingress)) == ([], [], [], 1)
+    assert (turns, chats, left, _owner_rows(ingress)) == ([], ["chat"], [], 1)
 
 
 def test_a_restart_during_the_final_send_is_settled_by_redelivery_alone(ingress, send, monkeypatch):
@@ -1453,7 +1471,7 @@ def test_a_restart_after_the_adapter_accepted_a_message_before_its_claim_keeps_i
             await h.wait(lambda: sending, "the first owner turn's final send")
             await h.adapter.handle_message(message)
             await h.wait(lambda: h.adapter._pending_messages.get(h.key) is message, "the follow-up to be queued")
-            assert _record_texts(ingress) == []  # queued: the FIFO and its shutdown flush hold it
+            assert _record_texts(ingress) == [follow_up]  # queueing never deletes the record
             arm()
             send_gate.set()
         else:
@@ -1518,3 +1536,245 @@ def test_a_slow_durable_write_never_stalls_the_event_loop(ingress, send, monkeyp
     assert longest_gap < 0.5, f"the event loop stalled for {longest_gap:.2f}s"
     assert (accepted_while_writing, accepted, seen) == ([False], True, [[_OWNER_TEXT]])
     assert (h.actor.calls[-1], _records(ingress)) == (_OWNER_TEXT, [])
+
+
+# ── Review r2 of 1600122b ────────────────────────────────────────────────────────────────────────
+
+def _hold_turns(h, monkeypatch, holds):
+    """Hold the agent run of each text in *holds* (text -> (entered, release) threading events)."""
+    actor = h.actor
+    run = actor.run_conversation
+
+    def held(text, *, conversation_history, task_id, **kwargs):
+        gate = holds.get(kwargs.get("persist_user_message", text))
+        if gate is not None:
+            gate[0].set()
+            gate[1].wait(30)
+        return run(text, conversation_history=conversation_history, task_id=task_id, **kwargs)
+    monkeypatch.setattr(actor, "run_conversation", held)
+
+
+def test_a_queued_follow_up_drained_inside_the_running_turn_keeps_its_record_until_its_turn_completes(
+        ingress, send, monkeypatch):
+    """Review r2 P1-1: an owner follow-up queued behind a running owner turn is drained inside that turn
+    (_run_agent_drain_pending). Queueing and dequeueing keep its record; the first message's record
+    goes once its answer is handed to the ledger. A restart while the follow-up runs leaves only the
+    follow-up's record, and the next process answers it once."""
+    follow_up = "owner: one more thing"
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    h.runner._restart_drain_timeout = 0.5
+    first, second = (threading.Event(), threading.Event()), (threading.Event(), threading.Event())
+
+    async def cut_off():
+        await h.warm()
+        _hold_turns(h, monkeypatch, {_OWNER_TEXT: first, follow_up: second})
+        await h.adapter.handle_message(h.owner_event())
+        await h.wait(first[0].is_set, "the first owner turn to run")
+        await h.adapter.handle_message(h.owner_event(follow_up, message_id="m2"))
+        await h.wait(lambda: h.queued() == [follow_up], "the follow-up to be queued")
+        assert _record_texts(ingress) == sorted([_OWNER_TEXT, follow_up])
+        first[1].set()
+        await h.wait(second[0].is_set, "the follow-up to run inside the turn")
+        assert h.queued() == [] and _record_texts(ingress) == [follow_up]
+        try:
+            await asyncio.wait_for(h.runner.stop(restart=True), 60)
+        finally:
+            second[1].set()
+
+    asyncio.run(cut_off())
+    assert [chat for chat, text in h.owner_replies() if _TERMINAL in text] == ["chat"]  # the first answer
+    turns, _inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch))
+    assert (turns, chats, left) == ([follow_up], ["chat"], [])
+
+
+def test_a_queued_follow_up_drained_inside_the_turn_settles_its_record_when_it_completes(
+        ingress, send, monkeypatch):
+    """The other end of P1-1: drained in-band and run to completion, the follow-up's record is deleted
+    with its turn, and nothing is left for a later start."""
+    follow_up = "owner: one more thing"
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    first = (threading.Event(), threading.Event())
+
+    async def exercise():
+        await h.warm()
+        _hold_turns(h, monkeypatch, {_OWNER_TEXT: first})
+        await h.adapter.handle_message(h.owner_event())
+        await h.wait(first[0].is_set, "the first owner turn to run")
+        await h.adapter.handle_message(h.owner_event(follow_up, message_id="m2"))
+        await h.wait(lambda: h.queued() == [follow_up], "the follow-up to be queued")
+        first[1].set()
+        await h.settle()
+
+    asyncio.run(exercise())
+    assert (h.actor.calls[-2:], _records(ingress)) == ([_OWNER_TEXT, follow_up], [])
+
+
+def test_an_orphan_whose_record_cannot_be_written_is_not_claimed(ingress, send, monkeypatch):
+    """Review r2 P1-2: the orphan rescue runs the oldest orphaned FIFO event as this turn. It is made
+    durable before the claim like every other path; when its write fails nothing is claimed, the
+    orphan stays queued, and the owner is told."""
+    from gateway import shutdown_flush
+
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    orphan = h.owner_event("owner: orphaned while busy", message_id="o1")
+    store = shutdown_flush.store_inbound_record
+
+    def failing_for_the_orphan(event, **kwargs):
+        if event is orphan:
+            raise OSError("No space left on device")
+        return store(event, **kwargs)
+    monkeypatch.setattr(shutdown_flush, "store_inbound_record", failing_for_the_orphan)
+    claims, claim = [], h.runner._claim_active_session_slot
+    monkeypatch.setattr(h.runner, "_claim_active_session_slot",
+                        lambda key, source: claims.append(key) or claim(key, source))
+
+    async def exercise():
+        await h.warm()
+        h.runner._session_state(h.key).conversation.queued_events.append(orphan)  # an orphaned overflow
+        await h.adapter.handle_message(h.owner_event())
+        await h.settle()
+
+    asyncio.run(exercise())
+    assert (claims, h.actor.calls) == ([], ["hello"])
+    assert h.runner._overflow_queue(h.key) == [orphan]  # still queued
+    [(chat, notice)] = h.owner_replies()
+    assert chat == "chat" and "not processed" in notice
+
+
+def _cut_after_the_agent_wrote(h, monkeypatch, *, message_id, fragment=None):
+    """The marker write fails transiently, the agent writes the user row and its answer (or only a
+    partial ``fragment``), and stop(restart=True) runs while the turn stops typing, before delivery."""
+    store, failed, stopping, gate = h.runner.session_store, [], [], asyncio.Event()
+    mark, stop_typing, armed = store.mark_turn_active, h.runner._hmwa_stop_typing_for_turn, []
+
+    def transiently_failing_mark(session_key):
+        if armed and not failed:
+            failed.append(session_key)
+            raise OSError("state.db is busy")
+        return mark(session_key)
+    monkeypatch.setattr(store, "mark_turn_active", transiently_failing_mark)
+
+    async def held_stop_typing(event, source):
+        if event.text == _OWNER_TEXT:
+            stopping.append(event)
+            await gate.wait()
+        return await stop_typing(event, source)
+    monkeypatch.setattr(h.runner, "_hmwa_stop_typing_for_turn", held_stop_typing)
+    _persisting_agents(monkeypatch, fragment=fragment)
+
+    async def cut_off():
+        await h.warm()
+        armed.append(True)
+        await h.adapter.handle_message(h.owner_event(message_id=message_id))
+        await h.wait(lambda: stopping, "the owner turn to stop typing after its agent ran")
+        await asyncio.wait_for(h.runner.stop(restart=True), 60)
+
+    asyncio.run(cut_off())
+    assert failed and [text for _chat, text in h.owner_replies() if _TERMINAL in text] == []
+
+
+def test_a_message_without_a_platform_id_is_not_answered_twice(ingress, send, monkeypatch):
+    """Review r2 P1-3: the same cut-off as r1 P1-b for a message with no platform message id. The user
+    row names the record's recovery id, so the next process finds it answered: the answer is
+    delivered once and no second turn runs."""
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    h.runner._restart_drain_timeout = 0.5
+    _cut_after_the_agent_wrote(h, monkeypatch, message_id=None)
+    turns, _inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch))
+    assert (turns, chats, left, _owner_rows(ingress)) == ([], ["chat"], [], 1)
+
+
+def test_a_partial_answer_in_the_transcript_is_not_taken_as_the_answer(ingress, send, monkeypatch):
+    """Review r2 P1-4: the cut-off turn's transcript holds only a truncated fragment (finish_reason
+    "length"). That is not a completed answer: the next process runs the message again and delivers
+    its real answer, never the fragment."""
+    fragment = "partial: I was about to"
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    h.runner._restart_drain_timeout = 0.5
+    _cut_after_the_agent_wrote(h, monkeypatch, message_id="m1", fragment=fragment)
+    nxt = _next_process(ingress, send, monkeypatch)
+    turns, _inputs, chats, left = _answered(ingress, nxt)
+    assert (turns, chats, left) == ([_OWNER_TEXT], ["chat"], [])
+    assert not any(fragment in text for _chat, text, _meta in nxt.adapter.sent_calls)
+
+
+def test_two_messages_answered_with_the_same_text_are_each_delivered(ingress, send, monkeypatch):
+    """Review r2 P1-5: two stored messages of one session were answered with the same text before a
+    restart, and neither answer was delivered. Each answer is owed under its own record: both go out."""
+    from types import SimpleNamespace
+
+    from agent.session_persistence import _db_flush_row
+    from gateway import shutdown_flush
+
+    db, sid, key = ingress.runner.session_store._db, ingress.entry.session_id, ingress.entry.session_key
+    rows = []
+    for index in (1, 2):
+        text, recovery_id = f"owner: question {index}", f"same{index}"
+        event = MessageEvent(text=text, message_type=MessageType.TEXT, source=ingress.source, message_id=f"m{index}")
+        shutdown_flush.store_inbound_record(event, session_key=key, transport_profile=None,
+                                            recovery_id=recovery_id, order=(1, index))
+        flusher = SimpleNamespace(_persist_user_message_override=None, _persist_user_message_timestamp=None)
+        rows += [_db_flush_row(flusher, {"role": "user", "content": text, "platform_message_id": f"m{index}",
+                                         "display_metadata": {"inbound_recovery_id": recovery_id}}, True),
+                 {"role": "assistant", "content": "OK", "finish_reason": "stop"}]
+    db.append_messages_batch(sid, rows)
+    nxt = _next_process(ingress, send, monkeypatch)
+    delivered = [chat for chat, text, _meta in nxt.adapter.sent_calls if text.endswith("OK")]
+    assert (delivered, [text for actor in nxt.built for text in actor.calls], _records(ingress)) == (
+        ["chat", "chat"], [], [])
+
+
+def test_a_message_folded_into_another_keeps_its_record_until_that_message_is_settled():
+    """Review r2 P1-1, the other dequeue-free exits: a message merged into the queued head, or replaced
+    by a newer one, has no turn of its own. Its record rides the event that absorbed it and is settled
+    with that event's turn, never at the merge."""
+    from gateway import shutdown_flush
+    from gateway.platforms.base import merge_pending_message_event
+    from gateway.session import SessionSource
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm", user_id="user")
+
+    def stored(text, recovery_id, message_type=MessageType.TEXT):
+        event = MessageEvent(text=text, message_type=message_type, source=source)
+        event._inbound_record_id = recovery_id
+        return event
+
+    pending = {}
+    head, merged = stored("first", "r-head"), stored("second", "r-merged")
+    merge_pending_message_event(pending, "k", head)
+    merge_pending_message_event(pending, "k", merged, merge_text=True)
+    assert pending["k"] is head and shutdown_flush.inbound_record_ids(head) == ["r-head", "r-merged"]
+    assert merged._inbound_absorbed is True
+    newer = stored("third", "r-newer")
+    merge_pending_message_event(pending, "k", newer)  # no text merge: the head is replaced
+    assert pending["k"] is newer and shutdown_flush.inbound_record_ids(newer) == ["r-newer", "r-head", "r-merged"]
+
+
+def test_a_message_steered_into_a_running_turn_keeps_its_record_until_that_turn_ends(
+        ingress, send, monkeypatch):
+    """Review r2 P1-1 rule for a steered message: it has no turn of its own, so its record rides the
+    running turn. A restart that cuts that turn short leaves both records, and the next process
+    answers both messages; a turn that completes settles both."""
+    steered = "owner: also check the logs"
+    h = _Harness(ingress, send, monkeypatch, "steer")
+    h.runner._restart_drain_timeout = 0.5
+    first = (threading.Event(), threading.Event())
+
+    async def cut_off():
+        await h.warm()
+        _hold_turns(h, monkeypatch, {_OWNER_TEXT: first})
+        await h.adapter.handle_message(h.owner_event())
+        await h.wait(first[0].is_set, "the owner turn to run")
+        state = h.runner._peek_session_state(h.key)
+        await h.wait(lambda: state.turn.agent is h.actor, "the owner turn's agent to be published")
+        await h.adapter.handle_message(h.owner_event(steered, message_id="m2"))
+        await h.wait(lambda: h.actor.steered, "the follow-up to be steered into the running turn")
+        assert _record_texts(ingress) == sorted([_OWNER_TEXT, steered])
+        try:
+            await asyncio.wait_for(h.runner.stop(restart=True), 60)
+        finally:
+            first[1].set()
+
+    asyncio.run(cut_off())
+    turns, _inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch))
+    assert (sorted(turns), chats, left) == (sorted([_OWNER_TEXT, steered]), ["chat", "chat"], [])

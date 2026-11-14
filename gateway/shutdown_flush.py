@@ -288,6 +288,24 @@ def load_inbound_records() -> list:
     return sorted(records, key=lambda r: (list(r.get("order") or []), r["recovery_id"]))
 
 
+def inbound_record_ids(event: Any) -> list:
+    """Every record an event answers for: its own and those of the messages folded into it."""
+    own = getattr(event, "_inbound_record_id", None)
+    return [*([own] if own else []), *getattr(event, "_inbound_carried", ())]
+
+
+def carry_inbound_records(into: Any, absorbed: Any) -> None:
+    """*absorbed* was merged into *into*, replaced by it, or steered into its running turn: it has no
+    turn of its own now, so its records stay on disk until *into*'s turn settles them (they are never
+    deleted at the merge). *absorbed* is marked so nothing settles them separately."""
+    if into is None or absorbed is None or into is absorbed:
+        return
+    ids = inbound_record_ids(absorbed)
+    if not ids:
+        return
+    into._inbound_carried = [*getattr(into, "_inbound_carried", ()), *ids]
+    absorbed._inbound_absorbed = True
+
 def inbound_event_from_record(record: Dict[str, Any]) -> Any:
     """The ``MessageEvent`` a record holds, flags included (``internal`` stays as stored)."""
     from datetime import datetime

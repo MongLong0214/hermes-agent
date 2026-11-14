@@ -827,11 +827,15 @@ class GatewayBusySessionMixin:
         try:
             call_text = self._steer_text_with_origin(text, event) if event else text
             if verb == "steer":
-                return self._steer_running_agent(running_agent, call_text)
-            return bool(getattr(running_agent, verb)(call_text))
+                accepted = self._steer_running_agent(running_agent, call_text)
+            else:
+                accepted = bool(getattr(running_agent, verb)(call_text))
         except Exception as exc:
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
             return False
+        if accepted and event is not None:
+            self._carry_steered_inbound(event, session_key)  # the running turn now answers for it
+        return accepted
 
     def _redirect_active_turn(self, running_agent, text: str, session_key: str, event: MessageEvent) -> bool:
         """``redirect()`` the running turn onto *event* and re-anchor its delivery to that message.
@@ -1282,6 +1286,7 @@ class GatewayBusySessionMixin:
             return f"⚠️ Steer failed: {exc}"
         if not accepted:
             return "Steer rejected (empty payload)."
+        self._carry_steered_inbound(event, quick_key)  # the running turn now answers for it
         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
         target = "run and its active subagent(s)" if self._agent_has_active_subagents(running_agent) else "run"
         return f"⏩ Steer queued into current {target} — arrives after the next tool call: '{preview}'"

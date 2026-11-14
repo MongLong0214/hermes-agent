@@ -645,6 +645,7 @@ class GatewayInboundMixin:
                 logger.warning("PRIORITY steer failed for session %s: %s", _quick_key, exc)
         if steered:
             logger.debug("PRIORITY steer for session %s", _quick_key)
+            self._carry_steered_inbound(event, _quick_key)  # the running turn now answers for it
             return None
         logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
         if not self._queue_or_replace_pending_event(_quick_key, event):
@@ -1380,13 +1381,21 @@ class GatewayInboundMixin:
             event._acp_admission = _acp.admission
             event.text = _acp.admission.task_text
 
-        # The adapter stored the owner message when it arrived or left the queue; one that reaches
-        # this turn another way is stored here, off the loop, before the claim below. From the claim
+        # The adapter stored the owner message when it arrived (it keeps the record while queued); one
+        # that reaches this turn another way is stored here, off the loop, before the claim below. From the claim
         # until its turn ends the inbound record is the copy that outlives a restart. Internal events
         # and /acp tasks get none (neither is re-run as owner input).
         if (not is_internal and not _acp_managed and not getattr(_incoming, "_inbound_record_id", None)
                 and not await self._store_inbound_record(_incoming, _quick_key)):
             return self._INBOUND_RECORD_REFUSED
+        if not _acp_managed and _reservation is None:
+            # An orphan the rescue below will run as this turn is durable before the claim, too. If its
+            # record cannot be written nothing is claimed: the orphan stays queued and the owner is told.
+            _orphan_ahead = self._peek_orphaned_fifo(event, source, _quick_key)
+            if (_orphan_ahead is not None and not getattr(_orphan_ahead, "internal", False)
+                    and not getattr(_orphan_ahead, "_inbound_record_id", None)
+                    and not await self._store_inbound_record(_orphan_ahead, _quick_key)):
+                return self._INBOUND_RECORD_REFUSED
         if _reservation is None and not _acp_managed and self._queues_behind_peer_turn(event, _quick_key):
             # A canonical peer turn was admitted during the awaits above: claiming now would overwrite
             # its running slot and generation and fail its answer (canonical_turn_interrupted).
@@ -1407,7 +1416,7 @@ class GatewayInboundMixin:
             self._settle_inbound_record(_incoming, _quick_key, completed=True)
             return _limit_message
 
-        _settled_event, _orphan = _incoming, None  # whose inbound record this turn settles when it ends
+        _settled_event = _incoming  # whose inbound record this turn settles when it ends
         if not _acp_managed and _reservation is None:
             # A managed task must run as THIS turn: the rescue would park it behind an orphan, where
             # it would later drain as an ordinary turn without its admission. A reserved follow-up is
@@ -1415,9 +1424,14 @@ class GatewayInboundMixin:
             _before_rescue = event
             event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
             if event is not _before_rescue:
-                # The orphan runs as this turn; the incoming message waits in the FIFO with its record.
+                # The orphan runs as this turn (stored before the claim); the incoming message waits in
+                # the FIFO with its record.
                 _settled_event = event
-                _orphan = None if is_internal else event
+                if getattr(event, "_inbound_record_id", None):
+                    event._inbound_record_claimed = True
+        # The transcript's user row for this turn names its record, which is how a restart tells it
+        # answered (gateway/run_startup.py, _inbound_record_answer).
+        event._inbound_row_id = getattr(_settled_event, "_inbound_record_id", None)
 
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:
@@ -1430,10 +1444,6 @@ class GatewayInboundMixin:
 
         _turn_ended = False  # the turn returned, as opposed to raising or being cancelled
         try:
-            if _orphan is not None:
-                # Best effort, once the slot is held: the orphan was only in memory until now.
-                if getattr(_orphan, "_inbound_record_id", None) or await self._store_inbound_record(_orphan, _quick_key):
-                    _orphan._inbound_record_claimed = True
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
@@ -1472,7 +1482,7 @@ class GatewayInboundMixin:
             try:
                 # Record before marker: a death between the two leaves the marker, whose recovery
                 # already covers a turn that ended (gateway/run_startup.py, _recover_unclean_sessions).
-                self._settle_inbound_record(_settled_event, _quick_key, completed=_turn_ended)
+                self._settle_inbound_record(_settled_event, _quick_key, completed=_turn_ended, also=event)
                 # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean
                 # startup's recovery pass. A turn the adapter delivers hands its marker to that
                 # lifecycle, which clears it only once the reply is in the delivery ledger (else a
@@ -1532,46 +1542,83 @@ class GatewayInboundMixin:
         return True
 
     def _settle_unclaimed_inbound(self, event: Optional[MessageEvent], *, ended: bool) -> None:
-        """A message whose record was stored on arrival or dequeue left the inbound path with no turn
-        claiming it: refused, a command, steered into a running turn, merged or queued (the FIFO, which
-        the shutdown flush writes out, holds it from there). Cut off by a restart before its claim
-        (``ended`` False while draining) the record stays; a re-admitted message the path queued keeps
-        it until its own turn ends; any other end deletes it."""
+        """A message whose record was stored on arrival left the inbound path with no turn
+        claiming it. Its record is deleted only when its handling is done: refused, or a command. It is
+        kept while the message waits in its queue (until its own turn settles it), when it was merged,
+        replaced or steered (the absorbing turn settles it), and when a restart cut it off before its
+        claim (``ended`` False while draining)."""
         recovery_id = getattr(event, "_inbound_record_id", None)
-        if not recovery_id or getattr(event, "_inbound_record_claimed", False):
+        if (not recovery_id or getattr(event, "_inbound_record_claimed", False)
+                or getattr(event, "_inbound_absorbed", False)):
             return
         try:
             if not ended and self._draining:
                 logger.info("A restart cut off a message before its claim; its inbound record stays for "
                             "the next process")
                 return
-            if (getattr(event, "_inbound_readmitted", False)
-                    and self._event_is_queued(getattr(event, "_inbound_record_key", None) or "", event)):
+            if self._event_is_queued(getattr(event, "_inbound_record_key", None) or "", event):
                 return
-            from gateway import shutdown_flush
-            shutdown_flush.discard_inbound_record(recovery_id)
-            event._inbound_record_id = event._inbound_record_order = None
+            self._discard_inbound_records(event)
         except Exception:
             logger.warning("Settling an unclaimed inbound record failed", exc_info=True)
 
-    def _settle_inbound_record(self, event: Optional[MessageEvent], session_key: str, *, completed: bool) -> None:
-        """The turn holding *event*'s inbound record has ended. Cut short by a restart, the record stays
-        for the next process: the turn raised or was cancelled while the gateway drains, or it returned
-        while its session is still resume_pending (the drain marks a running session before it
-        interrupts it, and only a completed turn clears the mark). Any other end deletes it."""
-        recovery_id = getattr(event, "_inbound_record_id", None)
-        if not recovery_id:
+    def _discard_inbound_records(self, event: Optional[MessageEvent]) -> None:
+        """Delete every record *event* answers for (its own and those folded into it)."""
+        from gateway import shutdown_flush
+        for recovery_id in shutdown_flush.inbound_record_ids(event):
+            shutdown_flush.discard_inbound_record(recovery_id)
+        if event is not None:
+            event._inbound_record_id = event._inbound_record_order = None
+            event._inbound_carried = []
+
+    def _carry_steered_inbound(self, event: MessageEvent, session_key: str) -> None:
+        """*event* was steered or redirected into the running turn: its record stays until that turn
+        settles it (gateway/shutdown_flush.py, carry_inbound_records)."""
+        from gateway import shutdown_flush
+        state = self._peek_session_state(session_key)
+        shutdown_flush.carry_inbound_records(getattr(getattr(state, "turn", None), "event", None), event)
+
+    def _peek_orphaned_fifo(self, event: MessageEvent, source: SessionSource, session_key: str):
+        """The orphan ``_hm_rescue_orphaned_fifo`` would run as this turn, without taking it."""
+        try:
+            adapter = self._delivery_adapter_for(source)
+            overflow = self._overflow_queue(session_key)
+            slot = getattr(adapter, "_pending_messages", None)
+            if (adapter is None or not overflow or getattr(event, "internal", False) or event.get_command()
+                    or not isinstance(slot, dict) or slot.get(session_key)):
+                return None
+            return overflow[0]
+        except Exception:
+            return None
+
+    def _settle_inbound_record(self, event: Optional[MessageEvent], session_key: str, *, completed: bool,
+                               also: Optional[MessageEvent] = None) -> None:
+        """The turn holding *event*'s inbound record (and the records folded into it or into *also*, the
+        turn's own event) has ended. Cut short by a restart, the records stay for the next process: the
+        turn raised or was cancelled while the gateway drains, or it returned while its session is
+        still resume_pending (the drain marks a running session before it interrupts it, and only a
+        completed turn clears the mark). Any other end deletes them."""
+        from gateway import shutdown_flush
+        events = [e for e in (event, also) if e is not None and shutdown_flush.inbound_record_ids(e)]
+        if not events or (also is event and len(events) > 1):
+            events = events[:1]
+        if not events:
             return
         try:
             if self._draining and not (completed and not self._resume_still_pending(session_key)):
                 logger.info("A restart cut the turn on %s short; its inbound record stays for the next "
                             "process", session_key)
                 return
-            from gateway import shutdown_flush
-            shutdown_flush.discard_inbound_record(recovery_id)
-            event._inbound_record_id = event._inbound_record_order = None
+            for each in events:
+                self._discard_inbound_records(each)
         except Exception:
             logger.warning("Settling the inbound record of %s failed", session_key, exc_info=True)
+
+    def _consume_inbound_record_id(self, recovery_id: Optional[str]) -> None:
+        """An in-turn follow-up's turn completed, or its answer was handed to the delivery ledger."""
+        if recovery_id:
+            from gateway import shutdown_flush
+            shutdown_flush.discard_inbound_record(recovery_id)
 
     def _resume_still_pending(self, session_key: str) -> bool:
         try:

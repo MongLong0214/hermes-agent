@@ -163,6 +163,13 @@ def hygiene_no_commit_reason(agent) -> str:
     return "in-place commit did not complete"
 
 
+def _inbound_row_metadata(event: Any) -> dict:
+    """``{"inbound_recovery_id": ...}`` for the user row of a turn whose message has an inbound record
+    (gateway/shutdown_flush.py), else ``{}``."""
+    recovery_id = getattr(event, "_inbound_row_id", None) or getattr(event, "_inbound_record_id", None)
+    return {"inbound_recovery_id": recovery_id} if isinstance(recovery_id, str) and recovery_id else {}
+
+
 class GatewayTurnMixin:
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
@@ -1819,6 +1826,8 @@ class GatewayTurnMixin:
             _user_entry["display_kind"] = prepared.persist_user_display_kind
         if prepared.persistence_owner:
             _user_entry["display_metadata"] = {"gateway_input_owner": prepared.persistence_owner}
+        if _inbound_row_metadata(event):
+            _user_entry.setdefault("display_metadata", {}).update(_inbound_row_metadata(event))
         _acp = getattr(event, "_acp_admission", None)
         if _acp is not None:  # diagnostic, as on the agent's own writer (recovery does not read it)
             _user_entry.setdefault("display_metadata", {})["acp_update_id"] = str(_acp.update_id)
@@ -2386,6 +2395,8 @@ class GatewayTurnMixin:
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event),
+                    # Names the inbound record on the user row, so a restart can tell this turn answered.
+                    **_inbound_row_metadata(event),
                     # Diagnostic only: crash recovery identifies a managed turn by its bound
                     # active-turn marker (acp_managed_ingress.bind_turn_marker), not by this row.
                     **({"acp_update_id": str(event._acp_admission.update_id)}
@@ -4079,6 +4090,10 @@ class GatewayTurnMixin:
         # Interrupted: discard the response ("Operation interrupted." is noise).
         if not result.get("interrupted"):
             await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
+            # This level's message has its answer handed to the delivery ledger (or delivered): its
+            # inbound record is done, before the follow-up runs.
+            self._consume_inbound_record_id(
+                (turn_ctx.persist_user_display_metadata or {}).get("inbound_recovery_id"))
 
         updated_history = result.get("messages", history)
         next_source, next_message, next_session_key = source, pending, session_key
@@ -4174,7 +4189,8 @@ class GatewayTurnMixin:
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
                 persist_user_message=next_persist_message,
                 persist_user_display_kind=next_display_kind,
-                persist_user_display_metadata=diagnostic_metadata(pending_event) or None,
+                persist_user_display_metadata={
+                    **diagnostic_metadata(pending_event), **_inbound_row_metadata(pending_event)} or None,
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -4186,6 +4202,11 @@ class GatewayTurnMixin:
             raise
         await _run_followup_processing_hook(
             _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
+        # The drained message's own turn has ended: its record goes, unless a restart cut that turn
+        # short (it stays for the next process, as the outer turn's would).
+        from gateway.run import _should_clear_resume_pending_after_turn
+        if not (self._draining and not _should_clear_resume_pending_after_turn(followup_result)):
+            self._discard_inbound_records(pending_event)
         merged = _preserve_queued_followup_history_offset(result, followup_result)
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal

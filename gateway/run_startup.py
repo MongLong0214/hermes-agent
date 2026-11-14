@@ -859,12 +859,13 @@ class GatewayStartupMixin:
             if not await asyncio.to_thread(ledger_enabled):
                 return False  # nothing could owe the answer: the message runs again instead
             source = shutdown_flush.inbound_event_from_record(record).source
+            # Keyed by the record alone: another message answered with the same text is its own delivery.
             await asyncio.to_thread(
                 record_crash_left_reply,
                 obligation_id=compute_obligation_id(key, f"inbound:{recovery_id}", text), session_key=key,
                 platform=str(getattr(source.platform, "value", source.platform)), chat_id=source.chat_id,
                 thread_id=source.thread_id, content=text, since=coerce_epoch(asked_at) or 0.0,
-                adapter_profile=record.get("transport_profile"))
+                adapter_profile=record.get("transport_profile"), same_reply_dedupe=False)
         logger.info("Stored owner message %s on %s was answered before the restart; its answer is owed "
                     "through the delivery ledger", recovery_id, key)
         shutdown_flush.discard_inbound_record(recovery_id)
@@ -872,12 +873,14 @@ class GatewayStartupMixin:
 
     async def _inbound_record_answer(self, record: dict):
         """``(history up to the answer, asked-at timestamp, origin)`` when the record's message already
-        has its answer in the transcript: its user row (by platform message id) is followed by a final
-        assistant reply before the next user row; else None. A record without a message id cannot be
-        matched and is re-admitted."""
+        has its final, completed answer in the transcript, else None. The user row is the one that
+        names the record (``display_metadata.inbound_recovery_id``, written when the turn persists it);
+        the answer is the next assistant row before another user row that ended the model's turn
+        (``finish_reason`` "stop", no tool calls, text, not the failed-turn notice). A fragment, a
+        truncated ("length") or interrupted reply does not count: the message runs again."""
         from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND
-        message_id = record["event"].get("message_id")
-        entry = self.session_store.lookup_by_session_key_existing(record["session_key"]) if message_id else None
+        recovery_id = record["recovery_id"]
+        entry = self.session_store.lookup_by_session_key_existing(record["session_key"])
         if entry is None:
             return None
         try:
@@ -888,13 +891,15 @@ class GatewayStartupMixin:
         asking = False
         for index, row in enumerate(history):
             if row.get("role") == "user":
-                asking = str(row.get("message_id") or "") == str(message_id)
+                asking = (row.get("display_metadata") or {}).get("inbound_recovery_id") == recovery_id
                 if asking:
                     answer, asked_at = None, row.get("timestamp")  # a later copy of the message is asked anew
-            elif (asking and row.get("role") == "assistant" and not row.get("tool_calls")
-                  and isinstance(row.get("content"), str) and row["content"].strip()
+            elif (asking and row.get("role") == "assistant" and row.get("finish_reason") == "stop"
+                  and not row.get("tool_calls") and isinstance(row.get("content"), str) and row["content"].strip()
                   and row.get("display_kind") != FAILED_TURN_DISPLAY_KIND):
                 answer, asking = index, False
+            elif asking and row.get("role") == "assistant" and not row.get("tool_calls"):
+                asking = False  # its turn ended without a completed answer
         if answer is None:
             return None
         if getattr(entry, "origin", None) is not None:
@@ -905,9 +910,19 @@ class GatewayStartupMixin:
         return history[:answer + 1], asked_at, origin
 
     def _event_is_queued(self, session_key: str, event: MessageEvent) -> bool:
+        """*event* waits in the session's queue: the pending slot, the FIFO overflow, or a busy-text
+        debounce buffer."""
         adapter = self._adapter_holding_pending(session_key)
         head = adapter._pending_messages.get(session_key) if adapter is not None else None
-        return head is event or any(queued is event for queued in (self._overflow_queue(session_key) or ()))
+        if head is event or any(queued is event for queued in (self._overflow_queue(session_key) or ())):
+            return True
+        for adapters in (self._primary_adapters(), *self._profile_adapters_map().values()):
+            for each in (adapters or {}).values():
+                store = getattr(each, "_text_debounce_store", None)
+                state = store().get(session_key) if callable(store) else None
+                if getattr(state, "event", None) is event:
+                    return True
+        return False
 
     def _startup_should_abort(self) -> bool:
         return self._restart_requested or self._draining or self._shutdown_event.is_set()
@@ -1474,6 +1489,11 @@ class GatewayStartupMixin:
         restored = process_registry.restore_durable_completions()
         if restored:
             logger.info("Restored %d undelivered async completion(s) from the previous run", restored)
+        # A stored message whose answer is already in the transcript owes that answer through the
+        # delivery ledger, keyed by its record: first, so the marker recovery below finds the reply
+        # already ledgered instead of owing it a second time, and the boot sweep delivers it.
+        with _log_suppressed(logging.WARNING, "Answered inbound record recovery failed", exc_info=True):
+            await self._ledger_answered_inbound_records()
         # Recover the turns the last process left marked (in flight, or reply not yet ledgered).
         # SKIP after a clean exit — the previous process already drained.
         _clean_marker = _hermes_home / ".clean_shutdown"
@@ -1825,10 +1845,6 @@ class GatewayStartupMixin:
         # control sleep here once froze every platform).
         # Restart notification, home-channel startup notice, and obligation redelivery all call
         # adapter.send(). Bound them the same way _finish_startup_restore bounds resume turns. See #91969.
-        # Before the boot sweep: a stored message whose answer is already in the transcript hands that
-        # answer to the delivery ledger, so the sweep below delivers it (and clears its resume flag).
-        with _log_suppressed(logging.WARNING, "Answered inbound record recovery failed", exc_info=True):
-            await self._ledger_answered_inbound_records()
         await self._await_startup_boot_sends(
             planned_restart_notification_pending=_planned_restart_notification_pending(),
         )

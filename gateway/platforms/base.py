@@ -1755,6 +1755,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
     turn sees the whole burst; with ``merge_text`` rapid TEXT follow-ups append instead of
     replace."""
     existing = pending_messages.get(session_key)
+    from gateway.shutdown_flush import carry_inbound_records
     if existing:
         existing_type = getattr(existing, "message_type", None)
         existing_is_photo = existing_type == MessageType.PHOTO
@@ -1787,12 +1788,15 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
             for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts"):
                 if hasattr(existing, attr):
                     delattr(existing, attr)
+            carry_inbound_records(existing, event)  # its inbound record now rides the merged event
             return
         both_text = existing_type == MessageType.TEXT and event.message_type == MessageType.TEXT
         if merge_text and both_text:
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
+            carry_inbound_records(existing, event)
             return
+        carry_inbound_records(event, existing)  # replaced: its record rides the event that replaced it
     pending_messages[session_key] = event
 
 
@@ -3847,6 +3851,8 @@ class BasePlatformAdapter(ABC):
         else:
             if event.text:
                 state.event.text = _append_text(state.event.text, event.text)
+            from gateway.shutdown_flush import carry_inbound_records
+            carry_inbound_records(state.event, event)
             latest_message_id = getattr(event, "message_id", None)
             latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
             if latest_message_id is not None:
@@ -3891,6 +3897,13 @@ class BasePlatformAdapter(ABC):
         state = self._text_debounce_store().pop(session_key, None)
         if state is not None:
             state.cancel_timer()
+            self._discard_inbound_records(state.event)
+
+    def _discard_inbound_records(self, event: Optional[MessageEvent]) -> None:
+        """A queued message is dropped on purpose (/stop, /new, /reset): its records go with it."""
+        discard = getattr(self.gateway_runner, "_discard_inbound_records", None)
+        if callable(discard) and event is not None:
+            discard(event)
 
     # ── Session task + guard ownership helpers: paired with the _session_tasks owner map so
     # reconciliation is deterministic across completion, /stop /new /reset, and stale-lock heal.
@@ -3972,7 +3985,7 @@ class BasePlatformAdapter(ABC):
                 logger.debug("[%s] Session cancellation raised while unwinding %s", self.name,
                              session_key, exc_info=True)
         if discard_pending:
-            self._pending_messages.pop(session_key, None)
+            self._discard_inbound_records(self._pending_messages.pop(session_key, None))
             self._discard_text_debounce(session_key)
         if release_guard:
             self._release_session_guard(session_key)
@@ -4602,10 +4615,8 @@ class BasePlatformAdapter(ABC):
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         handler_returned = False
         try:
-            # A follow-up taken from the queue (synchronously, as this task was spawned) is stored before
-            # this task's first await; a message stored on arrival already has its record.
-            if not await self._store_inbound(event, session_key):
-                return
+            # An owner message was stored on arrival and keeps its record while it waits in the queue,
+            # so a follow-up taken from it here is already durable.
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
