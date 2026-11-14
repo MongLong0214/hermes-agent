@@ -64,6 +64,16 @@ def cmd_set_journal_mode(args) -> int:
     if refusal:
         print(f"✗ Refusing to change the journal mode of {db_path}: {refusal}")
         return 1
+    # A store this build does not open (the fork's 1030 before its migration, other fenced stamps, fork
+    # markers, newer builds) is not converted; one SQLite cannot read is left to the switch below.
+    from hermes_state_fence import IncompatibleSchemaError, refuse_unadmitted_lineage
+    try:
+        refuse_unadmitted_lineage(db_path)
+    except IncompatibleSchemaError as exc:
+        print(f"✗ Refusing to change the journal mode of {db_path}: {exc}")
+        return 1
+    except sqlite3.DatabaseError:
+        pass
     if target == "wal" and is_sqlite_wal_reset_vulnerable():
         print(f"✗ Refusing to enable WAL: the linked SQLite {sqlite3.sqlite_version} has the WAL-reset bug "
               "(https://sqlite.org/wal.html#walresetbug). Upgrade to 3.51.3+ first.")

@@ -66,6 +66,10 @@ from hermes_state_dbfile import (
     quarantine_invalid_state_db,
     RetiredGenerationCaptureError, capture_retired_wal_generation, refuse_deleted_wal_generation,
 )
+from hermes_state_fence import (
+    fence_migration_admission, migrate_fenced_store, refuse_unadmitted_lineage, register_turn_fence_generation,
+    serialized_connection_factory,
+)
 from hermes_state_messages import SessionMessagesMixin
 from hermes_state_prune_rewrite import SessionPruneRewriteMixin
 from hermes_state_api_content import SessionApiContentMixin
@@ -82,6 +86,7 @@ from hermes_state_maintenance import SessionMaintenanceMixin
 from hermes_state_gateway import SessionGatewayMixin
 from hermes_state_compression import SessionCompressionMixin
 from hermes_state_search import SessionSearchMixin
+from hermes_state_target_bind import SessionTargetBindMixin
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -196,6 +201,20 @@ _READ_ONLY_IOERR_RETRY_ATTEMPTS, _READ_ONLY_IOERR_RETRY_BACKOFF_S = 3, 0.05
 # connection's 1 s timeout exists for writes (they retry at application level) and starved readers
 # into "database is locked" (dashboard 503s, `hermes sessions list` crashes) under a busy gateway.
 _READ_BUSY_TIMEOUT_S = 5.0
+
+# The exception object behind get_last_init_error(), kept beside the text: a classifier needs the
+# type and fields of an IncompatibleSchemaError, and str(exc) throws both away. Only __init__ sets it.
+_last_init_error_exc: Optional[BaseException] = None
+
+
+def _set_last_init_error_exc(exc: Optional[BaseException]) -> None:
+    global _last_init_error_exc
+    _last_init_error_exc = exc
+
+
+def get_last_init_error_exc() -> Optional[BaseException]:
+    """The exception behind :func:`get_last_init_error`, or None when that failure was text only."""
+    return _last_init_error_exc
 
 
 def _default_db_path() -> Path:
@@ -466,7 +485,7 @@ class SessionDB(
     SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
     SessionGatewayMixin, SessionMaintenanceMixin, SessionUsageMixin, SessionTitlesMixin,
     SessionMessagesMixin, SessionPruneRewriteMixin, SessionApiContentMixin, SessionCoverageMixin, SessionRewindMixin, SessionProfileRepairMixin,
-    SessionPromptRefreshMixin,
+    SessionPromptRefreshMixin, SessionTargetBindMixin,
 ):
     """SQLite-backed session storage with FTS5 search; many reader threads, one writer (WAL)."""
 
@@ -663,6 +682,7 @@ class SessionDB(
         except Exception as exc:
             # Surface WHY via /resume and friends; callers keep their ``_session_db = None`` path.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
+            _set_last_init_error_exc(exc)
             raise
         finally:
             if not initialization_complete:
@@ -734,6 +754,8 @@ class SessionDB(
         must exist. FTS flags are probed with SELECTs only, and the connection is
         closed on ANY probe failure (malformed schema raises DatabaseError) so a
         leaked tracked connection cannot block the forensic backup the writable heal takes next."""
+        # A reader must not serve a lineage this build does not own: refuse before the first read.
+        refuse_unadmitted_lineage(self.db_path)
         for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
             try:
                 self._conn = conn = self._connect_read_only(timeout=_READ_BUSY_TIMEOUT_S)
@@ -768,8 +790,10 @@ class SessionDB(
         conn = _connect_tracked_db(
             read_only_db_uri(self.db_path), tracking_path=self.db_path, uri=True,
             check_same_thread=False, timeout=timeout, isolation_level=None,
+            factory=serialized_connection_factory(),
         )
         conn.row_factory = sqlite3.Row
+        register_turn_fence_generation(conn)
         return conn
 
     def _handle_quarantine_if_invalid(self, already_locked: bool = False) -> None:
@@ -791,6 +815,7 @@ class SessionDB(
         )
         logger.error(msg)
         _set_last_init_error(msg)
+        _set_last_init_error_exc(None)
         if qpath is None and self.db_path.exists() and has_invalid_sqlite_header_preopen(self.db_path):
             raise sqlite3.DatabaseError(msg)
 
@@ -798,11 +823,15 @@ class SessionDB(
         """Connect + WAL/pragma setup for a writer connection (no schema init). Short timeout:
         jittered application-level retry handles contention, not SQLite's busy handler;
         isolation_level=None: explicit BEGIN IMMEDIATE."""
+        # Serialized, with the fence UDF: a governed write on a fenced store runs that Python callback
+        # inside sqlite3_step, and an unserialized shared connection deadlocks on it (GIL vs. db mutex).
         conn = _connect_tracked_db(
             str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None,
+            factory=serialized_connection_factory(),
         )
         try:
             conn.row_factory = sqlite3.Row
+            register_turn_fence_generation(conn)
             mode = apply_wal_with_fallback(conn, db_label="state.db")
             # "wal" is also the *assumed* mode when the on-disk probe was blocked by a concurrent opener
             # (#86515): the lock-free mode=ro read pool needs a confirmed WAL header, so confirm it here.
@@ -820,13 +849,22 @@ class SessionDB(
         return conn
 
     def _connect_and_init(self) -> None:
-        # Refuse before sqlite3.connect (under the startup lock) so we cannot mint
-        # a replacement WAL while a live writer still holds a deleted sidecar inode.
-        refuse_deleted_wal_generation(self.db_path)
-        # Create/tighten the main database before sqlite3.connect() so a
-        # permissive process umask can never expose a fresh profile store.
-        _secure_state_db_files(self.db_path, create_main=True)
-        self._conn = self._open_writer_conn()
+        # Lineage first, SELECT-only on a read-only connection: a store this build cannot migrate
+        # must come out of the open byte-identical, so nothing below (chmod, WAL, DDL) may run on it.
+        lineage = refuse_unadmitted_lineage(self.db_path, migrate=True)
+        # The fork's store is migrated under the profile's gateway.lock lease, taken before the first
+        # write and held through the migration's commit; every other lineage takes no lease.
+        with fence_migration_admission(self.db_path, lineage) as migrate:
+            # Refuse before sqlite3.connect (under the startup lock) so we cannot mint
+            # a replacement WAL while a live writer still holds a deleted sidecar inode.
+            refuse_deleted_wal_generation(self.db_path)
+            # Create/tighten the main database before sqlite3.connect() so a
+            # permissive process umask can never expose a fresh profile store.
+            _secure_state_db_files(self.db_path, create_main=True)
+            self._conn = self._open_writer_conn()
+            if migrate:
+                # Before _init_schema: its script and table rebuilds must meet this build's fences.
+                migrate_fenced_store(self, self._conn.cursor())
         self._init_schema()
 
     def _connect_and_init_with_lock_patience(self) -> None:

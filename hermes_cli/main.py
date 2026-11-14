@@ -320,6 +320,7 @@ from hermes_cli.subcommands.clipboard import build_clipboard_parser
 from hermes_cli.subcommands.journey import build_journey_parser
 from hermes_cli.subcommands.computer_use import build_computer_use_parser
 from hermes_cli.subcommands.sessions import build_sessions_parser, cmd_sessions_lazy
+from hermes_cli.target_bind import build_target_parser
 from hermes_cli.subcommands.completion import build_completion_parser
 
 
@@ -582,6 +583,7 @@ if __name__ == "__main__" and getattr(sys.modules.get("__main__"), "__file__", N
     # override on the stripped argv, and `--profile default` would fall to the sticky profile.
     sys.modules.setdefault("hermes_cli.main", sys.modules["__main__"])
 _apply_profile_override()
+_early_recovery_mod.reserve_stdout_if_target_bind()
 # ``-p``/active_profile re-homed the process after hermes_bootstrap ran: re-point the temp vars
 # at THIS home's scratch dir (a user-set TMPDIR is still left alone).
 try:
@@ -619,9 +621,8 @@ if sys.platform == "win32":
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
-# ``update`` must not resolve external secret sources (Windows self-lock via cryptography, slow
-# helpers inside the import probe) — ``_early_recovery._should_skip_external_secret_sources``
-# owns that argv check for every dotenv load in the process. See #73381.
+# ``update`` and ``target bind`` resolve no external secret source (#73381): that argv check, for
+# every dotenv load in the process, is ``_early_recovery._should_skip_external_secret_sources``.
 load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
 # Bridge security.redact_secrets → HERMES_REDACT_SECRETS BEFORE hermes_logging
@@ -2351,7 +2352,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "auth", "status", "cron", "doctor", "config", "pairing", "skills", "tools", "mcp",
         "sessions", "insights", "update", "uninstall", "profile", "dashboard", "serve", "webapp",
         "desktop", "gui", "claw", "plugins", "security", "acp", "webhook", "peer",
-        "memory", "dump", "debug", "backup", "import", "completion", "logs", "usage",
+        "memory", "dump", "debug", "backup", "import", "completion", "logs", "usage", "target",
     }
     _SESSION_FLAGS = {"-c", "--continue", "-r", "--resume"}
     if _SESSION_FLAGS.intersection(argv):  # the active memory provider registers ``hermes <name>``
@@ -2654,7 +2655,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "journey", "memory-graph", "learning",
         "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
         "project", "proxy", "prompt-size", "resume", "send", "sessions", "setup",
-        "skin", "skills", "slack", "status", "tools", "uninstall", "update",
+        "skin", "skills", "slack", "status", "target", "tools", "uninstall", "update",
         "usage", "vault",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "browser",
@@ -3272,6 +3273,7 @@ def _build_cli_parser():
     build_update_parser(subparsers, cmd_update=cmd_update)
     build_uninstall_parser(subparsers, cmd_uninstall=cmd_uninstall)
     build_acp_parser(subparsers, cmd_acp=cmd_acp)
+    build_target_parser(subparsers)
     build_profile_parser(subparsers, cmd_profile=cmd_profile)
     build_completion_parser(subparsers, cmd_completion=cmd_completion, parser=parser)
     build_dashboard_parser(
@@ -3370,7 +3372,7 @@ def main():
 
     _recover_update_debts_on_startup()  # owed fleet restarts, gateways a killed update paused
 
-    if _first_positional_argv() != "update":
+    if not _early_recovery_mod.defers_boot_home_maintenance(_first_positional_argv()):
         from hermes_cli.boot_bootstrap import maybe_run_boot_bootstrap
         from pm.paths import install_root
         maybe_run_boot_bootstrap(install_root())

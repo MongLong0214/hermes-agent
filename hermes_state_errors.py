@@ -324,3 +324,60 @@ def classify_persistence_error(exc_or_str) -> str:
     if is_disk_full_error(exc_or_str) or any(m in text for m in ("disk", "readonly", "read-only")):
         return "disk"
     return "unknown"
+
+
+# ── state.db lineage refusals (hermes_state_fence decides; these carry the verdict) ──
+
+SCHEMA_CAUSE_BUILD_TOO_OLD = "BUILD_TOO_OLD"
+SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH = "FENCE_GENERATION_MISMATCH"
+SCHEMA_CAUSE_VERSION_UNREADABLE = "SCHEMA_VERSION_UNREADABLE"
+SCHEMA_INCOMPATIBLE_CAUSES = frozenset({
+    SCHEMA_CAUSE_BUILD_TOO_OLD, SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH, SCHEMA_CAUSE_VERSION_UNREADABLE,
+})
+
+# A fence mismatch fires in either direction (older or newer writer), so its text never says "newer".
+_INCOMPATIBLE_SCHEMA_HEADS = {
+    SCHEMA_CAUSE_BUILD_TOO_OLD: "Session state schema is newer than this Hermes build",
+    SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH: "Session state turn-fence generation does not match this Hermes build",
+    SCHEMA_CAUSE_VERSION_UNREADABLE: "Session state does not record exactly one integer schema version",
+}
+_INCOMPATIBLE_SCHEMA_GENERATIONS = {
+    SCHEMA_CAUSE_BUILD_TOO_OLD: " (expected generation {expected}, actual generation {actual})",
+    SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH: " (build generation {expected}, stored generation {actual})",
+}
+
+
+class IncompatibleSchemaError(RuntimeError):
+    """This build must not open the store at all. Deliberately NOT an ``sqlite3.DatabaseError``: every
+    DatabaseError path in the open/repair stack treats the file as damaged and may quarantine, rebuild
+    FTS or VACUUM it, which would destroy a store that is healthy for the build that wrote it."""
+
+    code = "STATE_DB_SCHEMA_INCOMPATIBLE"
+
+    def __init__(self, *, cause: str, expected_generation, actual_generation, detail: str = ""):
+        if cause not in SCHEMA_INCOMPATIBLE_CAUSES:
+            raise ValueError(f"unknown schema incompatibility cause: {cause!r}")
+        self.cause = cause
+        self.expected_generation = expected_generation
+        self.actual_generation = actual_generation
+        self.detail = detail
+        suffix = f" ({detail})" if detail else ""
+        generations = _INCOMPATIBLE_SCHEMA_GENERATIONS.get(cause, "").format(
+            expected=expected_generation, actual=actual_generation)
+        super().__init__(
+            f"{_INCOMPATIBLE_SCHEMA_HEADS[cause]}{generations}{suffix}; refusing to open it, and nothing was changed.")
+
+
+class ForwardSchemaMigrationAdmissionError(RuntimeError):
+    """The open would migrate a store another build owns, and that build's gateway (or a sibling's
+    migration that outlived its wait) holds the profile's ``gateway.lock``. Not a DatabaseError, and
+    its text says neither "locked" nor "busy": no repair path and no lock-patience retry may take it."""
+
+    code = "STATE_DB_FORWARD_MIGRATION_ADMISSION_BLOCKED"
+
+    def __init__(self, *, stored, lock_path, detail: str):
+        self.stored, self.lock_path, self.detail = stored, lock_path, detail
+        super().__init__(
+            f"This profile's session history is still in another Hermes build's format (stored generation "
+            f"{stored}) and this version cannot upgrade it now: {detail} ({lock_path}). Nothing was changed. "
+            "Stop the gateway that runs on this profile, then start this version again.")
