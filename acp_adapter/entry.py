@@ -177,7 +177,13 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     _setup_logging()
-    _load_env()
+    # Dark mode: a parent launcher that already scoped this process's environment sets the exact
+    # value 1 (whitespace ignored) to skip this load; any other value keeps it. A launch without
+    # argv re-enters through hermes_cli.main, whose import has already loaded the .env. MCP is not
+    # loaded here either way (it belongs to the gateway daemon).
+    # health: allow HX002 -- launcher contract carried from the fork; it must be read before .env or config.yaml
+    if os.environ.get("HERMES_ACP_SKIP_ENV_LOAD", "").strip() != "1":
+        _load_env()
 
     logger = logging.getLogger(__name__)
     logger.info("Starting hermes-agent ACP adapter")

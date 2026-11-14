@@ -1,5 +1,6 @@
 """Tests for acp_adapter.entry startup wiring."""
 
+import os
 import sys
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import acp
 import pytest
 
 from acp_adapter import entry
+from hermes_constants import get_hermes_home
 
 
 def test_main_enables_unstable_protocol(monkeypatch):
@@ -42,6 +44,61 @@ def test_main_skips_configured_mcp_discovery_when_requested(monkeypatch):
     entry.main([])
 
     assert discovery_calls == []
+
+
+_CANARY_KEY = "ACP_DARK_CANARY_API_KEY"
+_CANARY_VALUE = "sk-acp-dark-canary-not-a-real-key"
+
+
+@pytest.fixture
+def secret_profile_env(monkeypatch, tmp_path):
+    """Put a secret in this test's temp profile ``.env`` (never the real HERMES_HOME)."""
+    home = get_hermes_home()
+    assert tmp_path in home.parents
+    (home / ".env").write_text(f"{_CANARY_KEY}={_CANARY_VALUE}\n", encoding="utf-8")
+    # The real dotenv load writes os.environ directly; registering the key lets monkeypatch drop it after.
+    monkeypatch.setenv(_CANARY_KEY, "")
+    monkeypatch.delenv(_CANARY_KEY)
+
+
+def _run_main(monkeypatch, env_value):
+    discovery_calls, agent_calls = [], []
+
+    async def fake_run_agent(agent, **kwargs):
+        agent_calls.append((agent, kwargs))
+
+    monkeypatch.setattr(entry, "_setup_logging", lambda: None)
+    for target in ("tools.mcp_tool_discovery.discover_mcp_tools",
+                   "hermes_cli.mcp_startup.start_background_mcp_discovery"):
+        monkeypatch.setattr(target, lambda *_a, **_k: discovery_calls.append(True))
+    if env_value is None:
+        monkeypatch.delenv("HERMES_ACP_SKIP_ENV_LOAD", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_ACP_SKIP_ENV_LOAD", env_value)
+    monkeypatch.setattr(acp, "run_agent", fake_run_agent)
+
+    entry.main([])
+
+    assert discovery_calls == []  # MCP belongs to the gateway daemon either way
+    assert len(agent_calls) == 1
+    return agent_calls
+
+
+@pytest.mark.parametrize("env_value", [pytest.param("1", id="exact"), pytest.param(" 1 ", id="padded")])
+def test_main_dark_mode_skips_dotenv_and_mcp_but_runs_agent(monkeypatch, secret_profile_env, env_value):
+    _run_main(monkeypatch, env_value)
+
+    assert _CANARY_KEY not in os.environ
+
+
+@pytest.mark.parametrize(
+    "env_value",
+    [pytest.param(None, id="missing"), pytest.param("0", id="zero"), pytest.param("true", id="nonliteral")],
+)
+def test_main_loads_dotenv_unless_dark_value_is_exactly_1(monkeypatch, secret_profile_env, env_value):
+    _run_main(monkeypatch, env_value)
+
+    assert os.environ.get(_CANARY_KEY) == _CANARY_VALUE
 
 
 
