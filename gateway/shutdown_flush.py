@@ -6,7 +6,8 @@ All hooks write atomic JSON payloads under ``<hermes_home>/pending_messages/``:
 ``flush_pending_to_file`` / ``flush_overflow_to_file`` (queue head / FIFO tail, before clear),
 ``recover_pending_to_db`` (after ``runner.start()``; replays via ``SessionDB.append_message``,
 deletes each file on success), ``flush_agent_history_to_file`` (DB flush raised),
-``spool_dropped_transcript_message`` / ``drain_transcript_spool``.
+``spool_dropped_transcript_message`` / ``drain_transcript_spool``, and the inbound turn records
+(``store_inbound_record`` ... ``inbound_event_from_record``) that keep an owner message until its turn ends.
 """
 
 from __future__ import annotations
@@ -84,6 +85,8 @@ def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> Path:
 def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **extra: Any) -> bool:
     """Serialise and write one pending value; return True when a payload was written."""
     try:
+        if inbound_record_exists(getattr(value, "_inbound_record_id", None)):
+            return False  # its inbound record already holds it; a copy here would run it twice
         serialised = _serialise_value(value)
         if serialised is None:
             return False
@@ -197,6 +200,121 @@ def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = 
     return replayed, remaining
 
 
+# Inbound turn records: one durable store with the pending-message spool above. An owner message's
+# turn writes its record (``inbound-<recovery id>.json``) before it takes the message from the queue and
+# claims the session, and deletes it once the turn has ended; a restart that cut the turn short leaves
+# it, and the next process re-admits the message through its adapter (gateway/run_startup.py). The
+# record holds the whole event, so it runs again as the message it was: same source, receiving bot
+# (``transport_profile``), chat, message id and flags. ``recover_pending_to_db`` never replays one, and
+# the flushes above skip an event whose record is on disk (it would otherwise exist twice).
+INBOUND_TURN_REASON = "inbound_turn"
+_INBOUND_PREFIX = "inbound-"
+_INBOUND_EVENT_FIELDS = (
+    "text", "message_id", "ledger_message_id", "reply_anchor_override", "platform_update_id", "media_urls",
+    "media_types", "media_text_inlined", "reply_to_message_id", "reply_to_text", "reply_to_author_id",
+    "reply_to_author_name", "reply_to_is_own_message", "prompt_response", "auto_skill", "channel_prompt",
+    "channel_context", "internal", "metadata", "allow_gateway_control", "user_id", "user_name",
+)
+# Trust signals SessionSource.to_dict() leaves off the wire on purpose; a local record keeps them.
+_INBOUND_SOURCE_FLAGS = ("is_bot", "role_authorized", "delivered_via_upstream_relay")
+
+
+def _inbound_record_path(recovery_id: str) -> Path:
+    # The launch home, like the delivery ledger: a served profile's turn runs under that profile's home
+    # override, but the startup that re-admits the record reads from the launch context.
+    from hermes_constants import get_process_hermes_home
+    spool = get_process_hermes_home() / "pending_messages"
+    spool.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return spool / f"{_INBOUND_PREFIX}{recovery_id}.json"
+
+
+def next_inbound_order() -> list:
+    """Arrival order of a new record, on the flush payloads' own sequence (see ``_FLUSH_ORDER_SEQ``)."""
+    return [_FLUSH_EPOCH_NS, next(_FLUSH_ORDER_SEQ)]
+
+
+def store_inbound_record(event: Any, *, session_key: str, transport_profile: Optional[str],
+                         recovery_id: str, order) -> None:
+    """Write *event*'s inbound record atomically (temp file, fsync, rename, directory fsync). Raises
+    when the record is not durably on disk; rewriting a record keeps its file and recovery id."""
+    from datetime import datetime
+
+    from utils import atomic_json_write
+    source = event.source
+    data: Dict[str, Any] = {name: getattr(event, name, None) for name in _INBOUND_EVENT_FIELDS}
+    data["message_type"] = getattr(event.message_type, "value", event.message_type)
+    stamp = getattr(event, "timestamp", None)
+    data["timestamp"] = stamp.isoformat() if isinstance(stamp, datetime) else None
+    stt_text = getattr(event, "_gateway_pending_stt_text", None)
+    if isinstance(stt_text, str) and stt_text:
+        data["pending_stt_text"] = stt_text
+    data["source"] = {**source.to_dict(),
+                      **{flag: bool(getattr(source, flag, False)) for flag in _INBOUND_SOURCE_FLAGS}}
+    atomic_json_write(_inbound_record_path(recovery_id), {
+        "reason": INBOUND_TURN_REASON, "recovery_id": recovery_id, "session_key": session_key,
+        "transport_profile": transport_profile, "order": list(order), "event": data,
+    }, mode=0o600, default=str, fsync_dir=True)
+
+
+def inbound_record_exists(recovery_id: Any) -> bool:
+    return isinstance(recovery_id, str) and bool(recovery_id) and _inbound_record_path(recovery_id).exists()
+
+
+def discard_inbound_record(recovery_id: str) -> None:
+    """Delete a record once its turn has ended (a failure is logged; the next start then judges it)."""
+    try:
+        _inbound_record_path(recovery_id).unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Could not delete inbound record %s: %s", recovery_id, exc)
+
+
+def load_inbound_records() -> list:
+    """Every readable record, in arrival order. An unreadable file is kept and logged, never deleted."""
+    from hermes_constants import get_process_hermes_home
+    spool = get_process_hermes_home() / "pending_messages"
+    records = []
+    for path in spool.glob(f"{_INBOUND_PREFIX}*.json") if spool.is_dir() else ():
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            valid = (isinstance(record, dict) and record.get("reason") == INBOUND_TURN_REASON
+                     and isinstance(record.get("recovery_id"), str) and isinstance(record.get("session_key"), str)
+                     and isinstance(record.get("event"), dict) and isinstance(record["event"].get("source"), dict))
+        except Exception:
+            valid = False
+        if not valid:
+            logger.warning("Unreadable inbound record %s kept for manual inspection", path)
+            continue
+        records.append(record)
+    return sorted(records, key=lambda r: (list(r.get("order") or []), r["recovery_id"]))
+
+
+def inbound_event_from_record(record: Dict[str, Any]) -> Any:
+    """The ``MessageEvent`` a record holds, flags included (``internal`` stays as stored)."""
+    from datetime import datetime
+
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.session import SessionSource
+    data = record["event"]
+    source = SessionSource.from_dict(data["source"])
+    for flag in _INBOUND_SOURCE_FLAGS:
+        setattr(source, flag, bool(data["source"].get(flag, False)))
+    fields = {name: data[name] for name in _INBOUND_EVENT_FIELDS if name in data}
+    for name in ("media_urls", "media_types", "media_text_inlined"):
+        fields[name] = list(fields.get(name) or [])
+    fields["metadata"] = dict(fields.get("metadata") or {})
+    for name in ("internal", "reply_to_is_own_message"):
+        fields[name] = bool(fields.get(name, False))
+    fields["allow_gateway_control"] = bool(fields.get("allow_gateway_control", True))
+    stamp = data.get("timestamp")
+    if isinstance(stamp, str) and stamp:
+        fields["timestamp"] = datetime.fromisoformat(stamp)
+    event = MessageEvent(message_type=MessageType(data.get("message_type") or MessageType.TEXT.value),
+                         source=source, **fields)
+    if isinstance(data.get("pending_stt_text"), str):
+        event._gateway_pending_stt_text = data["pending_stt_text"]
+    return event
+
+
 def _json_safe(value: Any) -> bool:
     try:
         json.dumps(value)
@@ -295,6 +413,8 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
                 # insertion.
                 if payload.get("reason") == "shutdown-with-unpersisted-agent-history":
                     continue
+                if payload.get("reason") == INBOUND_TURN_REASON:
+                    continue  # re-admitted as the owner's message at startup, never replayed as a row
                 if _recover_one_payload(session_db, path, payload,
                                         session_resolver=session_resolver):
                     recovered += 1

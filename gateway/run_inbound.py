@@ -1384,6 +1384,11 @@ class GatewayInboundMixin:
             # A canonical peer turn was admitted during the awaits above: claiming now would overwrite
             # its running slot and generation and fail its answer (canonical_turn_interrupted).
             return self._queue_behind_peer_turn(event, _quick_key)
+        # The owner message is on disk before the queue gives it up and the session is claimed: from
+        # here until its turn ends, its inbound record is the copy that outlives a restart. Internal
+        # events and /acp tasks get none (neither is re-run as owner input).
+        if not is_internal and not _acp_managed and not self._store_inbound_record(_incoming, _quick_key):
+            return self._INBOUND_RECORD_REFUSED
         self._take_queued_event_for_claim(_incoming, _quick_key, _reservation)
 
         # Claim this session before any await: many awaits sit between here and _run_agent
@@ -1395,13 +1400,21 @@ class GatewayInboundMixin:
             if _acp_managed:
                 # The receipt is claimed but the turn will not run: record the definite non-run.
                 acp_managed_ingress.abort_claimed(event._acp_admission)
+            self._settle_inbound_record(_incoming, _quick_key, completed=True)
             return _limit_message
 
+        _settled_event = _incoming  # whose inbound record this turn settles when it ends
         if not _acp_managed and _reservation is None:
             # A managed task must run as THIS turn: the rescue would park it behind an orphan, where
             # it would later drain as an ordinary turn without its admission. A reserved follow-up is
             # the FIFO head itself.
+            _before_rescue = event
             event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
+            if event is not _before_rescue:
+                # The orphan runs as this turn; the incoming message waits in the FIFO with its record.
+                _settled_event = event
+                if not is_internal:
+                    self._store_inbound_record(event, _quick_key)  # best effort: it was only in memory
 
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:
@@ -1412,10 +1425,12 @@ class GatewayInboundMixin:
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
+        _turn_ended = False  # the turn returned, as opposed to raising or being cancelled
         try:
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
+                _turn_ended = True
                 # A rejected message, not a completed turn: return before the /goal judge so it
                 # cannot consume the resend notice and enqueue a synthetic continuation loop.
                 if getattr(event, "_acp_admission", None) is not None:
@@ -1435,6 +1450,7 @@ class GatewayInboundMixin:
                     "protect the transcript, this message was not processed. "
                     "Wait for the active turn to finish, then resend it."
                 )
+            _turn_ended = True
             try:
                 await self._run_post_turn_hooks(
                     agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
@@ -1447,6 +1463,9 @@ class GatewayInboundMixin:
             # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.
             self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
             try:
+                # Record before marker: a death between the two leaves the marker, whose recovery
+                # already covers a turn that ended (gateway/run_startup.py, _recover_unclean_sessions).
+                self._settle_inbound_record(_settled_event, _quick_key, completed=_turn_ended)
                 # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean
                 # startup's recovery pass. A turn the adapter delivers hands its marker to that
                 # lifecycle, which clears it only once the reply is in the delivery ledger (else a
@@ -1467,6 +1486,67 @@ class GatewayInboundMixin:
                 # Turn lease is keyed by (routing key, run generation) so this unwind can only free
                 # the lease its own turn acquired, never a newer turn's.
                 self._release_turn_lease(_quick_key, _run_generation)
+
+    _INBOUND_RECORD_REFUSED = (
+        "⚠️ This message could not be saved for recovery, so it was not processed. Please send it again.")
+
+    def _inbound_live_ids(self) -> set:
+        """Recovery ids of the inbound records this process wrote, re-admitted or settled: the resume
+        scheduler never re-admits one of them in this process (their turn is its own)."""
+        live = self.__dict__.get("_inbound_records_live")
+        if live is None:
+            live = self.__dict__["_inbound_records_live"] = set()
+        return live
+
+    def _store_inbound_record(self, event: MessageEvent, session_key: str) -> bool:
+        """Durably store an owner message's inbound record (gateway/shutdown_flush.py): its full event,
+        session key and receiving bot. Synchronous, just before its turn takes it from the queue and
+        claims the session; a re-admitted message keeps its recovery id and arrival order. False when it
+        could not be written, so the caller claims nothing."""
+        import uuid
+
+        from gateway import shutdown_flush
+        from gateway.session_identity import transport_profile_of
+        recovery_id = getattr(event, "_inbound_record_id", None) or uuid.uuid4().hex
+        order = getattr(event, "_inbound_record_order", None) or shutdown_flush.next_inbound_order()
+        try:
+            shutdown_flush.store_inbound_record(
+                event, session_key=session_key, transport_profile=transport_profile_of(event.source),
+                recovery_id=recovery_id, order=order)
+        except Exception as exc:
+            logger.warning("Could not store the inbound record for %s, so its turn is refused before the "
+                           "claim: %s", session_key, exc)
+            return False
+        event._inbound_record_id, event._inbound_record_order = recovery_id, order
+        event._inbound_record_claimed = True
+        self._inbound_live_ids().add(recovery_id)
+        return True
+
+    def _settle_inbound_record(self, event: Optional[MessageEvent], session_key: str, *, completed: bool) -> None:
+        """The turn holding *event*'s inbound record has ended. Cut short by a restart, the record stays
+        for the next process: the turn raised or was cancelled while the gateway drains, or it returned
+        while its session is still resume_pending (the drain marks a running session before it
+        interrupts it, and only a completed turn clears the mark). Any other end deletes it."""
+        recovery_id = getattr(event, "_inbound_record_id", None)
+        if not recovery_id:
+            return
+        try:
+            if self._draining and not (completed and not self._resume_still_pending(session_key)):
+                logger.info("A restart cut the turn on %s short; its inbound record stays for the next "
+                            "process", session_key)
+                return
+            from gateway import shutdown_flush
+            shutdown_flush.discard_inbound_record(recovery_id)
+            event._inbound_record_id = event._inbound_record_order = None
+        except Exception:
+            logger.warning("Settling the inbound record of %s failed", session_key, exc_info=True)
+
+    def _resume_still_pending(self, session_key: str) -> bool:
+        try:
+            entry = self.session_store.lookup_by_session_key_existing(session_key)
+        except Exception:
+            return True  # unknown: keep the record; the next start reads the transcript
+        return bool(getattr(entry, "resume_pending", False))
 
     def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
         """Restore the per-session model override captured by ``/model --once`` or ``/moa``.

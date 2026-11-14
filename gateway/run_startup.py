@@ -701,9 +701,13 @@ class GatewayStartupMixin:
         candidates = self._resume_pending_candidates(platform)
         if candidates is None:
             return 0
+        # A session holding an inbound record resumes by re-running that message, never by an empty turn.
+        held = self._readmit_inbound_records(platform)
         now = datetime.now()
         scheduled = 0
         for entry in candidates:
+            if entry.session_key in held:
+                continue
             marker = entry.last_resume_marked_at or entry.updated_at
             if marker is not None and (now - marker).total_seconds() > window:
                 continue
@@ -740,6 +744,121 @@ class GatewayStartupMixin:
         if scheduled:
             logger.info("Scheduled auto-resume for %d restart-interrupted session(s)", scheduled)
         return scheduled
+
+    def _readmit_inbound_records(self, platform=None) -> set:
+        """Re-admit the owner messages an earlier process stored and never finished (gateway/
+        shutdown_flush.py, inbound turn records): each session's, in arrival order, through its adapter's
+        ``handle_message`` like any inbound, on the bot named by the record's transport profile. A
+        record this process wrote or already re-admitted is left alone, so each is re-admitted once per
+        process; one whose bot is offline (re-called on reconnect, scoped to ``platform``) or whose
+        session is busy waits for a later call, its file untouched. Returns the session keys holding a
+        record: their empty auto-resume is skipped."""
+        from gateway import shutdown_flush
+        try:
+            records = shutdown_flush.load_inbound_records()
+        except Exception:
+            logger.warning("Could not read the inbound records; none re-admitted", exc_info=True)
+            return set()
+        live = self._inbound_live_ids()
+        sessions: Dict[str, list] = {}
+        for record in records:
+            if record["recovery_id"] not in live:
+                sessions.setdefault(record["session_key"], []).append(record)
+        for session_key, batch in sessions.items():
+            targets = []
+            for record in batch:
+                try:
+                    event, adapter = self._inbound_record_target(record)
+                except Exception:
+                    logger.warning("Inbound record %s is unreadable; kept", record["recovery_id"], exc_info=True)
+                    break
+                if adapter is None or (platform is not None and event.source.platform != platform):
+                    break
+                targets.append((record, event, adapter))
+            if len(targets) < len(batch) or self._is_session_running(session_key):
+                continue
+            live.update(record["recovery_id"] for record, _event, _adapter in targets)
+            task = self._retain_background_task(asyncio.create_task(
+                self._readmit_session_records(session_key, targets)))
+            if getattr(self, "_startup_restore_in_progress", False):
+                tasks = getattr(self, "_startup_restore_tasks", None)
+                if tasks is None:
+                    tasks = self._startup_restore_tasks = []
+                tasks.append(task)
+            logger.info("Re-admitting %d stored owner message(s) for %s", len(targets), session_key)
+        return set(sessions)
+
+    def _inbound_record_target(self, record: dict):
+        """``(event, adapter)``: the stored event, its routing identity restored from the record's
+        transport profile, and the adapter of the bot that received it (None while that bot is offline)."""
+        from gateway import shutdown_flush
+        from gateway.session_identity import restore_identity
+        event = shutdown_flush.inbound_event_from_record(record)
+        restore_identity(event.source, runner=self, transport_profile=record.get("transport_profile"))
+        event._inbound_record_id, event._inbound_record_order = record["recovery_id"], record.get("order")
+        event._hermes_startup_restore_replay = True  # accepted before the restart: not held by the gate
+        return event, self._delivery_adapter_for(event.source)
+
+    async def _readmit_session_records(self, session_key: str, targets: list) -> None:
+        """Run one session's stored messages in order. A message the transcript shows answered (its user
+        row, by message id, followed by a final reply) is consumed without a turn. The record, not an
+        empty auto-resume, answers the interrupted turn, so the session's resume flag is cleared first. A
+        message the inbound path declined (refused, a command, steered into a running turn) is consumed;
+        one it queued keeps its record until its own turn settles it."""
+        from gateway import shutdown_flush
+        cleared = False
+        for record, event, adapter in targets:
+            recovery_id = record["recovery_id"]
+            if await self._inbound_record_answered(record):
+                logger.info("Stored owner message %s on %s was already answered; consumed", recovery_id, session_key)
+                shutdown_flush.discard_inbound_record(recovery_id)
+                continue
+            if not cleared:
+                cleared = True
+                with suppress(Exception):
+                    await self.async_session_store.clear_resume_pending(session_key)
+            try:
+                await adapter.handle_message(event)
+                session_tasks = getattr(adapter, "_session_tasks", {})
+                task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
+                if task is not None:
+                    await asyncio.shield(task)
+            except Exception:
+                logger.warning("Re-admitting stored owner message %s failed; kept", recovery_id, exc_info=True)
+                continue
+            if (getattr(event, "_inbound_record_id", None) == recovery_id
+                    and not getattr(event, "_inbound_record_claimed", False)
+                    and not self._draining and not self._event_is_queued(session_key, event)):
+                shutdown_flush.discard_inbound_record(recovery_id)
+
+    async def _inbound_record_answered(self, record: dict) -> bool:
+        """True when the record's message already has its answer in the transcript: its user row (by
+        platform message id) is followed by a final assistant reply before the next user row. A record
+        without a message id cannot be matched and is re-admitted."""
+        from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND
+        message_id = record["event"].get("message_id")
+        entry = self.session_store.lookup_by_session_key_existing(record["session_key"]) if message_id else None
+        if entry is None:
+            return False
+        try:
+            history = await self.async_session_store.load_transcript(entry.session_id)
+        except Exception:
+            return False
+        answered = asking = False
+        for row in history:
+            if row.get("role") == "user":
+                asking = str(row.get("message_id") or "") == str(message_id)
+                answered = answered and not asking  # a later copy of the message is asked anew
+            elif (asking and row.get("role") == "assistant" and not row.get("tool_calls")
+                  and isinstance(row.get("content"), str) and row["content"].strip()
+                  and row.get("display_kind") != FAILED_TURN_DISPLAY_KIND):
+                answered, asking = True, False
+        return answered
+
+    def _event_is_queued(self, session_key: str, event: MessageEvent) -> bool:
+        adapter = self._adapter_holding_pending(session_key)
+        head = adapter._pending_messages.get(session_key) if adapter is not None else None
+        return head is event or any(queued is event for queued in (self._overflow_queue(session_key) or ()))
 
     def _startup_should_abort(self) -> bool:
         return self._restart_requested or self._draining or self._shutdown_event.is_set()
