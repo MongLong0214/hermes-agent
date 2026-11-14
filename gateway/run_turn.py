@@ -276,6 +276,16 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             await asyncio.to_thread(acp_managed_ingress.abort_failed_turn, admission)
         return None
 
+    async def _acp_mark_followup_start(self, admission: Any, session_key: str) -> bool:
+        """Before an ordinary follow-up runs in a managed chain, record its start time under the
+        managed marker; crash recovery then owes exactly the reply an ordinary turn begun at that time
+        would owe. False when it could not be recorded."""
+        from gateway import acp_managed_ingress
+        with self.session_store._lock:  # noqa: SLF001 — this turn's own marker token
+            _entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+            token = getattr(_entry, "active_turn_token", None)
+        return await asyncio.to_thread(acp_managed_ingress.mark_followup_start, admission, token, time.time())
+
     async def _acp_release_failed_turn(self, event) -> None:
         """A managed turn ended without an answer: what goes out is a notice, so it must not carry or
         certify the admission. With no answer of the update ever recorded the receipt is a definite
@@ -1763,9 +1773,6 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 session_key or "?",
             )
             try:
-                # A queued first response that is not the managed turn's model answer settles its receipt
-                # as a failed turn. This send carries no admission, so an answer here leaves it in doubt.
-                await self._acp_first_response_admission(turn_ctx, _delivery_result)
                 _text_delivered = await self._deliver_queued_first_response(
                     first_response, source=turn_ctx.source, adapter=adapter,
                     metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
@@ -1774,6 +1781,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                    # Only the managed turn's model answer carries its admission (its ledgered send
+                    # settles the receipt); any other first response settles it as a failed turn.
+                    acp_admission=await self._acp_first_response_admission(turn_ctx, _delivery_result),
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
@@ -1914,6 +1924,13 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker
         # (the helper's own ``except Exception`` does not catch cancellation).
         try:
+            _chain_admission = getattr(turn_ctx, "acp_admission", None)
+            if _chain_admission is not None and not await self._acp_mark_followup_start(_chain_admission, session_key):
+                # The follow-up still runs in-band (the drain's order, hooks and commands stay intact, and
+                # the managed answer keeps its own delivery). Only crash recovery degrades: without a
+                # recorded start, a crash during this follow-up suppresses its reply with the managed turn.
+                logger.warning("Managed chain follow-up start not recorded for %s; a crash during it will not "
+                               "recover its reply", session_key)
             await self._refresh_agent_cache_message_count(session_key, session_id)
             # The follow-up is its own sender's turn: approvals it raises name that sender, not the opener.
             with scoped_turn_actor(pending_event, self._session_state(session_key).turn) if pending_event is not None else nullcontext():
@@ -2306,10 +2323,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             reply_expected=reply_expected,
             persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
+            acp_admission=acp_admission,
         )
-        # The ACP admission this turn runs under (an explicit /acp task); None for every other turn,
-        # including the follow-ups that drain after it.
-        turn_ctx.acp_admission = acp_admission
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
