@@ -1082,10 +1082,10 @@ def _cron_delivery_notify_enabled(cfg: Optional[dict]) -> bool:
 
 
 def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
-    """Persist ``last_delivery_unverified``: list of ``platform:chat_id[:thread_id]`` targets acked with no
-    evidence, or None, alongside queued Bot Chat receipts. Never raises (bookkeeping must not fail a
-    delivery)."""
-    new_value = list(unverified_targets) or None
+    """Persist ``last_delivery_unverified`` (``platform:chat_id[:thread_id]`` targets acked with no evidence,
+    closed: cron/jobs_public_status.py) and queued Bot Chat receipts. Never raises (bookkeeping)."""
+    from cron.jobs_public_status import public_delivery_unverified
+    new_value = public_delivery_unverified(list(unverified_targets))
     queued = {target: receipt for target, receipt in
               job.get("_bot_chat_delivery_receipts", {}).items()
               if receipt["status"] in ("queued", "claimed")} or None

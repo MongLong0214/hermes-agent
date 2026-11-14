@@ -13,6 +13,7 @@ from datetime import datetime
 import pytest
 
 from cron.jobs import create_job, get_job, mark_job_run
+from cron.jobs_public_status import public_delivery_error, public_run_error
 
 
 @pytest.fixture()
@@ -31,7 +32,7 @@ class TestLastFailureStamp:
 
         stamp = get_job(job["id"])["last_failure"]
         assert isinstance(stamp, dict)
-        assert stamp["detail"] == "Script exited with code 1"
+        assert stamp["detail"] == public_run_error("Script exited with code 1")
         # Timestamp parses as ISO.
         datetime.fromisoformat(stamp["at"])
 
@@ -47,14 +48,17 @@ class TestLastFailureStamp:
         healed = get_job(job["id"])
         assert healed["last_status"] == "ok"
         assert healed["failure_streak"] == 0
-        assert healed["last_failure"]["detail"] == "Script exited with code 1"
+        assert healed["last_failure"]["detail"] == public_run_error("Script exited with code 1")
 
     def test_latest_failure_wins(self, tmp_cron_dir):
         job = create_job(prompt="Watch the fleet", schedule="every 1h")
         mark_job_run(job["id"], success=False, error="first failure")
         mark_job_run(job["id"], success=True)
         mark_job_run(job["id"], success=False, error="second failure")
-        assert get_job(job["id"])["last_failure"]["detail"] == "second failure"
+        record = get_job(job["id"])
+        assert record["last_failure"]["detail"] == public_run_error("second failure")
+        # Both failures share a closed label, so the stamp's time says which one it is.
+        assert record["last_failure"]["at"] == record["last_run_at"]
 
     def test_success_without_prior_failure_leaves_no_stamp(self, tmp_cron_dir):
         job = create_job(prompt="Watch the fleet", schedule="every 1h")
@@ -74,4 +78,4 @@ class TestLastFailureStamp:
             job["id"], success=True, delivery_error="webhook unreachable") is True
         record = get_job(job["id"])
         assert record.get("last_failure") is None
-        assert record["last_delivery_error"] == "webhook unreachable"
+        assert record["last_delivery_error"] == public_delivery_error("webhook unreachable")

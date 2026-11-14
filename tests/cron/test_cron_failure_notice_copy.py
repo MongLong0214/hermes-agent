@@ -5,10 +5,17 @@ The classifier is `agent.error_classifier.classify_api_error`; these tests pin w
 does with its verdict, not the verdict itself.
 """
 
+import os
 import re
+from pathlib import Path
+
+import pytest
 
 from cron import scheduler
+from cron.jobs import get_cron_output_dir
+from cron.jobs_public_status import failure_cause, failure_kind
 from cron.scheduler import _compose_run_delivery, _summarize_cron_failure_for_delivery
+from cron.scheduler_failure_copy import cron_output_dir_display
 
 JOB = {"name": "Morning brief", "id": "ab12cd34"}
 _HTTP_LEAD = re.compile(r"failed: (HTTP|Error code:|provider )")
@@ -17,6 +24,47 @@ _HTTP_LEAD = re.compile(r"failed: (HTTP|Error code:|provider )")
 def _no_chain(monkeypatch):
     monkeypatch.setattr(scheduler, "load_config", dict)
     monkeypatch.setattr(scheduler, "get_fallback_chain", lambda cfg: [])
+
+
+def test_generic_failure_names_runs_and_pause_commands_and_the_real_output_dir():
+    raw = "[Errno 2] No such file or directory: '/x.py'"
+    msg = _summarize_cron_failure_for_delivery(JOB, raw)
+    assert "/x.py" not in msg and failure_cause(failure_kind(raw)) in msg  # closed cause, raw stays private
+    for cmd in ("hermes cron runs ab12cd34", "hermes cron run ab12cd34", "hermes cron pause ab12cd34"):
+        assert f"`{cmd}`" in msg
+    named = cron_output_dir_display("ab12cd34")
+    assert named in msg
+    # It names the real output dir; a home outside the user's reads `$HERMES_HOME`, not its host path.
+    resolved = Path(os.path.expandvars(os.path.expanduser(named))).resolve()
+    assert resolved == (get_cron_output_dir() / "ab12cd34").resolve()
+    assert "cron output" not in msg  # the unnamed internal location is gone
+
+
+_KEY = "sk-leakcanary0123456789abcdefghijklmnop"
+_URL = "https://user:hunter2@api.leakcanary.example/v1?key=leakcanary-q"
+
+
+@pytest.mark.parametrize("raw", [
+    f"HTTP 401: invalid api key {_KEY} at {_URL}",
+    f"Error code: 429 - rate limited for {_KEY} at {_URL}",
+    f"RuntimeError: Connection error. ({_URL}) token={_KEY}",
+    f"ImportError: cannot import name 'leakcanary' from '{_URL}'",
+])
+def test_failure_notice_never_carries_the_raw_error(monkeypatch, raw):
+    _no_chain(monkeypatch)
+    msg = _summarize_cron_failure_for_delivery(JOB, raw)
+    assert msg.startswith("⚠️ Cron 'Morning brief' failed: ")
+    for private in ("leakcanary", "hunter2", _KEY):
+        assert private not in msg, msg
+
+
+def test_output_dir_outside_the_user_home_is_named_not_printed(monkeypatch, tmp_path):
+    home = tmp_path / "custom-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user"))
+    assert cron_output_dir_display("ab12cd34") == "$HERMES_HOME/cron/output/ab12cd34/"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "user" / ".hermes"))
+    assert cron_output_dir_display("ab12cd34") == "~/.hermes/cron/output/ab12cd34/"
 
 
 
@@ -71,8 +119,9 @@ def test_cron_cause_gloss_is_the_shared_table():
 
 
 def test_blocked_config_notice_says_it_did_not_run_and_will_self_heal():
+    error = "[blocked_config] provider credential missing: no key in /Users/alice/.hermes/auth.json"
     text, blocked, *_ = _compose_run_delivery(
-        JOB, success=False, error="[blocked_config] provider credential missing: no key",
-        final_response="", output_file=None)
+        JOB, success=False, error=error, final_response="", output_file=None)
     assert blocked is True
-    assert "provider credential missing: no key" in text
+    assert failure_cause(failure_kind(error)) in text and "no key" not in text
+    assert "/Users/alice" not in text and "`hermes cron runs`" in text

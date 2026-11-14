@@ -42,7 +42,11 @@ def test_dead_drain_owner_settles_the_run_it_fenced_unknown(tmp_path, monkeypatc
     delivery_queue.drain(lambda *args: sent.append(args))
     saved = jobs.get_job(job["id"])
     assert sent == [], "an uncertain send is never retried"
-    assert saved["last_status"] == "delivery_failed" and "unknown" in saved["last_delivery_error"]
+    from cron.jobs_public_status import public_delivery_error
+    row = delivery_queue.get_status(execution["id"])
+    # The record gets the closed label; the queue row keeps the "unknown" reason.
+    assert saved["last_status"] == "delivery_failed" and "unknown" in (row["error"] or row["status"])
+    assert saved["last_delivery_error"] == public_delivery_error(row["error"] or "delivery unknown")
     assert executions.get_execution(execution["id"])["delivery_outcome"] == "failed"
 
 

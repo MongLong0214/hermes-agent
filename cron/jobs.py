@@ -38,7 +38,7 @@ from cron.jobs_invariants import _validate_job_mode_invariants, validate_schedul
 from cron.jobs_model_pin import _main_model_pin
 from cron import jobs_time
 from cron.scheduler_ownership import _claim_owner_is_dead
-from cron import extra_fire, store_health
+from cron import extra_fire, jobs_public_status as public_status, store_health
 from typing import Optional, Dict, List, Any, Callable, Set, Tuple, Union, Collection
 
 logger = logging.getLogger(__name__)
@@ -2404,7 +2404,10 @@ def _record_run_outcome(
     job["last_status"] = status or (
         "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
     cancelled = status == "cancelled"  # an operator stop is not a failure
-    job["last_error"] = None if success or cancelled else error
+    closed_error = public_status.public_run_error(error, no_agent=bool(job.get("no_agent")))
+    job["last_error"] = None if success or cancelled else closed_error
+    if delivery_failed:  # closed labels in the record; the adapter's reason survives in the log
+        logger.warning("Job '%s': result not delivered: %s", job.get("id"), delivery_error)
     if success:
         # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and clear
         # the forward-failure stamp so it only describes CURRENT auto-fire health.
@@ -2420,8 +2423,8 @@ def _record_run_outcome(
         # a monitor sampling jobs.json then sees a permanently green job. last_failure
         # survives success (latest failure wins); the recency window is the consumer's
         # call. Delivery failures keep their own sticky last_delivery_error.
-        job["last_failure"] = {"at": now, "detail": error or (status or "run failed")}
-    job["last_delivery_error"] = delivery_error
+        job["last_failure"] = {"at": now, "detail": closed_error or (status or "run failed")}
+    job["last_delivery_error"] = public_status.public_delivery_error(delivery_error)
     # Clear both claims: the run is over, so the job is claimable again.
     job["fire_claim"] = None
     job.pop("pending_slot", None)
@@ -2469,10 +2472,7 @@ def _advance_after_run(job: dict[str, Any], now: str, *, ladder_rung: bool = Fal
         # Recurring: transient failure (e.g. croniter missing) — disabling it would turn a missing
         # dep into "job completed" and silently drop the schedule.
         job["state"] = "error"
-        if not job.get("last_error"):
-            job["last_error"] = (
-                "Failed to compute next run for recurring schedule (is the 'croniter' package "
-                "installed in the gateway's Python env?)")
+        job["last_error"] = job.get("last_error") or public_status.NEXT_RUN_UNCOMPUTABLE
         logger.error(
             "Job '%s' (%s) could not compute next_run_at; "
             "leaving enabled and marking state=error so the job is not silently disabled.",

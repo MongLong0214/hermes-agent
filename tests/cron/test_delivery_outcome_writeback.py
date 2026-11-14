@@ -52,6 +52,11 @@ def test_drained_delivery_outcome_is_written_back(tmp_path, monkeypatch, transpo
         assert (saved["last_status"], saved["last_delivery_error"]) == ("ok", None)
         assert row["delivery_outcome"] == "delivered"
     else:
+        from cron.delivery_queue import get_status
+        from cron.jobs_public_status import public_delivery_error
+
         assert saved["last_status"] == "delivery_failed"
-        assert "transport refused" in saved["last_delivery_error"]
+        # The record gets the closed label; the queue row keeps the adapter's reason.
+        assert saved["last_delivery_error"] == public_delivery_error("transport refused")
+        assert "transport refused" in get_status(row["id"])["error"]
         assert row["delivery_outcome"] == "failed"

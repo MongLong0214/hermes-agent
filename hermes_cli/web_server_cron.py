@@ -127,8 +127,13 @@ def _cron_profile_home(profile: Optional[str]) -> tuple[str, Path]:
 def _annotate_cron_job(
     job: dict[str, Any], profile: str, home: Path, heartbeat_age: Optional[float] = None,
 ) -> dict[str, Any]:
+    """Every job the dashboard serves: the closed projection (no claims, origin or raw failure
+    text) plus the profile it lives in. A helper result that is no job record (``cancel_job_run``
+    has no ``id``) keeps its own keys."""
+    from cron.jobs_public_status import DASHBOARD_CRON_JOB_FIELDS, project_cron_job
+
     return {
-        **job,
+        **(project_cron_job(job, DASHBOARD_CRON_JOB_FIELDS) if "id" in job else job),
         "profile": profile,
         "profile_name": profile,
         "hermes_home": str(home),

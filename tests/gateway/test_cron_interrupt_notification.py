@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import pytest
 
+from cron.jobs_public_status import public_delivery_error
 from gateway.config import Platform
 from tests.gateway.restart_test_helpers import make_restart_runner
 from tools import browser_session_lifecycle as bt_lifecycle
@@ -261,8 +262,7 @@ class TestDeliveryErrorIsRecordedWhenTheNoticeCannotBeSent:
         finish_interrupted_run(before, execution["id"], "telegram: 502 Bad Gateway")
 
         after = get_job(before["id"])
-        # Raw until the closed public copy lands (E3-L2).
-        assert after["last_delivery_error"] == "telegram: 502 Bad Gateway"
+        assert after["last_delivery_error"] == public_delivery_error("telegram: 502 Bad Gateway")
         assert after["repeat"] == before["repeat"] and after["next_run_at"] == before["next_run_at"]
 
     def test_interrupted_uncertain_send_records_no_provider_text(self, tmp_path, monkeypatch):
@@ -329,7 +329,7 @@ class TestInterruptedRunKeepsItsQueuedNoticeOutcome:
         after, execution = self._interrupted_run(
             tmp_path, monkeypatch, {"success": False, "error": "transport refused"}, drain_first=True)
 
-        assert "transport refused" in (after["last_delivery_error"] or ""), after
+        assert after["last_delivery_error"] == public_delivery_error("transport refused"), after
         assert execution["delivery_outcome"] == "failed", execution
 
     def test_notice_still_queued_settles_the_ledger_when_drained(self, tmp_path, monkeypatch):
@@ -357,7 +357,7 @@ class TestInterruptedRunKeepsItsQueuedNoticeOutcome:
         assert executions.get_execution(execution["id"])["delivery_outcome"] == "failed"
         settled = jobs.get_job(after["id"])
         # Raw until the closed public copy lands (E3-L2), as on the drain-first path above.
-        assert "transport refused" in (settled["last_delivery_error"] or ""), settled
+        assert settled["last_delivery_error"] == public_delivery_error("transport refused"), settled
         assert (settled["repeat"], settled["next_run_at"]) == (after["repeat"], after["next_run_at"])
 
     def test_notice_drained_while_the_tail_runs_is_still_recorded(self, tmp_path, monkeypatch):
@@ -381,4 +381,4 @@ class TestInterruptedRunKeepsItsQueuedNoticeOutcome:
 
         assert drained == [1]
         assert execution["delivery_outcome"] == "failed", execution
-        assert "transport refused" in (after["last_delivery_error"] or ""), after
+        assert after["last_delivery_error"] == public_delivery_error("transport refused"), after

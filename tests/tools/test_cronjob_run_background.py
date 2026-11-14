@@ -248,8 +248,28 @@ class TestInFlightDedupe:
              }):
             res = _run_claimed_job(_job("job-bg-unknown"))
 
+        from cron.jobs_public_status import public_run_error
+
         assert res["success"] is False
-        assert res["error"] == "worker owner exited"
+        assert res["error"] == public_run_error("worker owner exited")
+
+    def test_failed_run_completion_relays_no_raw_output(self):
+        """A failed run's output file holds its raw error; the completion block the parent relays
+        to chat carries only the closed result. A run that succeeded still gets its excerpt."""
+        from tools.cronjob_tools import _manual_run_completion
+
+        raw = "Traceback: KeyError at https://u:hunter2@leakcanary.example /Users/alice/app.py"
+        closed = "The run ended with an error. Details: `hermes cron runs`."
+        failed = {"last_status": "error", "last_error": closed}
+        with patch("tools.cronjob_tools.get_job", return_value=failed), \
+             patch("tools.cronjob_tools._latest_job_output_excerpt", return_value=raw):
+            block = _manual_run_completion(
+                {"success": False, "error": closed}, "job-bg-x", "bg run", "telegram", 0.0)
+        assert "leakcanary" not in block["summary"] and closed in block["summary"]
+        with patch("tools.cronjob_tools.get_job", return_value={"last_status": "ok", "last_error": None}), \
+             patch("tools.cronjob_tools._latest_job_output_excerpt", return_value="report body"):
+            block = _manual_run_completion({"success": True}, "job-bg-x", "bg run", "telegram", 0.0)
+        assert "report body" in block["summary"]
 
     def test_background_dispatch_reports_running_job_immediately(self):
         """The dispatch path pre-checks the running set so a mid-run job
