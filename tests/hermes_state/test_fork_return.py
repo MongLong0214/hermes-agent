@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import signal
 import sqlite3
 from pathlib import Path
 
@@ -225,10 +227,31 @@ def fork_1030_store(path: Path) -> dict:
     return _shape(path)
 
 
+def run_input(db, session_id: str, request_id: str, text: str, *, transcript: bool, outcome="completed",
+              payload=None, cancel=False) -> int:
+    """One input through this build's real admission APIs: admitted, then cancelled before it runs, or claimed
+    and settled with *outcome* (its turn's user message written first when *transcript*). Returns the epoch."""
+    from hermes_state_runtime import (admit_session_input, begin_runtime_epoch, cancel_session_input,
+                                      claim_session_input, settle_session_input)
+
+    epoch = begin_runtime_epoch(db, instance_id="candidate-1")
+    admission = admit_session_input(db, epoch=epoch, principal_id="messaging:1", session_id=session_id,
+                                    request_id=request_id, payload=payload or {"text": text})
+    if cancel:
+        assert cancel_session_input(db, epoch=epoch, admission_id=admission["admission_id"])["outcome"] == "cancelled"
+        return epoch
+    claim = claim_session_input(db, epoch=epoch, session_id=session_id)
+    assert claim["admission_id"] == admission["admission_id"]
+    if transcript:
+        db.append_message(session_id, role="user", content=text)
+        db.append_message(session_id, role="assistant", content=f"answered: {text}")
+    settle_session_input(db, epoch=epoch, admission_id=claim["admission_id"], generation=claim["generation"],
+                         outcome=outcome)
+    return epoch
+
+
 def candidate_writes(path: Path) -> None:
     """Migrate to 1033 with this build's real migration, then write what this build writes."""
-    from hermes_state_runtime import admit_session_input, begin_runtime_epoch
-
     db = SessionDB(db_path=path)
     try:
         assert db._conn.execute("SELECT version FROM schema_version").fetchone()[0] == 1033
@@ -239,13 +262,9 @@ def candidate_writes(path: Path) -> None:
         db.end_session("s3", "user_exit")
         db.reopen_session("s3")
         assert db.try_acquire_session_turn_lease("tg1", "pid=1:turn=candidate", ttl_seconds=3600)
-        epoch = begin_runtime_epoch(db, instance_id="candidate-1")
-        admission = admit_session_input(db, epoch=epoch, principal_id="messaging:1", session_id="tg1",
-                                        request_id="r1", payload={"text": "done"})
+        epoch = run_input(db, "tg1", "r1", "done", transcript=True)
 
         def finish(conn):
-            conn.execute("UPDATE session_admissions SET status = 'terminal', outcome = 'completed' "
-                         "WHERE admission_id = ?", (admission["admission_id"],))
             conn.execute("INSERT INTO worker_executions VALUES ('x1', 'tg1', 'child', ?, 1, 'terminal', 'd', 1)", (epoch,))
             conn.execute("INSERT INTO worker_receipts VALUES ('x1', 1, 'p', '{}')")
             conn.execute("UPDATE conversation_generations SET generation = generation + 1 WHERE session_key = ?", (TG_KEY,))
@@ -329,8 +348,16 @@ def test_returned_store_is_the_forks_own_shape_with_every_row(stores):
     assert columns["messages.message_uid"]["non_default_rows"] == n_messages
     assert columns["sessions.created_source"]["non_default_rows"] >= 1
     assert columns["sessions.auto_archived"]["non_default_rows"] == 1
+    # Every column of every removed table has its disposition too, with how many of its rows were set.
+    removed = {f"{t}.{c}": "converted" for t in _UPSTREAM_ADDED_TABLES
+               for (c,) in _rows(source, f"SELECT name FROM pragma_table_xinfo('{t}')")}
+    assert len(removed) == 28
     assert {k: v["disposition"] for k, v in columns.items()} == {
-        f"{t}.{c}": "converted" for t, c in _UPSTREAM_ADDED_COLUMNS}
+        **{f"{t}.{c}": "converted" for t, c in _UPSTREAM_ADDED_COLUMNS}, **removed}
+    assert columns["session_admissions.payload_json"]["non_default_rows"] == 1
+    # The finished input is matched to its turn's user message, not assumed to be there.
+    assert tables["session_admissions"]["inputs"] == {"matched_to_messages": 1, "lossless_return_impossible": 0,
+                                                      "no_rule": 0}
     assert "message_uid_backfill" in report["state_meta"]
     assert _rows(output, "SELECT key FROM state_meta WHERE key LIKE 'message_uid_backfill%' "
                          "OR key LIKE 'legacy_refusal_repair%'") == []
@@ -387,10 +414,10 @@ def test_the_returned_store_migrates_forward_again(stores):
         assert _rows(output, FORK_ROWS[name]) == _rows(source, FORK_ROWS[name])
 
 
-def test_a_wal_bearing_source_is_read_through_a_copy(stores, tmp_path):
-    source, _, output = stores
-    crashed = tmp_path / "crashed" / "state.db"
-    crashed.parent.mkdir()
+def _wal_bearing_copy(source: Path, directory: Path) -> Path:
+    """A copy of *source* whose WAL holds a commit its main file lacks, as a crashed writer leaves it."""
+    crashed = directory / "state.db"
+    directory.mkdir()
     conn = sqlite3.connect(source, isolation_level=None)
     try:
         conn.execute("PRAGMA wal_autocheckpoint=0")
@@ -399,14 +426,20 @@ def test_a_wal_bearing_source_is_read_through_a_copy(stores, tmp_path):
         Path(f"{crashed}-wal").write_bytes(Path(f"{source}-wal").read_bytes())
     finally:
         conn.close()
-    shas = {p: _sha(p) for p in (crashed, Path(f"{crashed}-wal"))}
     assert Path(f"{crashed}-wal").stat().st_size
+    return crashed
+
+
+def test_a_wal_bearing_source_is_read_through_a_copy(stores, tmp_path):
+    source, _, output = stores
+    crashed = _wal_bearing_copy(source, tmp_path / "crashed")
+    shas = {p: _sha(p) for p in (crashed, Path(f"{crashed}-wal"))}
 
     _export(crashed, output)
 
     assert {p: _sha(p) for p in shas} == shas and not Path(f"{crashed}-shm").exists()
     assert _rows(output, "SELECT value FROM state_meta WHERE key = 'only-in-the-wal'") == [("1",)]
-    assert not list(output.parent.glob(".*return*"))
+    assert sorted(p.name for p in output.parent.iterdir()) == ["state.db"]
 
 
 # ── Refusals: nothing is published and the source is untouched ──
@@ -417,7 +450,7 @@ def _assert_refused(source, output, match: str) -> dict:
         _export(source, output)
     assert _sha(source) == sha
     assert not output.exists() and not list(output.parent.glob(".*return*"))
-    assert not caught.value.report["published"]
+    assert not caught.value.report["published"] and caught.value.report["source_unchanged"] is True
     return caught.value.report
 
 
@@ -490,7 +523,7 @@ _LOSSY = {
                 r"the output differs", {"session_turn_leases":
                                         "1 source rows absent or changed; 1 source vs 1 output rows"}),
     "a storage class": ("UPDATE messages SET display_identity = 7.0 WHERE display_identity = 7",
-                        r"the output differs", {"messages": "1 source rows absent or changed; 5 source vs 5 output rows"}),
+                        r"the output differs", {"messages": "1 source rows absent or changed; 7 source vs 7 output rows"}),
     "a column": ("ALTER TABLE sessions ADD COLUMN runtime_generation INTEGER NOT NULL DEFAULT 0",
                  r"the output differs", {"sessions": "columns differ: ['runtime_generation']"}),
     "an index": ("DROP INDEX idx_sessions_source", r"the output differs",
@@ -546,7 +579,7 @@ def test_a_source_written_during_the_export_refuses(stores, monkeypatch):
 
 def test_unusable_paths_refuse_before_reading(stores):
     source, _, output = stores
-    with pytest.raises(fork_return.ForkReturnError, match="must not be the source"):
+    with pytest.raises(fork_return.ForkReturnError, match="would be the source.s file"):
         fork_return.return_to_fork(source, Path(f"{source}-wal"))
     output.parent.mkdir()
     output.write_bytes(b"x")
@@ -574,3 +607,270 @@ def test_this_builds_declared_schema_is_fully_accounted_for(tmp_path):
     finally:
         conn.close()
     assert [r for r in plan["refused"] if "schema_version" not in r] == []
+
+
+# ── Paths: a conflict refuses before anything is written, and no existing file is ever touched ──
+
+def _snapshot(root: Path) -> dict:
+    """Every path under *root*: a directory, a link and its target, or a file's sha256."""
+    entries = {}
+    for directory, dirs, files in os.walk(root):
+        for name in dirs + files:
+            path = Path(directory) / name
+            entries[str(path.relative_to(root))] = (
+                ("link", os.readlink(path)) if path.is_symlink() else ("dir",) if path.is_dir() else ("file", _sha(path)))
+    return entries
+
+
+def _symlink(path: Path, target: Path) -> Path:
+    path.symlink_to(target)
+    return path
+
+
+def _hardlink(path: Path, target: Path) -> Path:
+    os.link(target, path)
+    return path
+
+
+_PATH_CONFLICTS = {
+    "report is the source": (lambda t, s, o: {"report_path": s}, "refusing to overwrite"),
+    "report is a symlink to the source": (lambda t, s, o: {"report_path": _symlink(t / "r.json", s)},
+                                          "refusing to overwrite"),
+    "report is a hardlink of the source": (lambda t, s, o: {"report_path": _hardlink(t / "r.json", s)},
+                                           "refusing to overwrite"),
+    "report is the output": (lambda t, s, o: {"report_path": o}, "would be the output's file"),
+    "report is the output's WAL": (lambda t, s, o: {"report_path": Path(f"{o}-wal")}, "would be the output's file"),
+    "report is the source's WAL": (lambda t, s, o: {"report_path": Path(f"{s}-wal")},
+                                   "would be the source's file|refusing to overwrite"),
+    "report is the output through a directory alias": (
+        lambda t, s, o: {"report_path": _symlink(t / "alias", o.parent) / o.name}, "would be the output's file"),
+    "report is the source's journal in another case": (
+        lambda t, s, o: {"report_path": s.parent / f"{s.name.upper()}-JOURNAL"}, "would be the source's file"),
+    "report is inside the source file": (lambda t, s, o: {"report_path": s / "r.json"}, "is not a directory"),
+    "output is the source through a directory alias": (
+        lambda t, s, o: {"output": _symlink(t / "alias", s.parent) / s.name}, "."),
+    "output is inside the source file": (lambda t, s, o: {"output": s / "state.db"}, "is not a directory"),
+    "output's directory does not exist": (lambda t, s, o: {"output": t / "missing" / "state.db"}, "does not exist"),
+    "work directory is the source file": (lambda t, s, o: {"work_dir": s}, "is not a directory"),
+}
+
+
+@pytest.mark.parametrize("case", list(_PATH_CONFLICTS))
+def test_a_path_conflict_refuses_before_anything_is_written(stores, tmp_path, case):
+    source, _, output = stores
+    output.parent.mkdir()
+    make, match = _PATH_CONFLICTS[case]
+    kwargs = {"output": output, **make(tmp_path, source, output)}
+    before = _snapshot(tmp_path)
+    with pytest.raises(fork_return.ForkReturnError, match=match):
+        fork_return.return_to_fork(source, kwargs.pop("output"), **kwargs)
+    assert _snapshot(tmp_path) == before
+
+
+def test_scratch_never_takes_an_existing_path(stores, tmp_path):
+    """A source stored where a predictable build copy would go, and user files where staging copies would go:
+    the export runs and every one of them is left as it was."""
+    source, _, output = stores
+    output.parent.mkdir()
+    planted = output.parent / f".{output.name}.return-build"
+    planted.write_bytes(source.read_bytes())
+    for name in (f".{output.name}.return-source", f".{output.name}.return-source-wal", "build.db", "source.db"):
+        (output.parent / name).write_bytes(b"a user's file")
+    before = _snapshot(tmp_path)
+
+    report = fork_return.return_to_fork(planted, output)
+
+    assert report["published"] and report["source_unchanged"] is True
+    after = _snapshot(tmp_path)
+    assert after.pop("out/state.db")[0] == "file" and after == before
+
+
+@pytest.mark.parametrize("stage", ["_plan", "_convert", "_compare"])
+def test_a_cancelled_export_removes_only_what_it_created(stores, tmp_path, monkeypatch, stage):
+    source, _, output = stores
+    crashed = _wal_bearing_copy(source, tmp_path / "crashed")  # so the staging copy exists too
+    work = tmp_path / "work"
+    work.mkdir()
+    output.parent.mkdir()
+    for directory in (work, output.parent):
+        for name in (f".{output.name}.return-build", f".{output.name}.return-source"):
+            (directory / name).write_bytes(b"a user's file")
+
+    def cancel(*_args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(fork_return, stage, cancel)
+    before = _snapshot(tmp_path)
+    with pytest.raises(KeyboardInterrupt):
+        fork_return.return_to_fork(crashed, output, work_dir=work, report_path=tmp_path / "report.json")
+    after = _snapshot(tmp_path)
+    assert after.pop("report.json")[0] == "file" and after == before
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert not report["published"] and report["source_unchanged"] is True and "scratch_left" not in report
+
+
+def test_a_terminated_export_removes_its_scratch(stores, tmp_path, monkeypatch):
+    source, _, output = stores
+    output.parent.mkdir()
+
+    class Terminated(Exception):
+        pass
+
+    def unhandled(_signum, _frame):  # what SIGTERM does here if the export installs no handler of its own
+        raise Terminated
+
+    previous = signal.signal(signal.SIGTERM, unhandled)
+    try:
+        monkeypatch.setattr(fork_return, "_convert", lambda conn, plan: os.kill(os.getpid(), signal.SIGTERM))
+        before = _snapshot(tmp_path)
+        with pytest.raises(SystemExit) as caught:
+            fork_return.main([str(source), str(output)])
+        assert caught.value.code == 128 + signal.SIGTERM
+        assert signal.getsignal(signal.SIGTERM) is unhandled
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    assert _snapshot(tmp_path) == before
+
+
+def test_an_output_that_appears_during_the_export_is_never_replaced(stores, monkeypatch):
+    source, _, output = stores
+    compare = fork_return._compare
+
+    def intruder(conn, plan, inventory):
+        output.write_bytes(b"someone else's file")
+        return compare(conn, plan, inventory)
+
+    monkeypatch.setattr(fork_return, "_compare", intruder)
+    with pytest.raises(fork_return.ForkReturnError, match="appeared during the export"):
+        _export(source, output)
+    assert output.read_bytes() == b"someone else's file"
+    assert sorted(p.name for p in output.parent.iterdir()) == ["state.db"]
+
+
+def test_source_unchanged_is_the_sources_bytes_read_again(stores, monkeypatch):
+    """A write that keeps the source's size, inode and mtime is still a change; it is never reported unchanged."""
+    source, _, output = stores
+    compare = fork_return._compare
+
+    def same_size_write(conn, plan, inventory):
+        st = source.stat()
+        with open(source, "r+b") as handle:  # the header's user_version: a write no stat() shows
+            handle.seek(60)
+            handle.write((1).to_bytes(4, "big"))
+        os.utime(source, ns=(st.st_atime_ns, st.st_mtime_ns))
+        assert (source.stat().st_size, source.stat().st_ino, source.stat().st_mtime_ns) == (
+            st.st_size, st.st_ino, st.st_mtime_ns)
+        return compare(conn, plan, inventory)
+
+    monkeypatch.setattr(fork_return, "_compare", same_size_write)
+    with pytest.raises(fork_return.ForkReturnRefused, match="the source changed while it was read") as caught:
+        _export(source, output)
+    assert caught.value.report["source_unchanged"] is False and not output.exists()
+
+
+def test_an_unreadable_source_is_never_reported_unchanged(stores, tmp_path, monkeypatch):
+    source, _, output = stores
+    read, calls = fork_return._source_state, []
+
+    def unreadable_after_the_first_read(path):
+        calls.append(path)
+        if len(calls) > 1:
+            raise PermissionError("Operation not permitted")
+        return read(path)
+
+    monkeypatch.setattr(fork_return, "_source_state", unreadable_after_the_first_read)
+    with pytest.raises(PermissionError):
+        _export(source, output, report_path=tmp_path / "report.json")
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["source_unchanged"] is False and report["source_check"].startswith("unverifiable")
+    assert not report["published"] and not output.exists()
+
+
+# ── Terminal admissions: input is data, matched to the kept transcript or refused ──
+
+def _runtime_write(path: Path, act) -> None:
+    db = SessionDB(db_path=path)
+    try:
+        act(db)
+    finally:
+        db.close()
+
+
+def _set_outcome(db, request_id: str, outcome: str) -> None:
+    db._execute_write(lambda conn: conn.execute(
+        "UPDATE session_admissions SET outcome = ? WHERE request_id = ?", (outcome, request_id)))
+
+
+_ONLY_IN_ITS_ADMISSION = {
+    "cancelled before it ran": lambda db: run_input(db, "s3", "r9", "only copy zk41", transcript=False, cancel=True),
+    "completed without its message": lambda db: run_input(db, "s3", "r9", "only copy zk41", transcript=False),
+    "interrupted before its message": lambda db: run_input(db, "s3", "r9", "only copy zk41", transcript=False,
+                                                           outcome="interrupted"),
+    "left steering": lambda db: (run_input(db, "s3", "r9", "only copy zk41", transcript=True),
+                                 _set_outcome(db, "r9", "steering")),
+    "the second of two with one message": lambda db: (run_input(db, "s3", "r8", "same words", transcript=True),
+                                                      run_input(db, "s3", "r9", "same words", transcript=False)),
+    "cancelled, its words in an older message": lambda db: (
+        db.append_message("s3", role="user", content="said before"),
+        run_input(db, "s3", "r9", "said before", transcript=False, cancel=True)),
+}
+
+
+@pytest.mark.parametrize("case", list(_ONLY_IN_ITS_ADMISSION))
+def test_input_that_exists_only_in_its_admission_refuses(stores, case):
+    source, _, output = stores
+    _runtime_write(source, _ONLY_IN_ITS_ADMISSION[case])
+    report = _assert_refused(source, output, r"lossless return impossible: 1 session_admissions inputs exist only")
+    assert report["tables"]["session_admissions"]["disposition"] == "refused"
+    assert report["tables"]["session_admissions"]["inputs"]["lossless_return_impossible"] == 1
+
+
+def test_inputs_each_matched_to_their_own_message_return(stores):
+    source, _, output = stores
+    _runtime_write(source, lambda db: (run_input(db, "s3", "r8", "same words", transcript=True),
+                                       run_input(db, "s3", "r9", "same words", transcript=True, outcome="failed")))
+    report = _export(source, output)
+    assert report["published"] and report["tables"]["session_admissions"]["inputs"]["matched_to_messages"] == 3
+
+
+@pytest.mark.parametrize("act, match", [
+    (lambda db: (run_input(db, "s3", "r9", "x", transcript=True), _set_outcome(db, "r9", "superseded")),
+     r"session_admissions rows no rule carries to the fork: \w+: outcome 'superseded'"),
+    (lambda db: run_input(db, "s3", "r9", "with envelope", transcript=True,
+                          payload={"text": "with envelope", "native_text_v1": {"event": {"message_id": "m1"}}}),
+     r"no rule carries to the fork: \w+: payload \['native_text_v1', 'text'\] is more than its text"),
+], ids=["an unknown outcome", "a payload with more than its text"])
+def test_an_admission_no_rule_carries_refuses(stores, act, match):
+    source, _, output = stores
+    _runtime_write(source, act)
+    report = _assert_refused(source, output, match)
+    assert report["tables"]["session_admissions"]["inputs"]["no_rule"] == 1
+
+
+# ── Removed tables: every column and every row has a rule, or the export refuses ──
+
+@pytest.mark.parametrize("sql, match", [
+    ("ALTER TABLE worker_receipts ADD COLUMN unconvertible_payload TEXT; "
+     "UPDATE worker_receipts SET unconvertible_payload = 'only here'",
+     r"column worker_receipts.unconvertible_payload \(1 rows set\) has no representation in the fork"),
+    ("ALTER TABLE session_admissions ADD COLUMN later TEXT",
+     r"column session_admissions.later \(0 rows set\) has no representation in the fork"),
+    ("ALTER TABLE runtime_epoch ADD COLUMN later INTEGER DEFAULT 3",
+     r"column runtime_epoch.later \(0 rows set\) has no representation in the fork"),
+    ("ALTER TABLE schema_version ADD COLUMN note TEXT", r"schema_version has columns \['note', 'version'\]"),
+    ("INSERT INTO worker_receipts VALUES ('ghost', 1, 'p', '{}')", r"worker_receipts rows of no terminal worker: 1"),
+    ("PRAGMA ignore_check_constraints = ON; UPDATE worker_executions SET kind = 'future'",
+     r"worker_executions.kind holds values no rule carries to the fork: \{'future': 1\}"),
+    ("ALTER TABLE worker_receipts DROP COLUMN payload_digest",
+     r"worker_receipts lacks \['payload_digest'\]; its rows are not the shape this export reads"),
+], ids=["a set unknown column", "an unset unknown column", "an unknown column with a default",
+        "an unknown schema_version column", "a receipt of no worker", "an unknown value", "a missing column"])
+def test_a_removed_tables_data_without_a_rule_refuses(stores, sql, match):
+    source, _, output = stores
+    conn = _connect_as(source, 1033)  # foreign keys off, as any raw writer may have left them
+    try:
+        conn.executescript(sql)
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+    _assert_refused(source, output, match)

@@ -7,13 +7,21 @@ built in a second byte copy that is published under the output path only after e
 Everything the fork's schema has is kept byte for byte, rowids included: sessions and messages, the
 fork's session-process authorities and their append-only event log, turn leases, conversation
 generations, routing, delegations, delivery obligations, state_meta. What upstream schema 31-33 added
-leaves the store with a stated reason (``converted``). Work this build accepted and has not finished
-(a queued or started admission, a registered or running worker) has no representation in the fork, so
-the export refuses rather than drop it; so does any object this module does not know.
+leaves the store with a stated reason (``converted``), column by column. Work this build accepted and
+has not finished (a queued or started admission, a registered or running worker) has no representation
+in the fork, so the export refuses rather than drop it. A terminal admission is input, not bookkeeping:
+one that ran must find its text as a kept user message of its sessions, and one that never ran (cancelled)
+exists nowhere else, so either refuses as a lossless return that is impossible. So does any object,
+column or value this module has no rule for.
 
 Loss is measured, not assumed: after the conversion every kept table is compared row by row against
 the source on every column the result has, every removed table, column and state_meta key is counted
 against its disposition, and an unaccounted difference refuses the export with nothing published.
+
+Paths are checked before anything is written: the output and the report are new files, and neither may
+be, alias or link to the source, each other or any of their SQLite files. Working copies live in
+directories created for this run alone and are removed on any exit; the output is published with an
+exclusive link, so a file that appears there meanwhile is never replaced.
 
 Copying the canonical tables into a fresh fork schema, as the fork's own ``sessions recover`` does, is
 ruled out: it leaves the authorities, their events, turn leases and conversation generations behind
@@ -26,11 +34,15 @@ the fork writes with foreign keys on, and their RESTRICT keys to sessions would 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
+import signal
 import sqlite3
 import sys
+import tempfile
+import unicodedata
 from pathlib import Path
 from typing import Optional
 
@@ -144,15 +156,50 @@ _FORK_TRIGGERS = frozenset((
 _FORK_VIEWS = frozenset(("messages_fts_src", "messages_fts_trigram_src"))
 _FTS5_SHADOW_SUFFIXES = ("_config", "_content", "_data", "_docsize", "_idx")
 
-# What upstream schema 31-33 added, and why the fork's representation of each is its absence.
+# What upstream schema 31-33 added, and why the fork's representation of each is its absence. Every column of
+# these tables needs a rule here; a column without one refuses the export, set or not.
 _RUNTIME_TABLES = {
-    # table: (status column, statuses that are unfinished work the fork cannot carry, why the rest can go)
-    "worker_receipts": (None, (), "step results of terminal workers; the delegations and deliveries they fed are kept"),
-    "worker_executions": ("status", ("registered", "running", "unknown"), "terminal workers of this build's runtime"),
-    "session_admissions": ("status", ("queued", "started", "unknown"),
-                           "finished input: its turn is in messages, its replay tombstone in state_meta"),
-    "runtime_epoch": (None, (), "this build's runtime owner epoch; the fork has no epoch-fenced owner"),
+    "worker_receipts": "replay answers of terminal workers' steps; the steps' effects are rows of kept tables",
+    "worker_executions": "terminal workers of this build's runtime; their effects are rows of kept tables",
+    "session_admissions": "terminal input whose run's user message is a kept row (matched, not assumed)",
+    "runtime_epoch": "this build's runtime owner epoch; the fork has no epoch-fenced owner",
 }
+_RETRY = "exact-retry identity this build's ledger answers; the fork keeps no admission ledger"
+_FENCE = "runtime fence of a finished claim; no unfinished work reads it"
+_RUNTIME_COLUMNS = {
+    "runtime_epoch": {"singleton": "the epoch row's key", "epoch": _FENCE, "instance_id": _FENCE},
+    "session_admissions": {
+        "seq": "FIFO position; every row is terminal, so no queue is left", "admission_id": _RETRY,
+        "request_id": _RETRY, "principal_id": _RETRY, "payload_digest": _RETRY,
+        "target_session_id": "the kept session the input was matched in",
+        "lineage_json": "the kept sessions the input was matched in",
+        "payload_json": "the input: its text is a kept user message of those sessions",
+        "intent": "queue, steer or redirect of input that already ran",
+        "status": "terminal", "outcome": "how the run ended; the run's transcript is kept",
+        "owner_epoch": _FENCE, "generation": _FENCE,
+    },
+    "worker_executions": {
+        "execution_id": "the worker's key", "session_id": "the kept session it worked for",
+        "kind": "cron, child, compute or kanban", "status": "terminal", "adoption_digest": _FENCE,
+        "owner_epoch": _FENCE, "generation": _FENCE, "last_sequence": "the last step it applied",
+    },
+    "worker_receipts": {
+        "execution_id": "the terminal worker it answered", "sequence": "the step it answered",
+        "payload_digest": "fingerprint of the step a late duplicate must match",
+        "result_json": "the answer a late duplicate replays; the step's effect is kept",
+    },
+}
+# Unfinished work has no representation in the fork; values outside these sets have no rule either.
+_UNFINISHED = {"session_admissions": ("queued", "started", "unknown"),
+               "worker_executions": ("registered", "running", "unknown")}
+_RUNTIME_VALUES = {
+    "session_admissions": {"status": ("terminal",), "intent": ("queue", "steer", "redirect")},
+    "worker_executions": {"status": ("terminal",), "kind": ("cron", "child", "compute", "kanban")},
+}
+# Terminal admission outcomes. A run handed the input to an agent, so its user message must be a kept row; an
+# input that never ran exists nowhere but its admission, and the fork has no place that gives it meaning.
+_ADMISSION_RAN = ("completed", "interrupted", "failed", "rejected", "steered")
+_ADMISSION_NEVER_RAN = {"cancelled": "cancelled before it ran", "steering": "handed to a turn that never settled it"}
 _COLUMNS = {
     "async_delegations": {
         "owner_execution_id": "execution fence of a terminal worker; owner_pid/owner_started_at are kept",
@@ -212,17 +259,6 @@ def _sidecar(path: Path, suffix: str) -> Path:
     return path.with_name(path.name + suffix)
 
 
-def _fingerprint(path: Path) -> dict:
-    result = {}
-    for suffix in ("", "-wal", "-journal"):
-        try:
-            st = _sidecar(path, suffix).stat()
-        except FileNotFoundError:
-            continue
-        result[suffix or "main"] = [st.st_size, st.st_mtime_ns, st.st_ino]
-    return result
-
-
 def _ro_uri(path: Path) -> str:
     return Path(path).resolve().as_uri() + "?mode=ro&immutable=1"
 
@@ -256,16 +292,92 @@ def _non_default_rows(conn, table: str, column: str, default) -> int:
     return conn.execute(f"SELECT count(*) FROM {_q(table)} WHERE {differs}").fetchone()[0]
 
 
-def _plan_runtime_table(conn, name: str, rows: int, refused: list) -> dict:
-    status_col, unfinished, reason = _RUNTIME_TABLES[name]
-    entry = {"disposition": "converted", "rows": rows, "reason": reason}
-    if status_col:
-        entry["by_status"] = dict(conn.execute(
-            f"SELECT {_q(status_col)}, count(*) FROM {_q(name)} GROUP BY 1 ORDER BY 1").fetchall())
-        pending = {s: n for s, n in entry["by_status"].items() if s in unfinished}
+def _admission_input(payload_json, target, lineage_json) -> tuple:
+    """``(text, sessions, None)`` for an input this export can match, else ``(None, None, why not)``."""
+    try:
+        payload, lineage = json.loads(payload_json), json.loads(lineage_json)
+    except (TypeError, ValueError):
+        return None, None, "payload or lineage is not JSON"
+    if not isinstance(payload, dict) or set(payload) != {"text"} or not isinstance(payload["text"], str):
+        shape = sorted(payload) if isinstance(payload, dict) else type(payload).__name__
+        return None, None, f"payload {shape} is more than its text"
+    if not isinstance(lineage, list) or not all(isinstance(s, str) for s in lineage):
+        return None, None, "lineage is not a list of session ids"
+    return payload["text"], sorted({target, *lineage}), None
+
+
+def _plan_admissions(conn, refused: list) -> dict:
+    """Each terminal admission's input against the user messages the output keeps: a run's input must be one
+    of them (each message answers one admission), an input that never ran refuses the export."""
+    taken, matched, lost, unruled = set(), 0, [], []
+    for admission_id, target, lineage, payload, outcome in conn.execute(
+            "SELECT admission_id, target_session_id, lineage_json, payload_json, outcome FROM session_admissions "
+            "WHERE status = 'terminal' ORDER BY seq").fetchall():
+        if outcome in _ADMISSION_NEVER_RAN:
+            lost.append(f"{admission_id} ({_ADMISSION_NEVER_RAN[outcome]})")
+            continue
+        if outcome not in _ADMISSION_RAN:
+            unruled.append(f"{admission_id}: outcome {outcome!r}")
+            continue
+        text, sessions, why = _admission_input(payload, target, lineage)
+        if why:
+            unruled.append(f"{admission_id}: {why}")
+            continue
+        hits = conn.execute(
+            f"SELECT id FROM messages WHERE role = 'user' AND typeof(content) = 'text' AND content = ? "
+            f"AND session_id IN ({', '.join('?' * len(sessions))}) ORDER BY id", (text, *sessions)).fetchall()
+        hit = next((mid for (mid,) in hits if mid not in taken), None)
+        if hit is None:
+            lost.append(f"{admission_id} ({outcome}; no kept user message of its sessions carries its input)")
+            continue
+        taken.add(hit)
+        matched += 1
+    if lost:
+        refused.append(f"lossless return impossible: {len(lost)} session_admissions inputs exist only in "
+                       f"session_admissions: {'; '.join(lost[:10])}{' ...' if len(lost) > 10 else ''}")
+    if unruled:
+        refused.append(f"session_admissions rows no rule carries to the fork: "
+                       f"{'; '.join(unruled[:10])}{' ...' if len(unruled) > 10 else ''}")
+    return {"matched_to_messages": matched, "lossless_return_impossible": len(lost), "no_rule": len(unruled)}
+
+
+def _plan_runtime_table(conn, name: str, info: dict, columns: dict, refused: list) -> dict:
+    entry = {"disposition": "converted", "rows": info["rows"], "reason": _RUNTIME_TABLES[name]}
+    known, before = _RUNTIME_COLUMNS[name], len(refused)
+    for column, default in info["columns"].items():
+        col = {"non_default_rows": _non_default_rows(conn, name, column, default)}
+        if column in known:
+            col.update(disposition="converted", reason=known[column])
+        else:
+            col["disposition"] = "refused"
+            refused.append(f"column {name}.{column} ({col['non_default_rows']} rows set) has no representation "
+                           "in the fork")
+        columns[f"{name}.{column}"] = col
+    if missing := sorted(set(known) - set(info["columns"])):
+        refused.append(f"{name} lacks {missing}; its rows are not the shape this export reads")
+        entry["disposition"] = "refused"
+        return entry
+    for column, allowed in _RUNTIME_VALUES.get(name, {}).items():
+        entry[f"by_{column}"] = counts = dict(conn.execute(
+            f"SELECT {_q(column)}, count(*) FROM {_q(name)} GROUP BY 1 ORDER BY 1").fetchall())
+        pending = {v: n for v, n in counts.items() if column == "status" and v in _UNFINISHED[name]}
         if pending:
-            entry["disposition"] = "refused"
             refused.append(f"{name} holds unfinished work the fork cannot carry: {pending}")
+        if unknown := {v: n for v, n in counts.items() if v not in allowed and v not in pending}:
+            refused.append(f"{name}.{column} holds values no rule carries to the fork: {unknown}")
+    if name == "worker_receipts":
+        try:
+            orphans = conn.execute("SELECT count(*) FROM worker_receipts AS r WHERE NOT EXISTS (SELECT 1 FROM "
+                                   "worker_executions AS w WHERE w.execution_id = r.execution_id "
+                                   "AND w.status = 'terminal')").fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            orphans = f"unknown ({exc})"
+        if orphans:
+            refused.append(f"worker_receipts rows of no terminal worker: {orphans}")
+    if name == "session_admissions":
+        entry["inputs"] = _plan_admissions(conn, refused)
+    if len(refused) > before:
+        entry["disposition"] = "refused"
     return entry
 
 
@@ -287,16 +399,22 @@ def _plan_tables(conn, inventory: dict, stamp, refused: list) -> dict:
         if name.startswith("sqlite_") or info["shadow_of"] in _FORK_TABLES:
             continue  # SQLite's own tables, and FTS5 shadows that follow a kept virtual table
         if name in _RUNTIME_TABLES:
-            tables[name] = _plan_runtime_table(conn, name, info["rows"], refused)
+            tables[name] = _plan_runtime_table(conn, name, info, columns, refused)
             drop_tables.append(name)
         elif name == "schema_version":
             tables[name] = {"disposition": "converted", "rows": info["rows"],
                             "reason": f"stamp {stamp} -> {FORK_STORED_SCHEMA_VERSION}"}
+            if set(info["columns"]) != {"version"}:
+                tables[name]["disposition"] = "refused"
+                refused.append(f"schema_version has columns {sorted(info['columns'])}; only its version converts")
         elif name in _FORK_TABLES:
             tables[name] = {"disposition": "preserved", "rows": info["rows"]}
             _plan_fork_table(conn, name, info, columns, drop_columns, refused)
         elif info["rows"] == 0 and not info["shadow_of"]:
             tables[name] = {"disposition": "converted", "rows": 0, "reason": "empty table the fork does not have"}
+            for column in info["columns"]:
+                columns[f"{name}.{column}"] = {"disposition": "converted", "non_default_rows": 0,
+                                               "reason": "column of an empty table"}
             drop_tables.append(name)
         elif not info["shadow_of"]:
             tables[name] = {"disposition": "refused", "rows": info["rows"]}
@@ -445,46 +563,135 @@ def _integrity(conn) -> list:
 
 # ── The entry point ──
 
-def _validated(source, output, work_dir) -> tuple:
-    source = Path(source).expanduser().resolve(strict=True)
-    output = Path(output).expanduser()
-    output = output.parent.resolve(strict=True) / output.name
-    work = Path(work_dir).expanduser().resolve(strict=True) if work_dir else output.parent
+_SIDECARS = ("", "-wal", "-shm", "-journal")
+
+
+def _bundle(path: Path) -> list:
+    return [_sidecar(path, suffix) for suffix in _SIDECARS]
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    """Equal paths, equal on a case- and normalization-insensitive filesystem, or one file (hard/symbolic link)."""
+    if unicodedata.normalize("NFC", str(a)).casefold() == unicodedata.normalize("NFC", str(b)).casefold():
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def _directory(path, what: str) -> Path:
+    try:
+        resolved = Path(path).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise ForkReturnError(f"{what} does not exist: {path}") from exc
+    if not resolved.is_dir():
+        raise ForkReturnError(f"{what} is not a directory: {resolved}")
+    return resolved
+
+
+def _new_path(path, what: str) -> Path:
+    path = Path(path).expanduser()
+    path = _directory(path.parent, f"the {what}'s directory") / path.name
+    for candidate in (_bundle(path) if what == "output" else [path]):
+        if os.path.lexists(candidate):
+            raise ForkReturnError(f"refusing to overwrite {candidate}: the {what} must be a new file")
+    return path
+
+
+def _validated(source, output, work_dir, report_path) -> tuple:
+    """Every path resolved and checked against every other before anything is written: the output and report
+    are new files, and neither is, aliases or links to the source, each other, or any of their SQLite files."""
+    try:
+        source = Path(source).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise ForkReturnError(f"source does not exist: {source}") from exc
     if not source.is_file():
         raise ForkReturnError(f"source is not a file: {source}")
-    if output in {_sidecar(source, s) for s in ("", "-wal", "-shm", "-journal")}:
-        raise ForkReturnError("the output must not be the source or one of its sidecars")
-    for suffix in ("", "-wal", "-shm", "-journal"):
-        if os.path.lexists(_sidecar(output, suffix)):
-            raise ForkReturnError(f"refusing to overwrite {_sidecar(output, suffix)}")
+    named = {"the source": _bundle(source)}
+    for what, path in (("output", output), ("report", report_path)):
+        if what == "output" or path:
+            path = _new_path(path, what)
+            for owner, files in named.items():
+                if clash := next((f for f in files for p in (_bundle(path) if what == "output" else [path])
+                                  if _same_path(f, p)), None):
+                    raise ForkReturnError(f"the {what} {path} would be {owner}'s file {clash}")
+            named[f"the {what}"] = _bundle(path) if what == "output" else [path]
+    output = named["the output"][0]
+    report = named["the report"][0] if "the report" in named else None
+    work = _directory(work_dir, "the work directory") if work_dir else output.parent
     if _sidecar(source, "-journal").exists():
         raise ForkReturnError("the source has a hot rollback journal; let its writer finish first")
-    return source, output, work
+    return source, output, work, report
 
 
-def _unlink_bundle(path: Path) -> None:
-    for suffix in ("", "-wal", "-shm", "-journal"):
-        _sidecar(path, suffix).unlink(missing_ok=True)
+def _source_state(source: Path) -> dict:
+    """The source's bytes: a sha256 of the database and of each journal file it has."""
+    state = {}
+    for path in (source, _sidecar(source, "-wal"), _sidecar(source, "-journal")):
+        if path is source or path.exists():
+            digest = hashlib.sha256()
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1 << 22), b""):
+                    digest.update(chunk)
+            state[path.name] = digest.hexdigest()
+    return state
+
+
+_STAGED, _BUILDING = "source.db", "build.db"  # the only names this run creates, inside its own scratch
+
+
+def _scratch(parent: Path, created: list) -> Path:
+    """A new private directory, created exclusively; the only place this run creates its working files."""
+    path = Path(tempfile.mkdtemp(prefix=".fork-return-", dir=parent))
+    created.append(path)
+    return path
+
+
+def _remove_scratch(directory: Path) -> Optional[str]:
+    """Delete the files this run made in *directory*, then the directory if that empties it; never anything else."""
+    for name in (_STAGED, _BUILDING):
+        for path in _bundle(directory / name):
+            path.unlink(missing_ok=True)
+    try:
+        directory.rmdir()
+    except OSError:
+        return str(directory)
+    return None
+
+
+
+def _write_report(path: Path, report: dict) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError as exc:
+        raise ForkReturnError(f"refusing to overwrite {path}: it appeared during the export") from exc
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps(report, indent=2, sort_keys=True, default=str) + "\n")
 
 
 def return_to_fork(source, output, *, work_dir=None, report_path=None) -> dict:
     """Write *source* (a settled 1033 store) to *output* as the live fork's fenced 1030 store; return the report.
 
     Raises ForkReturnRefused (carrying the report) when anything cannot be carried, ForkReturnError on unusable
-    paths. Either way *output* is not created and *source* is not written."""
-    source, output, work = _validated(source, output, work_dir)
-    before = _fingerprint(source)
+    paths. Either way *output* is not created, *source* is not written and no existing file is touched; the
+    report's ``source_unchanged`` is true only when the source's bytes were re-read and found unchanged."""
+    source, output, work, report_file = _validated(source, output, work_dir, report_path)
+    try:
+        before = _source_state(source)
+    except OSError as exc:
+        raise ForkReturnError(f"cannot read the source: {exc}") from exc
     wal_mode = _is_wal_file(source)
     report = {"operation": "return_to_fork", "source": str(source), "output": str(output),
-              "target_schema_version": FORK_STORED_SCHEMA_VERSION, "published": False, "refused": []}
-    staged = work / f".{output.name}.return-source"
-    building = output.parent / f".{output.name}.return-build"
-    _unlink_bundle(staged)
-    _unlink_bundle(building)
+              "target_schema_version": FORK_STORED_SCHEMA_VERSION, "published": False, "refused": [],
+              "source_unchanged": False}
+    scratch = []
     try:
         view = source
         if _sidecar(source, "-wal").exists() and _sidecar(source, "-wal").stat().st_size:
             # The WAL holds pages the main file lacks: fold them into a private copy, never into the source.
+            staged = _scratch(work, scratch) / _STAGED
             shutil.copyfile(source, staged)
             shutil.copyfile(_sidecar(source, "-wal"), _sidecar(staged, "-wal"))
             conn = sqlite3.connect(staged, isolation_level=None)
@@ -506,6 +713,7 @@ def return_to_fork(source, output, *, work_dir=None, report_path=None) -> dict:
             report["refused"] = plan["refused"]
             raise ForkReturnRefused(report)
 
+        building = _scratch(output.parent, scratch) / _BUILDING
         shutil.copyfile(view, building)
         os.chmod(building, 0o600)
         conn = sqlite3.connect(building.as_uri(), uri=True, isolation_level=None)
@@ -527,7 +735,7 @@ def return_to_fork(source, output, *, work_dir=None, report_path=None) -> dict:
             output_lineage={"lineage": lineage.lineage, "schema_version": lineage.stored,
                             "fence_generations": sorted(lineage.fence_literals), "fork_store": lineage.migratable},
             differences=differences, loss_detected=bool(differences), integrity_check=integrity,
-            source_unchanged=_fingerprint(source) == before)
+            source_unchanged=_source_state(source) == before)
         if differences:
             report["refused"].append(f"the output differs from the source: {sorted(differences)}")
         if not lineage.migratable:
@@ -540,14 +748,26 @@ def return_to_fork(source, output, *, work_dir=None, report_path=None) -> dict:
             raise ForkReturnRefused(report)
         with open(building, "rb") as handle:
             os.fsync(handle.fileno())
-        os.replace(building, output)
+        try:
+            os.link(building, output)  # exclusive: a file that appeared at the output since validation is kept
+        except FileExistsError as exc:
+            raise ForkReturnError(f"refusing to overwrite {output}: it appeared during the export") from exc
+        directory = os.open(output.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
         report["published"] = True
         return report
     finally:
-        _unlink_bundle(staged)
-        _unlink_bundle(building)
-        if report_path:
-            Path(report_path).write_text(json.dumps(report, indent=2, sort_keys=True, default=str) + "\n")
+        if left := [path for path in map(_remove_scratch, scratch) if path]:
+            report["scratch_left"] = left
+        try:
+            report["source_unchanged"] = _source_state(source) == before
+        except OSError as exc:
+            report["source_unchanged"], report["source_check"] = False, f"unverifiable: {exc}"
+        if report_file:
+            _write_report(report_file, report)
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -558,14 +778,22 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--work-dir", help="where a WAL-bearing source is staged (default: the output's directory)")
     parser.add_argument("--report", help="write the JSON report here")
     args = parser.parse_args(argv)
+
+    def cancel(signum, _frame):
+        raise SystemExit(128 + signum)  # a terminated export still removes its scratch and reports
+
+    previous = signal.signal(signal.SIGTERM, cancel)
     try:
         report = return_to_fork(args.source, args.output, work_dir=args.work_dir, report_path=args.report)
     except ForkReturnRefused as exc:
-        print("Refused; nothing was written:", *(f"  - {r}" for r in exc.report["refused"]), sep="\n", file=sys.stderr)
+        print("Refused; nothing was published:", *(f"  - {r}" for r in exc.report["refused"]), sep="\n",
+              file=sys.stderr)
         return 2
     except ForkReturnError as exc:
-        print(f"Refused; nothing was written: {exc}", file=sys.stderr)
+        print(f"Refused; nothing was published: {exc}", file=sys.stderr)
         return 2
+    finally:
+        signal.signal(signal.SIGTERM, previous)
     tables = report["tables"]
     print(f"Returned to the fork's schema {FORK_STORED_SCHEMA_VERSION}: {report['output']}")
     print(f"  tables preserved: {sum(v['disposition'] == 'preserved' for v in tables.values())}; converted: "
