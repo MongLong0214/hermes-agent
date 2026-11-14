@@ -23,7 +23,7 @@ value rides on the generic loop's early ``partial_result`` returns.
 
 import sqlite3
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -33,6 +33,7 @@ from agent.turn_response_intake import normalize_model_response
 from agent.turn_truncation import _Trunc, continue_codex_incomplete, turn_rows_persisted
 from hermes_state import SessionDB
 from run_agent import AIAgent
+from tests.agent.test_run_agent import _mock_response
 
 def _make_turn(projected=None):
     return SimpleNamespace(
@@ -83,9 +84,17 @@ def real_agent(tmp_path):
     yield agent
     db.close()
 
-def _break_writes(agent):
-    """Every later session-DB append raises, as a locked or full disk does."""
-    agent._session_db.append_messages_batch = MagicMock(side_effect=sqlite3.OperationalError("database is locked"))
+def _break_writes(agent, after=0):
+    """Every session-DB append after the next ``after`` raises, as a locked or full disk does."""
+    real, calls = agent._session_db.append_messages_batch, []
+
+    def append(*args, **kwargs):
+        calls.append(None)
+        if len(calls) > after:
+            raise sqlite3.OperationalError("database is locked")
+        return real(*args, **kwargs)
+
+    agent._session_db.append_messages_batch = append
 
 def _run(agent, messages, text="hello"):
     return run_codex_app_server_turn(
@@ -247,3 +256,25 @@ def test_partial_result_reports_its_own_flush(real_agent, site, writes_ok):
         _break_writes(real_agent)
     result = site(real_agent, [{"role": "user", "content": "write an essay"}])
     assert result["agent_persisted"] is writes_ok
+
+
+# --- The main path: finalize_turn after its own _persist_session() ------------------------------------
+
+@pytest.mark.parametrize(("appends_that_land", "persisted", "stored"), [
+    (None, True, ["write an essay", "An essay."]), (1, False, ["write an essay"]), (0, False, [])])
+def test_finalize_turn_reports_this_turns_flush(real_agent, appends_that_land, persisted, stored):
+    """A plain text turn: the turn-start flush writes the ask, finalize_turn's flush the answer. Either
+    failing reports False; a turn whose writes all land reports True."""
+    agent = real_agent
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = [_mock_response(content="An essay.", finish_reason="stop")]
+    agent._cached_system_prompt, agent._use_prompt_caching, agent._skip_mcp_refresh = "You are helpful.", False, True
+    agent.compression_enabled = agent.save_trajectories = False
+    if appends_that_land is not None:
+        _break_writes(agent, after=appends_that_land)
+    with patch.object(agent, "_cleanup_task_resources"):
+        result = agent.run_conversation("write an essay")
+
+    assert result["final_response"] == "An essay." and result["completed"] is True
+    assert [r["content"] for r in agent._session_db.get_messages(agent.session_id)] == stored  # reach
+    assert result["agent_persisted"] is persisted

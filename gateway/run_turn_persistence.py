@@ -55,6 +55,19 @@ def _acp_launch(runner, source) -> bool:
         return False
 
 
+def _agent_holds_row(msg: Any) -> bool:
+    """The store already holds ``msg``: a committed flush stamped it ``_db_persisted``, or it carries
+    the ``_row_id`` of a stored row whose in-memory rewrite (the finalizer's blank-row fill) has not
+    landed. The fork repairs that row in place through a batch append this store does not have;
+    inserting it would add a second row, so it is skipped."""
+    return isinstance(msg, dict) and (bool(msg.get("_db_persisted")) or type(msg.get("_row_id")) is int)
+
+
+def _turn_user_row_held(new_messages: list) -> bool:
+    """Whether the store already holds this turn's own user row: the first user row the agent added."""
+    return _agent_holds_row(next((m for m in new_messages if isinstance(m, dict) and m.get("role") == "user"), None))
+
+
 class GatewayTurnPersistenceMixin:
     @staticmethod
     def _is_intentional_silence(agent_result, response) -> bool:
@@ -486,6 +499,11 @@ class GatewayTurnPersistenceMixin:
         # into a gateway-side write by returning False.
         agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
         _user_row = self._hmwa_user_transcript_entry(event, prepared, ts)
+        # Only the NEW messages: history_offset (what the agent saw), not len(history), which
+        # counts session_meta entries stripped before the agent saw them.
+        history_len = agent_result.get("history_offset", len(history))
+        new_messages = (agent_messages[history_len:]
+                        if isinstance(agent_messages, list) and len(agent_messages) > history_len else [])
 
         if is_context_overflow_failure:
             # Skip all transcript writes — don't grow a broken session. An exhausted turn keeps the
@@ -528,15 +546,13 @@ class GatewayTurnPersistenceMixin:
                         event.message_id, sid,
                     )
                 else:
-                    await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
+                    # The agent's turn-start flush may already hold this ask though a later write failed.
+                    await store.append_to_transcript(
+                        sid, _user_row, skip_db=agent_persisted or _turn_user_row_held(new_messages))
                 # Close the failed turn: a user-only tail lets alternation repair merge this request
                 # into an unrelated future message and replay stale side effects (#107070).
                 await self._hmwa_close_failed_turn(sid, self._hmwa_failed_turn_notice(agent_result))
             else:
-                # Only the NEW messages: history_offset (what the agent saw), not len(history), which
-                # counts session_meta entries stripped before the agent saw them.
-                history_len = agent_result.get("history_offset", len(history))
-                new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
                 if not new_messages:
                     # Edge case: fall back to simple user/assistant rows.
                     await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
@@ -561,7 +577,10 @@ class GatewayTurnPersistenceMixin:
                         ):
                             entry["message_id"] = str(event.message_id)
                             _user_msg_id_attached = True
-                        await store.append_to_transcript(sid, entry, skip_db=agent_persisted)
+                        # agent_persisted=False means SOME write this turn failed, not that every row
+                        # is unwritten: recover only the rows the agent never landed.
+                        await store.append_to_transcript(
+                            sid, entry, skip_db=agent_persisted or _agent_holds_row(msg))
 
         # The agent persists token counts/model itself; keep only last_prompt_tokens for hygiene.
         await store.update_session(

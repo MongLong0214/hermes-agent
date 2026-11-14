@@ -786,6 +786,11 @@ def finalize_turn(
         agent._persist_session(messages, conversation_history)
 
     _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
+    # This turn's own outcome, read from its rows the moment its last flush returned (a raise
+    # before that flush leaves them unstamped): the gateway skips its own write only on True.
+    from agent.turn_truncation import turn_rows_persisted
+
+    _agent_persisted = turn_rows_persisted(agent, messages)
 
     # Keep the gateway's separate in-memory history snapshot current even on
     # cleanup error, so a later prompt isn't sent with a pre-turn snapshot.
@@ -880,6 +885,7 @@ def finalize_turn(
             (getattr(agent, "request_overrides", {}) or {}).get("extra_body") or {}
         ).get("service_tier"),
         "session_id": agent.session_id,
+        "agent_persisted": _agent_persisted,
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
