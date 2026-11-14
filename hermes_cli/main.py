@@ -619,10 +619,10 @@ if sys.platform == "win32":
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
-# ``update`` must not resolve external secret sources (Windows self-lock via cryptography, slow
-# helpers inside the import probe) — ``_early_recovery._should_skip_external_secret_sources``
-# owns that argv check for every dotenv load in the process. See #73381.
-load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+# ``update`` skips secret sources (_early_recovery, #73381). hermes-acp / python -m acp_adapter re-enter
+# from acp_adapter.entry, which owns ACP dark mode: a dark launch skips this load (``hermes acp`` keeps it).
+if not (sys.argv[1:2] == ["acp"] and getattr(sys.modules.get("acp_adapter.entry"), "dark_launch", bool)()):
+    load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
 # Bridge security.redact_secrets → HERMES_REDACT_SECRETS BEFORE hermes_logging
 # imports agent.redact, which snapshots the flag exactly once at import. A
