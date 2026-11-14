@@ -594,6 +594,114 @@ _TOPLEVEL_BOOL_DEFAULTS = {
 }
 
 
+def _parse_canonical_surface_bindings(value: Any) -> dict[str, Any]:
+    """Validate the closed, server-owned canonical binding schema. All or nothing: one malformed
+    entry raises ``ValueError`` for the whole mapping, so a partial set never becomes authority."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("canonical_surface_bindings must be a mapping")
+    # Imported only when a mapping is present: a config without bindings loads nothing new.
+    from gateway.canonical_surface import CanonicalSurfaceBinding
+    from bridge.canonical.canonical_roster import RosterReader
+
+    def text(raw: Any, *, maximum: int = 256, optional: bool = False) -> Optional[str]:
+        if raw is None and optional:
+            return None
+        if not isinstance(raw, str):
+            raise ValueError("canonical surface binding strings are required")
+        raw = raw.strip()
+        if not raw or len(raw) > maximum:
+            raise ValueError("canonical surface binding string is out of bounds")
+        return raw
+
+    def principals(raw: Any) -> tuple[str, ...]:
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("canonical surface principal lists must be non-empty")
+        result = tuple(text(item) for item in raw)
+        if len(set(result)) != len(result):
+            raise ValueError("canonical surface principal lists must be unique")
+        return result  # type: ignore[return-value]
+
+    def buzz_pairs(buzz: dict) -> tuple[tuple[str, str], ...]:
+        # Admission is by declared pair, never by the two lists alone: two authors and two channels
+        # without pairs would also admit each author in the other's channel.
+        authors, channels = principals(buzz["author_ids"]), principals(buzz["channel_ids"])
+        if "pairs" not in buzz:
+            if len(authors) != 1 or len(channels) != 1:
+                raise ValueError("canonical Buzz binding must declare its author–channel pairs")
+            return ()
+        raw = buzz["pairs"]
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("canonical Buzz binding pairs must be a non-empty list")
+        result = []
+        for item in raw:
+            if not isinstance(item, dict) or set(item) != {"author_id", "channel_id"}:
+                raise ValueError("canonical Buzz binding pair schema is invalid")
+            result.append((text(item["author_id"]), text(item["channel_id"])))
+        if len(set(result)) != len(result):
+            raise ValueError("canonical Buzz binding pairs must be unique")
+        if {a for a, _ in result} != set(authors) or {c for _, c in result} != set(channels):
+            raise ValueError("canonical Buzz binding pairs must cover exactly its author_ids and channel_ids")
+        return tuple(result)  # type: ignore[return-value]
+
+    parsed: dict[str, Any] = {}
+    for raw_name, raw in value.items():
+        name = text(raw_name, maximum=128)
+        if not isinstance(raw, dict) or set(raw) != {"session_key", "session_id", "telegram", "buzz"}:
+            raise ValueError("canonical surface binding schema is invalid")
+        telegram, buzz = raw["telegram"], raw["buzz"]
+        if not isinstance(telegram, dict) or set(telegram) != {"chat_id", "chat_type", "user_id", "thread_id"}:
+            raise ValueError("canonical Telegram binding schema is invalid")
+        if not isinstance(buzz, dict) or set(buzz) - {"pairs"} != {"author_ids", "channel_ids"}:
+            raise ValueError("canonical Buzz binding schema is invalid")
+        chat_type = text(telegram["chat_type"], maximum=16)
+        if chat_type not in {"dm", "group", "channel", "thread"}:
+            raise ValueError("canonical Telegram chat type is invalid")
+        if name in parsed:
+            raise ValueError("canonical surface binding names must be unique")
+        parsed[name] = CanonicalSurfaceBinding(
+            name=name,
+            session_key=text(raw["session_key"], maximum=512),
+            session_id=text(raw["session_id"]),
+            telegram_chat_id=text(telegram["chat_id"]),
+            telegram_chat_type=chat_type,
+            telegram_user_id=text(telegram["user_id"], optional=True),
+            telegram_thread_id=text(telegram["thread_id"], optional=True),
+            allowed_author_ids=principals(buzz["author_ids"]),
+            allowed_channel_ids=principals(buzz["channel_ids"]),
+            pairs=buzz_pairs(buzz),
+            roster=(RosterReader(get_hermes_home() / "bridge" / "required-mentions.json")
+                    if name == "acp-canonical-ceo" else None),
+        )
+    return parsed
+
+
+def _canonical_bindings_to_dict(bindings: dict[str, Any]) -> dict[str, Any]:
+    """The closed schema ``_parse_canonical_surface_bindings`` reads back."""
+    return {
+        name: {
+            "session_key": binding.session_key,
+            "session_id": binding.session_id,
+            "telegram": {
+                "chat_id": binding.telegram_chat_id,
+                "chat_type": binding.telegram_chat_type,
+                "user_id": binding.telegram_user_id,
+                "thread_id": binding.telegram_thread_id,
+            },
+            "buzz": {
+                "author_ids": list(binding.allowed_author_ids),
+                "channel_ids": list(binding.allowed_channel_ids),
+                # Present only when declared, so a binding of one author in one channel
+                # serializes as it always did.
+                **({"pairs": [{"author_id": author, "channel_id": channel}
+                              for author, channel in binding.pairs]} if binding.pairs else {}),
+            },
+        }
+        for name, binding in bindings.items()
+    }
+
+
 @dataclass
 class GatewayConfig:
     """Main gateway configuration: platform connections, session policies, delivery settings."""
@@ -654,6 +762,8 @@ class GatewayConfig:
     # Prune SessionEntry records older than this (a resumed chat gets a fresh session). 0 = off.
     session_store_max_age_days: int = 90
     profile_routes: list = field(default_factory=list)  # gateway/profile_routing.py
+    # Server-owned canonical surface bindings (name -> CanonicalSurfaceBinding), YAML layer only.
+    canonical_surface_bindings: dict[str, Any] = field(default_factory=dict)
 
     # Scalar fields serialized verbatim by ``to_dict`` (in output order).
     _SCALAR_DICT_FIELDS = (
@@ -710,6 +820,9 @@ class GatewayConfig:
                 if is_dataclass(r) and not isinstance(r, type) else r
                 for r in self.profile_routes
             ],
+            # Omitted when empty, so a config without bindings serializes exactly as before.
+            **({"canonical_surface_bindings": _canonical_bindings_to_dict(self.canonical_surface_bindings)}
+               if self.canonical_surface_bindings else {}),
         }
 
     @classmethod
@@ -805,6 +918,7 @@ class GatewayConfig:
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),
+            canonical_surface_bindings=_parse_canonical_surface_bindings(pick("canonical_surface_bindings")),
         )
 
     def _extra_choice(self, platform: Optional[Platform], key: str, choices: set, default: str) -> Optional[str]:
@@ -834,9 +948,20 @@ def load_gateway_config() -> GatewayConfig:
 
     _home = get_hermes_home()
     gw_data = config_loader.load_legacy_gateway_json(_home)
+    # Canonical bindings have one source of truth: the merged YAML layer read once below, managed
+    # overlay included. gateway.json is never one, in either spelling: the top-level key is always
+    # set, so ``from_dict`` never consults ``gateway.canonical_surface_bindings`` from the legacy file.
+    canonical_bindings = None
     try:
-        config_loader.load_yaml_layer(_home, gw_data)
+        yaml_data = config_loader.load_yaml_layer(_home, gw_data)
+        if isinstance(yaml_data, dict):
+            yaml_gateway = yaml_data.get("gateway")
+            if "canonical_surface_bindings" in yaml_data:
+                canonical_bindings = yaml_data["canonical_surface_bindings"]
+            elif isinstance(yaml_gateway, dict):
+                canonical_bindings = yaml_gateway.get("canonical_surface_bindings")
     except Exception as e:
+        # A broken YAML layer leaves no bindings, and is not re-read: a second read could see a changed file.
         logger.warning(
             # DingTalk settings → env vars: migrated to the dingtalk plugin's apply_yaml_config_fn hook
             # (plugins/platforms/dingtalk/adapter.py). #41112 / #3823.
@@ -850,6 +975,8 @@ def load_gateway_config() -> GatewayConfig:
             "Check %s for syntax errors. Error: %s",
             _home / "config.yaml", e,
         )
+    if isinstance(gw_data, dict):
+        gw_data["canonical_surface_bindings"] = canonical_bindings
 
     config = GatewayConfig.from_dict(gw_data)
     _apply_env_overrides(config)

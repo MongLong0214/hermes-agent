@@ -511,14 +511,57 @@ def read_yaml_layers(home: Path) -> dict:
     # Managed scope: overlay administrator-pinned values (this loader bypasses
     # hermes_cli.config.load_config, so managed quick_commands / stt would otherwise be ignored).
     from hermes_cli import managed_scope
-    return managed_scope.apply_managed_overlay(yaml_cfg)
+    # Canonical bindings are server-owned: when the managed layer declares them (either spelling, an
+    # explicit empty or null included) they replace the user's and never merge with them. The overlay
+    # reads the managed file again, so the user's are held out of it and come back only when neither
+    # read declared any: a rewrite between the reads, or an overlay that failed open, leaves none.
+    managed_declares = _declares_canonical_bindings(managed_scope.load_managed_config())
+    yaml_cfg, user_bindings = _hold_out_canonical_bindings(yaml_cfg)
+    merged = managed_scope.apply_managed_overlay(yaml_cfg)
+    if not managed_declares and not _declares_canonical_bindings(merged):
+        _restore_canonical_bindings(merged, user_bindings)
+    return merged
 
 
-def load_yaml_layer(home: Path, gw_data: dict) -> None:
-    """Overlay ``read_yaml_layers`` onto *gw_data* in place. Raises on any failure (caller warns + falls back)."""
+_CANONICAL_BINDINGS = "canonical_surface_bindings"
+
+
+def _declares_canonical_bindings(cfg: Any) -> bool:
+    gateway = cfg.get("gateway") if isinstance(cfg, dict) else None
+    return isinstance(cfg, dict) and (
+        _CANONICAL_BINDINGS in cfg or (isinstance(gateway, dict) and _CANONICAL_BINDINGS in gateway))
+
+
+def _hold_out_canonical_bindings(cfg: Any) -> tuple[Any, dict]:
+    """*cfg* without either binding spelling (copied only where one was removed), and what was removed."""
+    held: dict = {}
+    if not _declares_canonical_bindings(cfg):
+        return cfg, held
+    cfg = dict(cfg)
+    if _CANONICAL_BINDINGS in cfg:
+        held["top"] = cfg.pop(_CANONICAL_BINDINGS)
+    gateway = cfg.get("gateway")
+    if isinstance(gateway, dict) and _CANONICAL_BINDINGS in gateway:
+        gateway = cfg["gateway"] = dict(gateway)
+        held["gateway"] = gateway.pop(_CANONICAL_BINDINGS)
+    return cfg, held
+
+
+def _restore_canonical_bindings(cfg: Any, held: dict) -> None:
+    if not isinstance(cfg, dict):
+        return
+    if "top" in held:
+        cfg[_CANONICAL_BINDINGS] = held["top"]
+    if "gateway" in held and isinstance(cfg.get("gateway"), dict):
+        cfg["gateway"][_CANONICAL_BINDINGS] = held["gateway"]
+
+
+def load_yaml_layer(home: Path, gw_data: dict) -> Any:
+    """Overlay ``read_yaml_layers`` onto *gw_data* in place and return that YAML mapping, the one
+    read keys with YAML-only authority come from. Raises on any failure (caller warns + falls back)."""
     yaml_cfg = read_yaml_layers(home)
     if not yaml_cfg:
-        return
+        return yaml_cfg
 
     gateway_section = yaml_cfg.get("gateway")
     bridge_toplevel_keys(yaml_cfg, gateway_section, gw_data)
@@ -552,6 +595,7 @@ def load_yaml_layer(home: Path, gw_data: dict) -> None:
     apply_plugin_yaml_hooks(yaml_cfg, gateway_platforms, platforms_data, registry,
                             warned=warned, authored=authored, managed_extra=managed_extra, entries=entries)
     bridge_core_env_settings(yaml_cfg, platforms_data)
+    return yaml_cfg
 
 
 def load_gateway_config_file(gateway_config_file: str):
