@@ -794,6 +794,17 @@ class GatewayTurnPrepareMixin:
         # A turn becomes durable recovery work only after it owns the per-session lease; marking
         # earlier would falsely recover a message that never began processing.
         await self._mark_durable_active_turn(event, session_entry.session_key)
+        if getattr(event, "_acp_admission", None) is not None:
+            # An admitted /acp task runs only once its crash identity is durable: startup recovery
+            # recognises it by this marker, never re-runs or redelivers it (acp_managed_ingress).
+            from gateway import acp_managed_ingress
+            if not await asyncio.to_thread(acp_managed_ingress.bind_turn_marker, event._acp_admission,
+                                           getattr(event, "_gateway_active_turn_token", None)):
+                acp_managed_ingress.abort_claimed(event._acp_admission)
+                event._acp_admission = None
+                self._clear_session_env(_session_env_tokens)
+                return (acp_managed_ingress.REFUSED.format(reason="turn identity could not be recorded"),
+                        _session_env_tokens)
 
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).

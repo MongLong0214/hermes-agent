@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Mapping
 from contextlib import suppress
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -162,6 +163,7 @@ def _resolve_budget_fallback(
                     "— requesting summary...", diagnostic=True,
                 )
             _summary_start = time.time()
+            agent._iteration_summary_answered = False  # handle_max_iterations sets it on a model-written summary
             try:
                 final_response = agent._handle_max_iterations(messages, api_call_count)
             except InterruptedError:
@@ -437,6 +439,27 @@ def _append_file_mutation_footer(agent, final_response, logger):
     return final_response
 
 
+def _answer_provenance(agent, turn_id, _turn_exit_reason, preserved_verification_fallback, clean_exit):
+    """Answer provenance for /acp receipts: ``(answer_origin, answer_body, answer_disposition)``.
+
+    Only these exits produce the model's own text for this turn: a text response, recovered stream
+    text, this turn's earlier text reused after housekeeping tools, or a budget exit whose summary (or
+    preserved verification answer) the model wrote. For them, carry the text the output hook was given,
+    the text it returned (both recorded at that one seam before footer, explainer or media decoration)
+    and what the hook declared it did to the answer; every other exit carries None. The gateway judges
+    all three at its certification boundary; nothing here decides eligibility."""
+    _exit = str(_turn_exit_reason)
+    answer_exit = clean_exit and (
+        _exit.startswith("text_response")
+        or _exit in ("partial_stream_recovery", "fallback_prior_turn_content")
+        or (_exit.startswith("max_iterations_reached")
+            and (preserved_verification_fallback or getattr(agent, "_iteration_summary_answered", False) is True)))
+    seam = getattr(agent, "_llm_output_seam", None)
+    if answer_exit and isinstance(seam, tuple) and len(seam) == 4 and seam[0] == turn_id:
+        return seam[1], seam[2], seam[3]
+    return None, None, None
+
+
 def _explain_abnormal_exit(agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger):
     """Turn-completion explainer: on abnormal exits, surface one explanation from
     ``_turn_exit_reason``. Only acts when no usable reply exists (empty, "(empty)",
@@ -544,21 +567,35 @@ def apply_llm_output_transform(
         return final_response, transformed, pre_transform
     if not final_response:
         return final_response, False, None
+    model_text = final_response
     if platform is None:
         platform = getattr(agent, "platform", None) or ""
     transformed, pre_transform = False, None
     payload = dict(response_text=final_response, session_id=agent.session_id or "", model=agent.model,
                    platform=platform, turn_id=turn_id)  # turn_id: per-turn identity for the hook callback gate
     held = getattr(agent, "_held_transforms", None) if getattr(agent, "_hold_stream", False) else None
+    rewrite, declared = None, None
     if held:
         rewrite = _run_held_transforms(held, payload, logger)
     else:
-        # First hook to return a string wins; None/empty leaves the text unchanged.
-        rewrite = next((r for r in _invoke_hook_safely("transform_llm_output", logger, **payload)
-                        if isinstance(r, str) and r), None)
+        # First hook to return a non-empty text wins; None/empty leaves the text unchanged. A hook may
+        # return {"text": ..., "answer": "preserved" | "suppressed"} to say whether its text still
+        # carries the model's answer; the text itself is used exactly as a plain string would be.
+        for result in _invoke_hook_safely("transform_llm_output", logger, **payload):
+            text, answer = (result.get("text"), result.get("answer")) if isinstance(result, Mapping) else (result, None)
+            if isinstance(text, str) and text:
+                rewrite, declared = text, answer
+                break
+    disposition = "unchanged"
     if rewrite:
         pre_transform, final_response, transformed = final_response, rewrite, True
+        # A plain string (or an unclear declaration) cannot say whether the model's answer survived:
+        # a reformat and a hook-written notice look alike, so only the hook knows.
+        disposition = declared if declared in ("preserved", "suppressed") else "undeclared"
     agent._llm_output_transform = (turn_id, transformed, pre_transform)
+    # Answer provenance (/acp receipts): the text this turn handed the hook, the text the hook returned
+    # (both before any footer, explainer or media decoration) and what the hook said it did to the answer.
+    agent._llm_output_seam = (turn_id, model_text, final_response, disposition)
     return final_response, transformed, pre_transform
 
 
@@ -761,6 +798,10 @@ def finalize_turn(
         # The streamed partial already reached the user and owns the transcript row, so the
         # reply is only this fixed notice: echoing the partial would deliver it twice.
         final_response = _ACCEPTED_STREAM_FAILURE_NOTICE
+    _answer_origin, _answer_body, _answer_disposition = _answer_provenance(
+        agent, turn_id, _turn_exit_reason, preserved_verification_fallback,
+        not interrupted and not failed and accepted_stream_failure_error is None,
+    )
     # Response transforms apply only to real, uninterrupted responses.
     if final_response and not interrupted:
         final_response = _append_file_mutation_footer(agent, final_response, logger)
@@ -809,6 +850,9 @@ def finalize_turn(
         "api_calls": api_call_count,
         "completed": completed,
         "turn_exit_reason": _turn_exit_reason,
+        "answer_origin": _answer_origin,
+        "answer_body": _answer_body,
+        "answer_disposition": _answer_disposition,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,
