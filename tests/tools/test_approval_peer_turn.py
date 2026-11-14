@@ -25,6 +25,18 @@ def _owner_yolo(tmp_path, monkeypatch):
     monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
 
 
+@pytest.fixture
+def _unbound_session_context(monkeypatch):
+    """``clear_session_vars`` leaves every session ContextVar at ``""`` in the test's own context, and
+    ``""`` masks ``os.environ``: a later file's ``HERMES_SESSION_PLATFORM`` would read as unset. Put
+    the vars back to never-bound, and the process-wide engaged latch to its prior value."""
+    from gateway import session_context
+
+    monkeypatch.setattr(session_context, "_session_context_engaged", session_context.session_context_engaged())
+    yield
+    session_context.reset_session_vars()
+
+
 def _as(principal, fn):
     """Run *fn* with the turn principal bound (``None`` = an ordinary owner turn: nothing bound)."""
     if principal is None:
@@ -235,7 +247,8 @@ def test_the_mcp_trust_gate_never_grants_a_peer_the_owner_bypass(principal, expe
 
 
 @pytest.mark.parametrize("principal,expected,prompts", [(None, "accept", 1), ("peer", "decline", 0)])
-def test_mcp_elicitation_never_prompts_the_owner_for_a_peer(monkeypatch, principal, expected, prompts):
+def test_mcp_elicitation_never_prompts_the_owner_for_a_peer(monkeypatch, _unbound_session_context,
+                                                             principal, expected, prompts):
     from gateway.session_context import clear_session_vars, set_session_vars
     from tools import approval_prompt
     from tools.approval_context import reset_current_session_key, set_current_session_key
