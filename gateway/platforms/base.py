@@ -4464,9 +4464,13 @@ class BasePlatformAdapter(ABC):
         records = getattr(event, "_inbound_records_on_delivery", None)
         if records:
             event._inbound_records_on_delivery = []
+            # An earlier answer of the chain that was neither ledgered nor delivered keeps its records
+            # (gateway/run_turn.py, _keep_inbound_records).
+            kept = getattr(self.gateway_runner, "__dict__", {}).get("_inbound_records_kept") or ()
             try:
                 for recovery_id in records:
-                    self.gateway_runner._consume_inbound_record_id(recovery_id)
+                    if recovery_id not in kept:
+                        self.gateway_runner._consume_inbound_record_id(recovery_id)
             except Exception:
                 logger.warning("[%s] Deleting the inbound records of a delivered turn failed", self.name,
                                exc_info=True)

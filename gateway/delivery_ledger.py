@@ -284,14 +284,30 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
     return hashlib.sha256(f"{session_key}|{message_ref}|{content}".encode("utf-8", "replace")).hexdigest()[:24]
 
 
-def inbound_obligation_id(session_key: str, recovery_id: str, *, platform: str, chat_id: Any,
+def inbound_answer_ref(recovery_id: str, run: Any = 0) -> str:
+    """The ledger reference of the answer one run of an inbound record's message gave: the record id,
+    with the run's ordinal when the message ran again after a restart. The ordinal is chosen when the
+    record is re-admitted (gateway/run_startup.py, _inbound_run_for) and stamped on the run's user row
+    (``inbound_run``), so it is the same at delivery and at a later recovery, and a rerun's reply never
+    takes over the obligation an earlier run's reply still holds."""
+    return f"{recovery_id}#{run}" if isinstance(run, int) and run > 0 else str(recovery_id)
+
+
+def inbound_obligation_id(session_key: str, answer_ref: str, *, platform: str, chat_id: Any,
                           thread_id: Any) -> str:
-    """Id of the reply owed to the owner message whose inbound record is *recovery_id*
-    (gateway/shutdown_flush.py): that record and where the reply goes, never the reply's text. Normal
-    delivery (platforms/base.py, _record_delivery_obligation) and startup recovery of an answered record
-    (gateway/run_startup.py, _consume_if_answered) agree on it even when the delivered text is not the
-    transcript's (a runtime footer added at delivery), and two records answered alike stay two."""
-    return compute_obligation_id(session_key, f"inbound:{recovery_id}|{platform}|{chat_id}|{thread_id or ''}", "")
+    """Id of the reply owed to the owner message whose inbound record (gateway/shutdown_flush.py) and
+    run *answer_ref* names (``inbound_answer_ref``): that and where the reply goes, never the reply's
+    text. Normal delivery (platforms/base.py, _record_delivery_obligation) and startup recovery of an
+    answered record (gateway/run_startup.py, _consume_if_answered) agree on it even when the delivered
+    text is not the transcript's (a runtime footer added at delivery), and two records answered alike
+    stay two."""
+    return compute_obligation_id(session_key, f"inbound:{answer_ref}|{platform}|{chat_id}|{thread_id or ''}", "")
+
+
+def obligation_exists(obligation_id: str) -> bool:
+    with _DB_LOCK, _transaction() as conn:
+        return conn.execute("SELECT 1 FROM delivery_obligations WHERE obligation_id=?",
+                            (obligation_id,)).fetchone() is not None
 
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,

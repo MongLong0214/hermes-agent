@@ -817,6 +817,8 @@ class GatewayStartupMixin:
                 cleared = True
                 with suppress(Exception):
                     await self.async_session_store.clear_resume_pending(session_key)
+            with _log_suppressed(logging.WARNING, "Choosing the run of stored message failed: %s"):
+                event._inbound_run = await asyncio.to_thread(self._inbound_run_for, record, event.source)
             try:
                 await adapter.handle_message(event)
                 session_tasks = getattr(adapter, "_session_tasks", {})
@@ -848,12 +850,13 @@ class GatewayStartupMixin:
         folded into the row's message owes the same one row. False, keeping the record to be
         re-admitted, when there is no answer, it cannot be matched, or no ledger can owe it."""
         from gateway import shutdown_flush
-        from gateway.delivery_ledger import inbound_obligation_id, ledger_enabled, record_crash_left_reply
+        from gateway.delivery_ledger import (
+            inbound_answer_ref, inbound_obligation_id, ledger_enabled, record_crash_left_reply)
         from hermes_cli.timefmt import coerce_epoch
         found = await self._inbound_record_answer(record)
         if found is None:
             return False
-        history, asked_at, origin, answered_as = found
+        history, asked_at, origin, answered_as, answered_run = found
         text = self._crash_left_reply(history, 0.0, origin)
         if text is None:
             return False
@@ -867,8 +870,9 @@ class GatewayStartupMixin:
             # delivery.
             await asyncio.to_thread(
                 record_crash_left_reply,
-                obligation_id=inbound_obligation_id(key, answered_as, platform=platform, chat_id=source.chat_id,
-                                                    thread_id=source.thread_id),
+                obligation_id=inbound_obligation_id(
+                    key, inbound_answer_ref(answered_as, answered_run), platform=platform,
+                    chat_id=source.chat_id, thread_id=source.thread_id),
                 session_key=key, platform=platform, chat_id=source.chat_id,
                 thread_id=source.thread_id, content=text, since=coerce_epoch(asked_at) or 0.0,
                 adapter_profile=record.get("transport_profile"), same_reply_dedupe=False)
@@ -878,11 +882,11 @@ class GatewayStartupMixin:
         return True
 
     async def _inbound_record_answer(self, record: dict):
-        """``(history up to the answer, asked-at timestamp, origin, answered record id)`` when the
-        record's message already has its final, completed answer in the transcript, else None. The user
-        row is the one that names the record, as its own (``display_metadata.inbound_recovery_id``,
+        """``(history up to the answer, asked-at timestamp, origin, answered record id, its run)`` when
+        the record's message already has its final, completed answer in the transcript, else None. The
+        user row is the one that names the record, as its own (``display_metadata.inbound_recovery_id``,
         written when the turn persists it, the answered record id) or as a message folded into it
-        (``inbound_absorbed_ids``). The answer is the next assistant row before another user row that
+        (``inbound_absorbed_ids``), and names the run (``inbound_run``, absent for the first). The answer is the next assistant row before another user row that
         completed the turn: no tool calls, text, not the failed-turn notice, and either the model ended
         its turn there (``finish_reason`` "stop") or the finalizer closed a completed turn with it
         (``display_metadata.turn_completed``, agent/turn_finalizer.py, a recovery or fallback reply). A
@@ -898,7 +902,7 @@ class GatewayStartupMixin:
             history = await self.async_session_store.load_transcript(entry.session_id)
         except Exception:
             return None
-        answer = asked_at = answered_as = None
+        answer = asked_at = answered_as = answered_run = None
         asking = False
         for index, row in enumerate(history):
             meta = row.get("display_metadata") if isinstance(row.get("display_metadata"), dict) else {}
@@ -908,6 +912,7 @@ class GatewayStartupMixin:
                     isinstance(absorbed, list) and recovery_id in absorbed)
                 if asking:  # a later copy of the message is asked anew
                     answer, asked_at, answered_as = None, row.get("timestamp"), meta.get("inbound_recovery_id")
+                    answered_run = meta.get("inbound_run")
             elif (asking and row.get("role") == "assistant"
                   and (row.get("finish_reason") == "stop" or meta.get(TURN_COMPLETED_METADATA_KEY) is True)
                   and not row.get("tool_calls") and isinstance(row.get("content"), str) and row["content"].strip()
@@ -922,7 +927,23 @@ class GatewayStartupMixin:
         else:
             from gateway import shutdown_flush
             origin = shutdown_flush.inbound_event_from_record(record).source
-        return history[:answer + 1], asked_at, origin, answered_as or recovery_id
+        return history[:answer + 1], asked_at, origin, answered_as or recovery_id, answered_run
+
+    def _inbound_run_for(self, record: dict, source) -> int:
+        """The run a re-admitted stored message is about to start: the first whose reply obligation is
+        not in the delivery ledger. An earlier run's reply that reached the ledger (its record then
+        outlived it: a death before the delete, a failed delete, a restart that cut the turn short) keeps
+        its own row, still owed or already delivered, and this run's reply gets a row of its own."""
+        from gateway.delivery_ledger import inbound_answer_ref, inbound_obligation_id, ledger_enabled, obligation_exists
+        if not ledger_enabled():
+            return 0
+        platform = str(getattr(source.platform, "value", source.platform))
+        run = 0
+        while obligation_exists(inbound_obligation_id(
+                record["session_key"], inbound_answer_ref(record["recovery_id"], run), platform=platform,
+                chat_id=source.chat_id, thread_id=source.thread_id)):
+            run += 1
+        return run
 
     def _event_is_queued(self, session_key: str, event: MessageEvent) -> bool:
         """*event* waits in the session's queue: the pending slot, the FIFO overflow, or a busy-text

@@ -775,7 +775,7 @@ def _persisting_agents(monkeypatch, fragment=None):
             recovery_id = metadata.get("inbound_recovery_id")
             if recovery_id:  # the agent writes the turn's display metadata on its user row
                 user["display_metadata"] = {key: metadata[key] for key in (
-                    "inbound_recovery_id", "inbound_absorbed_ids") if key in metadata}
+                    "inbound_recovery_id", "inbound_absorbed_ids", "inbound_run") if key in metadata}
             answer = {"role": "assistant", "content": result["final_response"], "finish_reason": "stop"}
             if fragment is not None and recovery_id:  # an owner turn cut off with only a partial reply
                 answer = {"role": "assistant", "content": fragment, "finish_reason": "length"}
@@ -2053,3 +2053,121 @@ def test_a_stream_recovered_reply_the_finalizer_filled_into_a_blank_row_is_answe
     nxt = _next_process(ingress, send, monkeypatch, crashed=True)
     turns, _inputs, chats, left = _answered(ingress, nxt)
     assert (turns, chats, left) == ([], ["chat"], [])
+
+
+@pytest.mark.parametrize("chain", ["as_is", "rewritten", "raises"])
+def test_a_first_response_neither_ledgered_nor_delivered_keeps_its_record_through_the_chain(
+        ingress, send, monkeypatch, chain):
+    """The in-turn sibling of review r4 P1-1: an owner follow-up is drained inside the running turn, and
+    the first message's answer, sent before the follow-up runs, fails with no ledger row (the ledger
+    write fails and the send is refused). The process lives on. The first message's record stays
+    through the chain's end: after the follow-up is answered, also when admission rewrote the turn's
+    event (a pre-dispatch hook) so the record lives on the adapter's event, and when the chain raises
+    before the follow-up runs. The next process delivers that answer once and does not run it again;
+    after the raise, the failed turn's own notice re-asked the message on the transcript, so the next
+    process runs it, and the follow-up that never ran, once each."""
+    import dataclasses
+
+    import gateway.run_turn_followup_ack as followup_ack
+    from gateway import delivery_ledger
+    from gateway.platforms.base import SendResult
+
+    follow_up = "owner: one more thing"
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    _persisting_agents(monkeypatch)
+    if chain == "rewritten":
+        async def rewritten(event):
+            return dataclasses.replace(event), event.source, False
+        monkeypatch.setattr(h.runner, "_hm_admit_event", rewritten)
+    elif chain == "raises":
+        async def failing_hook(_adapter, _event, hook, *_args):
+            raise RuntimeError(f"{hook} failed")
+        monkeypatch.setattr(followup_ack, "_run_followup_processing_hook", failing_hook)
+    first, failed = (threading.Event(), threading.Event()), []
+    record, send_with_retry = delivery_ledger.record_obligation, h.adapter._send_with_retry
+
+    def failing_record(**kwargs):  # the first response's ledger write, then the follow-up's
+        if not failed:
+            failed.append("ledger")
+            raise OSError("the delivery ledger is read-only")
+        return record(**kwargs)
+
+    async def refused_send(*, chat_id, content, **kwargs):
+        if _TERMINAL in content and failed == ["ledger"]:
+            failed.append("send")
+            return SendResult(success=False, error="Bad Gateway")
+        return await send_with_retry(chat_id=chat_id, content=content, **kwargs)
+
+    import run_agent
+    build = run_agent.AIAgent
+
+    def holding(**kwargs):  # every agent the session builds (a persisted row can rebuild it)
+        actor = build(**kwargs)
+        run = actor.run_conversation
+
+        def held(text, *, conversation_history, task_id, **kw):
+            if kw.get("persist_user_message", text) == _OWNER_TEXT:
+                first[0].set()
+                first[1].wait(30)
+            return run(text, conversation_history=conversation_history, task_id=task_id, **kw)
+        actor.run_conversation = held
+        return actor
+    monkeypatch.setattr(run_agent, "AIAgent", holding)
+
+    async def exercise():
+        await h.warm()
+        await h.adapter.handle_message(h.owner_event())
+        await h.wait(first[0].is_set, "the first owner turn to run")
+        await h.adapter.handle_message(h.owner_event(follow_up, message_id="m2"))
+        await h.wait(lambda: h.queued() == [follow_up], "the follow-up to be queued")
+        monkeypatch.setattr(delivery_ledger, "record_obligation", failing_record)
+        monkeypatch.setattr(h.adapter, "_send_with_retry", refused_send)
+        first[1].set()
+        await h.settle()
+    asyncio.run(exercise())
+    ran = [] if chain == "raises" else [follow_up]  # the follow-up's record stays when it never ran
+    assert failed == ["ledger", "send"]
+    assert [text for actor in h.built for text in actor.calls][-1 - len(ran):] == [_OWNER_TEXT, *ran]
+    assert [chat for chat, text in h.owner_replies() if _TERMINAL in text] == ["chat" for _ in ran]
+    assert _record_texts(ingress) == sorted([_OWNER_TEXT, *([] if ran else [follow_up])])
+    turns, _inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch))
+    if ran:
+        assert (turns, chats, left) == ([], ["chat"], [])
+    else:
+        assert (turns, chats, left) == ([_OWNER_TEXT, follow_up], ["chat", "chat"], [])
+
+
+def test_a_rerun_after_a_restart_never_takes_over_the_reply_an_earlier_run_still_owes(
+        ingress, send, monkeypatch):
+    """Open item 5 of r4 slice 1: a stored message's earlier run left a reply in the delivery ledger that
+    is still owed, the transcript holds no completed answer (a truncated one), and the record outlived
+    that reply (a death between the ledger write and the delete). The next process runs the message
+    again. The rerun's reply is owed under the record's next run, so the earlier run's obligation is
+    neither replaced nor lost."""
+    from types import SimpleNamespace
+
+    from agent.session_persistence import _db_flush_row
+    from gateway import delivery_ledger, shutdown_flush
+
+    db, sid, key, source = (ingress.runner.session_store._db, ingress.entry.session_id,
+                            ingress.entry.session_key, ingress.source)
+    event = MessageEvent(text=_OWNER_TEXT, message_type=MessageType.TEXT, source=source, message_id="m1")
+    shutdown_flush.store_inbound_record(event, session_key=key, transport_profile=None,
+                                        recovery_id="rerun", order=(1, 1))
+    fragment = "partial: I was about to"
+    flusher = SimpleNamespace(_persist_user_message_override=None, _persist_user_message_timestamp=None)
+    db.append_messages_batch(sid, [
+        _db_flush_row(flusher, {"role": "user", "content": _OWNER_TEXT, "platform_message_id": "m1",
+                                "display_metadata": {"inbound_recovery_id": "rerun"}}, True),
+        {"role": "assistant", "content": fragment, "finish_reason": "length"}])
+    platform = source.platform.value
+    earlier = delivery_ledger.inbound_obligation_id(
+        key, "rerun", platform=platform, chat_id=source.chat_id, thread_id=source.thread_id)
+    delivery_ledger.record_obligation(obligation_id=earlier, session_key=key, platform=platform,
+                                      chat_id=source.chat_id, thread_id=source.thread_id, content=fragment)
+    turns, _inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch))
+    assert (turns, chats, left) == ([_OWNER_TEXT], ["chat"], [])
+    with delivery_ledger._connect() as conn:
+        owed = dict(conn.execute("SELECT obligation_id, content FROM delivery_obligations WHERE session_key=?",
+                                 (key,)).fetchall())
+    assert owed.pop(earlier) == fragment and [_TERMINAL in content for content in owed.values()] == [True]

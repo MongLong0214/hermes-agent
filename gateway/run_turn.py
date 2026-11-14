@@ -176,7 +176,17 @@ def _inbound_row_metadata(event: Any) -> dict:
     if not (isinstance(recovery_id, str) and recovery_id):
         return {}
     absorbed = [rid for rid in absorbed or () if isinstance(rid, str) and rid and rid != recovery_id]
-    return {"inbound_recovery_id": recovery_id, **({"inbound_absorbed_ids": absorbed} if absorbed else {})}
+    run = getattr(event, "_inbound_run", 0)  # a rerun after a restart (gateway/run_startup.py, _inbound_run_for)
+    return {"inbound_recovery_id": recovery_id, **({"inbound_absorbed_ids": absorbed} if absorbed else {}),
+            **({"inbound_run": run} if isinstance(run, int) and run > 0 else {})}
+
+
+def _inbound_answer_ref_of(row_metadata: Any) -> Optional[str]:
+    """The ledger reference of the answer to the row's message, this run of it (delivery_ledger.
+    inbound_answer_ref), or None when the row names no record."""
+    from gateway.delivery_ledger import inbound_answer_ref
+    recovery_id = (row_metadata or {}).get("inbound_recovery_id")
+    return inbound_answer_ref(recovery_id, row_metadata.get("inbound_run", 0)) if recovery_id else None
 
 
 class GatewayTurnMixin:
@@ -2396,6 +2406,9 @@ class GatewayTurnMixin:
             # Admission/typing is not execution. All routing, authorization and
             # turn preparation gates have passed when the agent runner is entered.
             event._heartbeat_execution_started = True
+            _row_inbound = _inbound_row_metadata(event)
+            if _row_inbound:  # the reply is owed under this run of the row's record (run_inbound.py)
+                event._inbound_answer_ref = _inbound_answer_ref_of(_row_inbound)
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -2408,7 +2421,7 @@ class GatewayTurnMixin:
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event),
                     # Names the inbound record on the user row, so a restart can tell this turn answered.
-                    **_inbound_row_metadata(event),
+                    **_row_inbound,
                     # Diagnostic only: crash recovery identifies a managed turn by its bound
                     # active-turn marker (acp_managed_ingress.bind_turn_marker), not by this row.
                     **({"acp_update_id": str(event._acp_admission.update_id)}
@@ -3991,10 +4004,13 @@ class GatewayTurnMixin:
 
     async def _run_agent_deliver_first_response(
         self, turn_ctx: TurnContext, adapter: Any, response: Any, result: Any, stream_task: Any,
-    ) -> None:
-        """Deliver the first response before a queued follow-up runs, unless streaming already did."""
+    ) -> bool:
+        """Deliver the first response before a queued follow-up runs, unless streaming already did.
+        Returns whether that answer is settled: nothing was to be sent, it was delivered, or its
+        obligation is in the delivery ledger. False when its send raised or was refused with no ledger
+        row: its message's inbound records must then stay for the next start."""
         if turn_ctx.mute_notification_reply:
-            return
+            return True
         session_key = turn_ctx.session_key
         _sc = turn_ctx.stream_consumer_holder[0]
         if _sc and stream_task:
@@ -4025,9 +4041,11 @@ class GatewayTurnMixin:
                 _already_streamed = False
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
-        # A message with an inbound record is owed under that record (platforms/base.py,
-        # _record_delivery_obligation), the identity a restart owes its answer under.
-        _row_record = (turn_ctx.persist_user_display_metadata or {}).get("inbound_recovery_id")
+        # A message with an inbound record is owed under that record and run (platforms/base.py,
+        # _record_delivery_obligation), the identity a restart owes its answer under. Read like the
+        # other turn-context fields added after it (``acp_admission``): a narrower context may lack it.
+        _row_ref = _inbound_answer_ref_of(getattr(turn_ctx, "persist_user_display_metadata", None))
+        _text_delivered = False
         if first_response:
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
@@ -4044,7 +4062,7 @@ class GatewayTurnMixin:
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key,
-                    inbound_message_id=f"inbound:{_row_record}" if _row_record else turn_ctx.inbound_message_id,
+                    inbound_message_id=f"inbound:{_row_ref}" if _row_ref else turn_ctx.inbound_message_id,
                     acp_admission=await self._acp_first_response_admission(turn_ctx, _delivery_result),
                 )
             except Exception as e:
@@ -4068,6 +4086,28 @@ class GatewayTurnMixin:
                 _bg_result = _bg_cb()
                 if inspect.isawaitable(_bg_result):
                     await _bg_result
+        return not first_response or _text_delivered or (
+            _row_ref is not None and await self._inbound_answer_ledgered(turn_ctx, _row_ref))
+
+    async def _inbound_answer_ledgered(self, turn_ctx: TurnContext, answer_ref: str) -> bool:
+        """The first response's obligation, under *answer_ref*, is in the delivery ledger."""
+        from gateway.delivery_ledger import inbound_obligation_id, ledger_enabled, obligation_exists
+        source = turn_ctx.source
+        try:
+            return await asyncio.to_thread(ledger_enabled) and await asyncio.to_thread(
+                obligation_exists, inbound_obligation_id(
+                    turn_ctx.session_key, answer_ref, platform=str(getattr(source.platform, "value", source.platform)),
+                    chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None)))
+        except Exception:
+            logger.warning("Reading the first response's delivery obligation failed", exc_info=True)
+            return False
+
+    def _keep_inbound_records(self, recovery_ids: list) -> None:
+        """An answer that was neither ledgered nor delivered: its message's records stay on disk for the
+        next start, which delivers the stored answer or runs the message again. They still ride the
+        turn's event, so the adapter skips them when the chain's final is ledgered (platforms/base.py,
+        _release_turn_marker)."""
+        self.__dict__.setdefault("_inbound_records_kept", set()).update(recovery_ids)
 
     async def _run_agent_queued_followup(
         self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,
@@ -4105,12 +4145,17 @@ class GatewayTurnMixin:
 
         # Interrupted: discard the response ("Operation interrupted." is noise).
         if not result.get("interrupted"):
-            await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
-            # This level's message has its answer handed to the delivery ledger (or delivered): its
-            # inbound record, and those of the messages folded into it, are done before the follow-up runs.
-            _row = turn_ctx.persist_user_display_metadata or {}
-            for _done in (_row.get("inbound_recovery_id"), *(_row.get("inbound_absorbed_ids") or ())):
-                self._consume_inbound_record_id(_done)
+            _settled = await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
+            # This level's message has its answer delivered or handed to the delivery ledger: its inbound
+            # record, and those of the messages folded into it, are done before the follow-up runs. An
+            # answer neither ledgered nor delivered keeps them for the next start.
+            _row = getattr(turn_ctx, "persist_user_display_metadata", None) or {}
+            _done = [rid for rid in (_row.get("inbound_recovery_id"), *(_row.get("inbound_absorbed_ids") or ())) if rid]
+            if _settled:
+                for _rid in _done:
+                    self._consume_inbound_record_id(_rid)
+            else:
+                self._keep_inbound_records(_done)
 
         updated_history = result.get("messages", history)
         next_source, next_message, next_session_key = source, pending, session_key
@@ -4242,7 +4287,7 @@ class GatewayTurnMixin:
             merged = {
                 **merged,
                 "queued_terminal_inbound_id": next_inbound_id,
-                "queued_terminal_inbound_record": _inbound_row_metadata(pending_event).get("inbound_recovery_id"),
+                "queued_terminal_inbound_record": _inbound_answer_ref_of(_inbound_row_metadata(pending_event)),
                 "queued_terminal_display_kind": next_display_kind,
                 "queued_terminal_notification_category": (
                     (pending_event.metadata or {}).get("notification_category", "result")
