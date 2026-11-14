@@ -23,7 +23,7 @@ from agent.i18n import t
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType, clean_attachment_filename
-from gateway.run_busy import approval_input_words
+from gateway.run_busy import approval_input_words, run_reserved_turn
 from gateway.run_inbound_media import rehome_inbound_media
 from gateway.run_inbound_hooks import GatewayInboundHooksMixin
 from gateway.run_inbound_transcription import GatewayInboundTranscriptionMixin
@@ -1230,42 +1230,6 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             _handled, _result = await self._admit_command_turn(event, source, _quick_key, stop_epoch)
         return _handled, _result
 
-    def _hm_rescue_orphaned_fifo(
-        self, event: MessageEvent, source: SessionSource, is_internal: bool, _quick_key: str
-    ) -> tuple[MessageEvent, SessionSource, bool]:
-        """FIFO orphan rescue: a session that went idle with a populated overflow (post-turn drain
-        never promoted, e.g. a compression-demoted follow-up) silently orphaned those events. The
-        oldest orphan runs as THIS turn and the incoming event is parked behind the chain. Skipped
-        for control commands and internal events."""
-        try:
-            # ── FIFO orphan rescue (#99882) ──────────────────────────────── If this session went idle with
-            # a populated overflow (queued during a busy window whose post-turn drain never promoted — e.g.
-            # a compression-demoted follow-up after the compression window ended through an exit that
-            # skipped the promotion site), those events were silently orphaned. We are starting the next
-            # turn for this session NOW: re-stage the orphans in FIFO order and enqueue the incoming event
-            # behind them, so arrival order (#28503) holds: oldest orphan runs as this turn, the rest drain
-            # in order, the new message last.
-            _orphan_adapter = self._delivery_adapter_for(source)
-            # An admitted /acp task must run as THIS turn: parked behind an orphan it would later drain
-            # as an ordinary turn without its admission.
-            if (_orphan_adapter is None or getattr(event, "internal", False) or event.get_command()
-                    or getattr(event, "_acp_admission", None) is not None):
-                return event, source, is_internal
-            _rescued = self._rescue_orphaned_overflow(_quick_key, _orphan_adapter)
-            if _rescued is None:
-                return event, source, is_internal
-            # Into the slot when the chain was a single orphan (post-turn drain picks it up),
-            # otherwise into overflow behind the already-staged next orphan.
-            self._enqueue_fifo(_quick_key, event, _orphan_adapter)
-            # Same session key by construction; carry the orphan's own source so reply anchors /
-            # thread metadata point at the message actually being answered.
-            _rescued_source = getattr(_rescued, "source", None)
-            source = _rescued_source if _rescued_source is not None else source
-            return _rescued, source, bool(getattr(_rescued, "internal", False))
-        except Exception:
-            logger.debug("FIFO orphan rescue pre-claim failed for %s", _quick_key, exc_info=True)
-            return event, source, is_internal
-
     async def _hm_authority_admission(
         self, event: MessageEvent, source: SessionSource, _quick_key: str, is_internal: bool,
     ) -> tuple[bool, Optional[str]]:
@@ -1374,8 +1338,13 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
-        interrupt → get/create session → build context → run agent → return response."""
+        interrupt → get/create session → build context → run agent → return response. A follow-up
+        a canonical peer turn handed the session to runs under that reservation (run_busy)."""
+        return await run_reserved_turn(self, event, GatewayInboundMixin._hm_handle_message)
+
+    async def _hm_handle_message(self, event: MessageEvent, _reservation: Optional[tuple]) -> Optional[str]:
         from gateway.run import _AGENT_PENDING_SENTINEL
+        _incoming = event  # admission may hand on a rewritten event; the reservation is this one's
         _admitted = await self._hm_admit_event(event)
         if _admitted is None:
             return None
@@ -1407,7 +1376,10 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if _reply is not None:
             return _reply
 
-        _owned, _authority_reply = await self._hm_authority_admission(event, source, _quick_key, is_internal)
+        # A reserved follow-up came out of the in-process FIFO and holds the slot itself: admitted to
+        # the authority's FIFO instead, that FIFO's drain would wait on this very reservation.
+        _owned, _authority_reply = (False, None) if _reservation is not None else (
+            await self._hm_authority_admission(event, source, _quick_key, is_internal))
         if _owned:
             return _authority_reply
 
@@ -1415,7 +1387,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         self._hm_evict_idle_stale_agent(_quick_key)
         if self._is_session_running(_quick_key):
             self._hm_evict_reaped_agent(_quick_key)
-        if self._is_session_running(_quick_key):
+        if not _acp_managed and _reservation is None and self._queues_behind_peer_turn(event, _quick_key):
+            return self._queue_behind_peer_turn(event, _quick_key)
+        if self._is_session_running(_quick_key) and _reservation is None:
             from gateway.acp_managed_ingress import BUSY
             return BUSY if _acp_managed else await self._hm_handle_running_session_message(event, source, _quick_key)
 
@@ -1428,6 +1402,12 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if _refused:
             return _refusal
 
+        if _reservation is None and not _acp_managed and self._queues_behind_peer_turn(event, _quick_key):
+            # A canonical peer turn was admitted during the awaits above: claiming now would overwrite
+            # its running slot and generation and fail its answer (canonical_turn_interrupted).
+            return self._queue_behind_peer_turn(event, _quick_key)
+        self._take_queued_event_for_claim(_incoming, _quick_key, _reservation)
+
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
         # passes the "already running" guard and spins up a duplicate agent for the same session.
@@ -1437,7 +1417,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             self._hm_acp_not_run(event)
             return _limit_message
 
-        event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
+        if _reservation is None:  # a reserved follow-up is the FIFO head itself
+            event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
 
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:
@@ -1474,7 +1455,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 await self._run_post_turn_hooks(
                     agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
                 )
-            except Exception as _goal_exc:
+            except Exception as _goal_exc:  # health: allow BLE001 -- unchanged from _handle_message, whose body this is now (renamed for the peer-turn reservation wrapper): a post-turn hook never fails the turn
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         finally:

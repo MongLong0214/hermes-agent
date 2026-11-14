@@ -3947,7 +3947,7 @@ class BasePlatformAdapter(ABC):
         """Tail of /stop, /new, /reset: release the command-scoped guard, then
         spawn a fresh processing task for any follow-up queued meanwhile."""
         await self._flush_text_debounce_now(session_key)
-        pending_event = self._pending_messages.pop(session_key, None)
+        pending_event = self._pending_for_drain(session_key)
         self._release_session_guard(session_key, guard=command_guard)
         if pending_event is not None:
             self._start_session_processing(pending_event, session_key)
@@ -4123,7 +4123,7 @@ class BasePlatformAdapter(ABC):
                 # own slot, so leave that one alone.
                 orphan = None
                 for owner in self._pending_recovery_owners(event, session_key):
-                    orphan = owner.get_pending_message(session_key)
+                    orphan = owner._pending_for_drain(session_key)  # None: held queued by the runner
                     if orphan is not None:
                         owner._start_session_processing(orphan, session_key)
                         break
@@ -4520,9 +4520,9 @@ class BasePlatformAdapter(ABC):
     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not
         drop: re-queue it if another task already owns the session (drain handoff), else spawn the
-        drain task and leave it the guard. Nothing pending: release the guard only if we still own
-        it."""
-        late_pending = self._pending_messages.pop(session_key, None)
+        drain task and leave it the guard. Nothing pending (or a follow-up the runner holds queued,
+        ``_keep_pending``): release the guard only if we still own it."""
+        late_pending = self._pending_for_drain(session_key)
         current_task = asyncio.current_task()
         if late_pending is not None:
             existing_task = self._session_tasks.get(session_key)
@@ -4631,11 +4631,11 @@ class BasePlatformAdapter(ABC):
             # Force-flush an unfired debounce timer so this task hands off to a fresh drain task.
             # Clear the Event BEFORE the stop-typing await so concurrent inbound sees a live guard.
             await self._flush_text_debounce_now(session_key)
-            if session_key in self._pending_messages:
+            if session_key in self._pending_messages and not self._keep_pending(session_key):
                 pending_event = self._pending_messages[session_key]
                 delay = self._requeue_backoff_delay(session_key, pending_event, event)
                 if not delay:  # a backed-off event stays queued until the drain task wakes
-                    self._pending_messages.pop(session_key)
+                    self._pop_pending_for_drain(session_key)
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 self._clear_session_guard(session_key)
                 await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_typing_metadata)
@@ -4701,6 +4701,29 @@ class BasePlatformAdapter(ABC):
             "backing off %.2fs", self.name, session_key, delay)
         return delay
 
+    def _keep_pending(self, session_key: str) -> bool:
+        """True when a queued follow-up must stay in ``_pending_messages`` instead of being handed to
+        a drain task: the runner holds it for a canonical peer turn, which hands the queue on itself
+        when it releases the session, or keeps it for the shutdown flush (``_defers_pending_drain``)."""
+        defers = getattr(self.gateway_runner, "_defers_pending_drain", None)
+        return session_key in self._pending_messages and callable(defers) and defers(session_key) is True
+
+    def _pending_for_drain(self, session_key: str) -> Optional[MessageEvent]:
+        """The queued head a drain site hands to a task, or None (nothing queued, or held queued)."""
+        return None if self._keep_pending(session_key) else self._pop_pending_for_drain(session_key)
+
+    def _pop_pending_for_drain(self, session_key: str) -> Optional[MessageEvent]:
+        """Take the queued head for a drain task. A head the runner reserved the session for (a
+        follow-up a canonical peer turn handed the session to) is dispatched but stays queued until
+        its own turn claims the session (``_take_queued_event_for_claim`` on the runner): a
+        cancellation at any await before that claim (a restart during ``on_processing_start``,
+        admission or preparation) leaves it for the shutdown flush."""
+        head = self._pending_messages.get(session_key)
+        reservation_of = getattr(self.gateway_runner, "_turn_reservation_of", None)
+        if head is not None and callable(reservation_of) and isinstance(reservation_of(head), tuple):
+            return head
+        return self._pending_messages.pop(session_key, None)
+
     def _spawn_drain_task(self, pending_event: MessageEvent, session_key: str,
                           delay: float = 0.0) -> None:
         """Hand the session to a fresh task for a queued follow-up — never recurse (chained
@@ -4722,8 +4745,8 @@ class BasePlatformAdapter(ABC):
         if delay > 0:
             await asyncio.sleep(delay)
             await self._flush_text_debounce_now(session_key)  # as every other task exit does
-            pending_event = self._pending_messages.pop(session_key, None)
-            if pending_event is None:  # consumed elsewhere during the back-off
+            pending_event = self._pending_for_drain(session_key)
+            if pending_event is None:  # consumed elsewhere during the back-off, or held queued
                 self._cleanup_finished_session_task(session_key, guard)
                 return
         await self._process_message_background(pending_event, session_key)

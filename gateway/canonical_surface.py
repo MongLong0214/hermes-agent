@@ -95,6 +95,17 @@ def cached_actor(runner: Any, session_key: str) -> tuple[Any, Any]:
     return cached, getattr(cached, "session_id", None)
 
 
+def _session_taken(runner: Any, session_key: str) -> bool:
+    """A turn holds ``session_key``'s running slot (or a queued follow-up's reservation of it), or an
+    owner input committed to the session authority's durable FIFO goes next
+    (``_durable_input_holds_session``): a peer event is refused ``canonical_turn_busy``, never run
+    ahead of that input, whose own claim would then overwrite the peer turn."""
+    if runner._is_session_running(session_key):
+        return True
+    queued = getattr(runner, "_durable_input_holds_session", None)
+    return callable(queued) and queued(session_key) is True
+
+
 def bound_actor_db(
     runner: Any, session_key: str, session_id: str, db_path: Path | None,
     db_identity: tuple[int, int] | None,
@@ -1037,7 +1048,7 @@ class CanonicalReceiptCoordinator:
             # A cached agent is borrowed as always.
             if cached_actor(self._runner, proof.session_key)[0] is not None:
                 actor, db = self._borrow_actor_db(self._runner, proof)
-            if self._runner._is_session_running(proof.session_key):
+            if _session_taken(self._runner, proof.session_key):
                 raise ValueError("canonical_turn_busy")
             if actor is not None and _runs_tools_outside_hermes(actor):
                 raise ValueError("canonical_runtime_refused")
@@ -1072,7 +1083,7 @@ class CanonicalReceiptCoordinator:
                 self._require_current_claim_target(proof, actor, db)
                 if event.expected_identity is not None:
                     self._require_expected_identity(proof, event.expected_identity)
-                if self._runner._is_session_running(proof.session_key):
+                if _session_taken(self._runner, proof.session_key):
                     raise ValueError("canonical_turn_busy")
                 # An open user row would be merged with this peer turn by the agent's alternation
                 # repair, erasing the boundary between the two principals. Checked under the lease.
