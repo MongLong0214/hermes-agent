@@ -292,3 +292,55 @@ async def test_long_look_alike_ids_never_share_a_label(plain_keyboards):
     ids = [f"{x}{v}{x}-{t}" for t in ("one", "two") for v in (1, 2)]
     labels = await _model_labels_for({"slug": "custom", "name": "C", "models": ids, "total_models": 4})
     assert len(set(labels)) == len(ids), labels
+
+
+def _picker_state(on_model_selected):
+    return {
+        "providers": [{"slug": "provider_one", "name": "Provider One", "total_models": 1, "is_current": True,
+                       "models": ["model_1", "model_2"]}],
+        "current_model": "model_1", "current_provider": "provider_one", "session_key": "s",
+        "on_model_selected": on_model_selected, "msg_id": 42,
+        "selected_provider": "provider_one", "model_list": ["model_1", "model_2"],
+    }
+
+
+def _group_tap(data: str, user_id: int):
+    query = SimpleNamespace(
+        data=data,
+        message=SimpleNamespace(chat_id=-1001234, chat=SimpleNamespace(type="supergroup"), message_thread_id=None),
+        from_user=SimpleNamespace(id=user_id, first_name="Member"),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    return SimpleNamespace(callback_query=query), query
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", ["mm:1", "mc:1", "mp:provider_one", "mx"])
+async def test_unauthorized_group_member_cannot_drive_model_picker(monkeypatch, data):
+    """A group member outside the allowlist who can see the picker must not switch the model or touch
+    picker state, whichever picker button they tap."""
+    for key in ("GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS", "TELEGRAM_ALLOW_ALL_USERS",
+                "TELEGRAM_GROUP_ALLOWED_USERS", "TELEGRAM_GROUP_ALLOWED_CHATS"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    import hermes_cli.model_selection_guards as guards
+    monkeypatch.setattr(guards, "combined_selection_warning", lambda *a, **k: None)
+    adapter = _gateway_wired_adapter()
+    on_model_selected = AsyncMock(return_value="switched")
+    adapter._model_picker_state["-1001234"] = state = _picker_state(on_model_selected)
+    snapshot = dict(state)
+
+    update, query = _group_tap(data, user_id=999)
+    await adapter._handle_callback_query(update, MagicMock())
+
+    on_model_selected.assert_not_awaited()
+    assert adapter._model_picker_state.get("-1001234") is state and state == snapshot
+    query.edit_message_text.assert_not_awaited()
+    query.answer.assert_awaited_once()
+
+    # The allowlisted operator's tap on the same picker still switches.
+    if data in ("mm:1", "mc:1"):
+        update, query = _group_tap(data, user_id=111)
+        await adapter._handle_callback_query(update, MagicMock())
+        on_model_selected.assert_awaited_once_with("-1001234", "model_2", "provider_one")

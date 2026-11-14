@@ -40,9 +40,37 @@ def _redact_telegram_error_text(error: object, proxy_url: str | None = None) -> 
         return f"<{type(error).__name__}>" if error is not None else text
     try:
         from agent.redact import redact_sensitive_text
-        return redact_sensitive_text(text, force=True)
+        # redact_url_credentials: httpx/PTB errors can echo a proxy URL's userinfo or a generic
+        # ``?access_token=`` query param, which the default pattern pass leaves (partly) visible.
+        return redact_sensitive_text(text, force=True, redact_url_credentials=True)
     except Exception:
         return "<telegram error redacted>"
+
+
+class _RedactTelegramLogRecord(logging.Filter):
+    """Force-redact every record this module emits, traceback included. Redacting only the message
+    is not enough: ``exc_info=True`` makes logging append the raw exception text, and a Bot API
+    URL in it carries the token; some sites also pass the raw exception as a message argument.
+    ``exc_info`` stays on the record (a traceback-bearing record is still recognisable as one):
+    ``Formatter.format`` renders the cached ``exc_text`` set here instead of re-formatting it."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+            if message:
+                record.msg, record.args = _redact_telegram_error_text(message), None
+            if record.exc_info:
+                record.exc_text = _redact_telegram_error_text(logging.Formatter().formatException(record.exc_info))
+        # health: allow BLE001 -- a filter that raises breaks the caller's log call and one that logs recurses; fail closed
+        except Exception:
+            # Unformattable (args that do not match the message) or unrenderable traceback: keep the record,
+            # drop the text redaction could not vouch for (logging's own error dump would print the raw args).
+            record.msg, record.args = "<telegram log record redacted>", None
+            record.exc_info = record.exc_text = None
+        return True
+
+
+logger.addFilter(_RedactTelegramLogRecord())
 
 
 def _consume_abandoned_task(task: asyncio.Task) -> None:
@@ -103,6 +131,11 @@ async def _shutdown_abandoned_app(app) -> None:
         await app.shutdown()
     except Exception:
         logger.debug("Abandoned Telegram app.shutdown() failed", exc_info=True)
+    await _close_app_requests(app)
+
+
+async def _close_app_requests(app) -> None:
+    """Close the bot's request transports directly; a no-op for ones ``app.shutdown()`` already closed."""
     bot = getattr(app, "bot", None)
     for request in (getattr(bot, "_request", None) if bot is not None else None) or ():
         shutdown = getattr(request, "shutdown", None)
@@ -199,6 +232,7 @@ from plugins.platforms.telegram.telegram_network import (
     proxy_target_hosts)
 from plugins.platforms.telegram.telegram_outbound import is_visually_empty, resolve_notifications_mode
 from plugins.platforms.telegram.telegram_send_path_recovery import TelegramSendPathRecoveryMixin, mark_send_path_recovered
+from plugins.platforms.telegram.telegram_recovery import await_abandoned_initialize_owners, retain_abandoned_initialize
 from plugins.platforms.telegram.telegram_send_errors import LOST, is_entity_parse_error, maybe_delivered_result as _maybe_delivered_result, send_error_kind
 from plugins.platforms.telegram.telegram_typing_gate import typing_may_fire
 from plugins.platforms.telegram.telegram_group_observe import apply_group_observe_attribution, shared_sender_suffix
@@ -2848,9 +2882,15 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 logger.warning("[%s] Connecting to Telegram (attempt %d/%d)…", self.name, _attempt + 1, _max_connect)
                 # On timeout the (possibly shielded) initialize() task is abandoned; release the half-built
                 # app's httpx client so it isn't leaked across the ladder.
-                await _await_with_thread_deadline(
-                    self._app.initialize(), timeout=_init_timeout, on_abandon=lambda app=self._app: _shutdown_abandoned_app(app),
-                    label="telegram-init")
+                init_task = asyncio.ensure_future(self._app.initialize())
+                try:
+                    await _await_with_thread_deadline(
+                        init_task, timeout=_init_timeout, on_abandon=lambda app=self._app: _shutdown_abandoned_app(app),
+                        label="telegram-init")
+                except asyncio.CancelledError:
+                    # Our caller was cancelled: the deadline helper abandons the child with no cleanup.
+                    retain_abandoned_initialize(self, init_task, self._app)
+                    raise
                 break
             except TimeoutError:
                 rebuild_app = True
@@ -3217,6 +3257,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         with contextlib.suppress(Exception):
             await self._await_disconnect_step(self._set_status_indicator(online=False), _DISCONNECT_STEP_TIMEOUT, "status-indicator update")
         await self._await_disconnect_step(self._cancel_pending_delivery_tasks(), _DISCONNECT_STEP_TIMEOUT, "pending-delivery cancel")
+        await await_abandoned_initialize_owners(self, _DISCONNECT_STEP_TIMEOUT)
         if self._app:
             try:
                 # Bounded: a CLOSE-WAIT socket can wedge updater.stop() forever; fall through on timeout.
@@ -3231,6 +3272,9 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 if self._app.running:
                     await self._await_disconnect_step(self._app.stop(), _DISCONNECT_STEP_TIMEOUT, "app.stop()")
                 await self._await_disconnect_step(self._app.shutdown(), _DISCONNECT_STEP_TIMEOUT, "app.shutdown()")
+                # app.shutdown() no-ops for an app whose initialize() never finished (the last attempt of
+                # an exhausted retry ladder) and leaves its httpx pools open.
+                await self._await_disconnect_step(_close_app_requests(self._app), _DISCONNECT_STEP_TIMEOUT, "request shutdown")
             except Exception as e:
                 logger.warning("[%s] Error during Telegram disconnect: %s", self.name, _redact_telegram_error_text(e))
         self._app = None
@@ -6088,6 +6132,14 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             if event is not None:
                 self._hold_inbound_event(event, where=f"{where}-flush-cancelled")
             raise
+        except Exception:
+            # The pop already took the only copy (PTB acked the update): hold it like a cancel. A failure
+            # in the redispatch re-holds without rescheduling, so a poison event cannot tight-loop. Once the
+            # gateway accepted the event it owns it; holding a second copy would deliver it twice.
+            if event is None or getattr(event, "_gateway_accepted", False):
+                raise
+            logger.exception("[Telegram] %s flush dispatch failed; holding the event for redispatch", where)
+            self._hold_inbound_event(event, where=f"{where}-flush-failed")
         finally:
             if committed.get((where, key)) is current_task:
                 committed.pop((where, key), None)

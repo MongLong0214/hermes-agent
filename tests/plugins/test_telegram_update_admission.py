@@ -1144,3 +1144,92 @@ async def test_root_message_after_threaded_follow_up_stays_root_while_creation_w
         assert await flushed(3)
         assert delivered[-1].text == "back at the root"
         assert delivered[-1].source.thread_id is None
+
+
+async def _settle_flushes(adapter):
+    await asyncio.gather(*adapter._pending_text_batch_tasks.values(), *adapter._pending_photo_batch_tasks.values(),
+                         *getattr(adapter, "_committed_flush_tasks", {}).values(), return_exceptions=True)
+
+
+def _offline_photo_download(monkeypatch, tmp_path):
+    monkeypatch.setattr(PhotoSize, "get_file", AsyncMock(return_value=SimpleNamespace(
+        file_path="offline.png", download_as_bytearray=AsyncMock(return_value=bytearray(b"offline")))))
+    monkeypatch.setattr("plugins.platforms.telegram.adapter.cache_image_from_bytes_async",
+                        AsyncMock(return_value=str(tmp_path / "photo.png")))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["text", "photo"])
+async def test_buffered_event_survives_a_one_time_dispatch_failure(monkeypatch, tmp_path, kind):
+    """The batch flush pops the buffered event before dispatching it; PTB has already acknowledged the
+    update, so a dispatch that raises once must not lose it: it is held, redispatched, admitted once."""
+    _offline_photo_download(monkeypatch, tmp_path)
+    async with connected(monkeypatch) as (adapter, app, delivered):
+        adapter._media_batch_delay_seconds = 0.01
+        record = adapter._start_session_processing
+        failures = []
+
+        def fail_once(event, session_key):
+            if not failures:
+                failures.append(event)
+                raise RuntimeError("session store briefly unavailable")
+            return record(event, session_key)
+
+        monkeypatch.setattr(adapter, "_start_session_processing", fail_once)
+        await app.process_update(update(app.bot, kind=kind))
+        await _settle_flushes(adapter)
+        assert len(failures) == 1
+        redispatch = getattr(adapter, "_held_inbound_redispatch_task", None)
+        assert redispatch is not None, "the popped event was dropped instead of held"
+        await redispatch
+        assert len(delivered) == 1 and delivered[0] is failures[0]
+        assert not adapter._held_inbound_events
+
+
+@pytest.mark.asyncio
+async def test_poison_buffered_event_is_re_held_without_a_tight_loop(monkeypatch):
+    """A dispatch that always raises: the flush holds the event and schedules ONE redispatch; that
+    redispatch re-holds it without rescheduling, so the event waits for the next reconnect/live hold."""
+    async with connected(monkeypatch) as (adapter, app, delivered):
+        attempts = []
+
+        def always_fail(event, session_key):
+            attempts.append(event)
+            raise RuntimeError("poison")
+
+        monkeypatch.setattr(adapter, "_start_session_processing", always_fail)
+        await app.process_update(update(app.bot, kind="text"))
+        await _settle_flushes(adapter)
+        redispatch = getattr(adapter, "_held_inbound_redispatch_task", None)
+        assert redispatch is not None, "the popped event was dropped instead of held"
+        await redispatch
+        for _ in range(20):  # a tight loop would keep rescheduling here
+            await asyncio.sleep(0)
+        assert len(attempts) == 2 and attempts[0] is attempts[1]
+        assert adapter._held_inbound_events == [attempts[0]]
+        assert adapter._held_inbound_redispatch_task is redispatch and redispatch.done()
+        assert delivered == []
+
+
+@pytest.mark.asyncio
+async def test_failure_after_gateway_acceptance_re_raises_and_is_not_held(monkeypatch):
+    """Once the gateway accepted the event it owns it: a later failure in the flush must re-raise, not
+    hold a second copy that a redispatch would deliver again."""
+    async with connected(monkeypatch) as (adapter, app, delivered):
+        real_handle = adapter.handle_message
+
+        async def accept_then_fail(event):
+            await real_handle(event)
+            assert event._gateway_accepted is True
+            raise RuntimeError("post-acceptance bookkeeping failed")
+
+        monkeypatch.setattr(adapter, "handle_message", accept_then_fail)
+        await app.process_update(update(app.bot, kind="text"))
+        flushes = [*adapter._pending_text_batch_tasks.values(), *getattr(adapter, "_committed_flush_tasks", {}).values()]
+        results = await asyncio.gather(*flushes, return_exceptions=True)
+        assert [type(r) for r in results] == [RuntimeError]
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert len(delivered) == 1
+        assert not getattr(adapter, "_held_inbound_events", None)
+        assert getattr(adapter, "_held_inbound_redispatch_task", None) is None

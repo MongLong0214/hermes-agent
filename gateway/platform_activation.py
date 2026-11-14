@@ -10,9 +10,10 @@ configuring that platform, so they materialize only names with *activation evide
 * a config block for it (top-level ``<name>:``, ``platforms.<name>``, ``gateway.platforms.<name>``,
   ``gateway.<name>``, or a legacy ``gateway.json`` row) — including a sibling block such as
   ``wecom_callback`` (registered by the ``wecom`` plugin);
-* an env var (process env, the profile ``.env``, or the active secret scope) under the platform's
-  prefix (``TELEGRAM_*``, ``GOOGLE_CHAT_*``) or named in its manifest ``requires_env``
-  (``TWILIO_*`` for sms);
+* an env var in this profile's own secret scope (its ``.env``, external secret sources and the
+  managed ``.env``; the active secret scope when it was bound for this profile; the process env only
+  when this is the process's own profile) under the platform's prefix (``TELEGRAM_*``,
+  ``GOOGLE_CHAT_*``) or named in its manifest ``requires_env`` (``TWILIO_*`` for sms);
 * a credential-pool record for it in the profile ``auth.json`` (Photon stores project creds there).
 
 The rule over-approximates on purpose: a false positive costs one import, a false negative would
@@ -44,11 +45,18 @@ def _yaml_block_names(yaml_cfg: Any) -> set[str]:
 
 
 def _env_names(home: Optional[Path]) -> set[str]:
-    names = {k for k, v in os.environ.items() if str(v).strip()}
+    """Env names in *home*'s own secret scope. ``os.environ`` is that profile's env only when *home* is
+    the process's own profile: a multiplexing or profile-routing process holds the LAUNCH profile's
+    ``.env`` there, which is no evidence for another profile. A bound scope counts only when it was
+    bound for *home* (its stamped home, else the home active where it is bound)."""
+    from agent.secret_scope import _is_process_home
+    from hermes_constants import get_hermes_home, get_routing_process_hermes_home, hermes_home_key
+    own = home if home is not None else get_routing_process_hermes_home()
+    names = {k for k, v in os.environ.items() if str(v).strip()} if _is_process_home(own) else set()
     try:
-        from agent.secret_scope import current_secret_scope, load_env_file
+        from agent.secret_scope import current_secret_scope, current_secret_scope_home, load_env_file
         scope = current_secret_scope()
-        if scope is not None:
+        if scope is not None and hermes_home_key(current_secret_scope_home() or get_hermes_home()) == hermes_home_key(own):
             names.update(k for k, v in scope.items() if str(v).strip())
         if home is not None:
             names.update(k for k, v in load_env_file(home / ".env").items() if str(v).strip())
