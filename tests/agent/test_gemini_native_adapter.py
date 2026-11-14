@@ -19,15 +19,6 @@ class DummyResponse:
         return self._payload
 
 
-
-
-
-
-
-
-
-
-
 def test_followup_user_turn_is_not_merged_into_function_response_turn():
     """Human follow-up after tool results must stay its own user content.
 
@@ -241,8 +232,6 @@ def test_ref_value_without_pointer_prefix_remains_structured():
     assert out["functionResponse"]["response"] == payload
 
 
-
-
 def test_translate_native_response_surfaces_reasoning_and_tool_calls():
     from agent.gemini_native_adapter import translate_gemini_response
 
@@ -273,57 +262,6 @@ def test_translate_native_response_surfaces_reasoning_and_tool_calls():
     assert json.loads(choice.message.tool_calls[0].function.arguments) == {"q": "hermes"}
 
 
-def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monkeypatch):
-    from agent.gemini_native_adapter import GeminiNativeClient
-
-    recorded = {}
-
-    class DummyHTTP:
-        def post(self, url, json=None, headers=None, timeout=None):
-            recorded["url"] = url
-            recorded["json"] = json
-            recorded["headers"] = headers
-            return DummyResponse(
-                payload={
-                    "candidates": [
-                        {
-                            "content": {"parts": [{"text": "hello"}]},
-                            "finishReason": "STOP",
-                        }
-                    ],
-                    "usageMetadata": {
-                        "promptTokenCount": 1,
-                        "candidatesTokenCount": 1,
-                        "totalTokenCount": 2,
-                    },
-                }
-            )
-
-        def close(self):
-            return None
-
-    monkeypatch.setattr("agent.gemini_native_adapter.httpx.Client", lambda *a, **k: DummyHTTP())
-
-    client = GeminiNativeClient(api_key="AIza-test", base_url="https://generativelanguage.googleapis.com/v1beta")
-    response = client.chat.completions.create(
-        model="gemini-2.5-flash",
-        messages=[{"role": "user", "content": "Hello"}],
-    )
-
-    assert recorded["url"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-    assert recorded["headers"]["x-goog-api-key"] == "AIza-test"
-    assert "Authorization" not in recorded["headers"]
-    assert response.choices[0].message.content == "hello"
-
-
-
-
-
-
-
-
-
-
 @pytest.mark.parametrize(
     ("configured", "expected"),
     [
@@ -341,20 +279,6 @@ def test_normalize_gemini_base_url_guarantees_version_segment(configured, expect
     from agent.gemini_native_adapter import normalize_gemini_base_url
 
     assert normalize_gemini_base_url(configured) == expected
-
-
-
-
-def test_native_client_rejects_empty_api_key_with_actionable_message():
-    """Empty/whitespace api_key must raise at construction, not produce a cryptic
-    Google GFE 'Error 400 (Bad Request)!!1' HTML page on the first request."""
-    from agent.gemini_native_adapter import GeminiNativeClient
-
-    for bad in ("", "   ", None):
-        with pytest.raises(RuntimeError) as excinfo:
-            GeminiNativeClient(api_key=bad)  # type: ignore[arg-type]
-        msg = str(excinfo.value)
-        assert "GOOGLE_API_KEY" in msg and "GEMINI_API_KEY" in msg
 
 
 @pytest.mark.asyncio
@@ -503,25 +427,9 @@ def test_build_gemini_request_does_not_raise_when_thinking_is_disabled():
     assert request["generationConfig"]["thinkingConfig"]["includeThoughts"] is False
 
 
-
-
-
-
-
-
-
-
 # ---------------------------------------------------------------------------
 # X-Goog-Api-Client header tests
 # ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
 
 
 class TestGemini3ToolCallIds:
@@ -775,41 +683,6 @@ def test_iter_sse_events_stops_at_done_and_ignores_trailing_frames():
     assert list(_iter_sse_events(resp)) == [{"candidates": [1]}]
 
 
-@pytest.mark.parametrize(
-    "api_key, configured, expected_prefix",
-    [
-        # AQ. keys exist for BOTH AI Studio and Vertex express mode (#115306): the prefix never
-        # reroutes, so an AI-Studio AQ. key keeps working on the default Studio host.
-        ("AQ.studio-key", None, "https://generativelanguage.googleapis.com/v1beta/models/"),
-        # Control: legacy AIza Studio key keeps the Studio host too.
-        ("AIza-test", None, "https://generativelanguage.googleapis.com/v1beta/models/"),
-        # An explicit aiplatform base (host root or versioned) is completed to the publishers form —
-        # the express key's only route to aiplatform now that the prefix no longer reroutes.
-        ("AQ.express-key", "https://aiplatform.googleapis.com", "https://aiplatform.googleapis.com/v1beta1/publishers/google/models/"),
-        ("AIza-test", "https://aiplatform.googleapis.com/v1beta1", "https://aiplatform.googleapis.com/v1beta1/publishers/google/models/"),
-        # An explicit proxy is never overridden by the key shape.
-        ("AQ.studio-key", "http://localhost:4000/gemini", "http://localhost:4000/gemini/v1beta/models/"),
-    ],
-)
-def test_native_client_never_reroutes_aq_keys_off_the_configured_surface(api_key, configured, expected_prefix):
-    """Google issues ``AQ.`` keys for both AI Studio and Vertex express mode, so the key prefix must
-    not decide the surface (#115306): the default (or explicitly configured) base is used verbatim,
-    and an explicit aiplatform base is completed to ``…/publishers/google/models/…``."""
-    from agent.gemini_native_adapter import GeminiNativeClient
-
-    seen = []
-
-    class _HTTP:
-        def post(self, url, **_):
-            seen.append(url)
-            return SimpleNamespace(status_code=200, json=lambda: {"candidates": [
-                {"content": {"role": "model", "parts": [{"text": "ok"}]}, "finishReason": "STOP"}]})
-
-    client = GeminiNativeClient(api_key=api_key, base_url=configured, http_client=_HTTP())
-    client.chat.completions.create(model="gemini-3.7-flash", messages=[{"role": "user", "content": "hi"}])
-    assert seen == [f"{expected_prefix}gemini-3.7-flash:generateContent"]
-
-
 def test_native_gemini_detection_covers_express_but_not_vertex_oauth_openapi():
     """The express base is native Gemini; the OAuth Vertex provider's OpenAI-compatible
     ``…/endpoints/openapi`` base must NOT be captured by the native adapter."""
@@ -918,125 +791,35 @@ def test_build_gemini_request_tools_plus_json_output_only_on_gemini3(model, keep
     assert ("responseMimeType" in generation) is keeps_json
 
 
-def test_long_decode_continues_across_hops_and_reports_first_hop_prompt(monkeypatch):
-    """A CONTINUATION hop resends the SAME request plus the token (never the partial output); the hops
-    join into one turn whose usage is summed for billing, with hop 1's prompt kept as the context size."""
-    from agent.gemini_native_adapter import GeminiNativeClient
-
-    def hop(text, finish, token, prompt, out):
-        cand = {"content": {"role": "model", "parts": [{"text": text}]}, "finishReason": finish}
-        return {"candidates": [{**cand, **({"continuationToken": token} if token else {})}],
-                "usageMetadata": {"promptTokenCount": prompt, "candidatesTokenCount": out, "totalTokenCount": prompt + out}}
-
-    hops = [hop("part one ", "CONTINUATION", "tok-1", 100, 32768), hop("part two", "STOP", None, 32868, 500)]
-    sent = []
-
-    class _Stream:
-        def __init__(self, payload):
-            self.status_code, self._payload = 200, payload
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def iter_text(self):
-            # A mid-stream checkpoint (token, no finish) precedes the hop's final event.
-            checkpoint = {"candidates": [{"content": {"parts": [{"text": ""}]}, "continuationToken": "ckpt"}]}
-            yield f"data: {json.dumps(checkpoint)}\n\ndata: {json.dumps(self._payload)}\n\n"
-
-    class DummyHTTP:
-        def post(self, url, json=None, headers=None, timeout=None):
-            sent.append(json)
-            return DummyResponse(payload=hops[len(sent) - 1])
-
-        def stream(self, method, url, json=None, headers=None, timeout=None):
-            sent.append(json)
-            return _Stream(hops[len(sent) - 1])
-
-        def close(self):
-            return None
-
-    monkeypatch.setattr("agent.gemini_native_adapter.httpx.Client", lambda *a, **k: DummyHTTP())
-    client = GeminiNativeClient(api_key="AQ.test", base_url="https://generativelanguage.googleapis.com/v1beta")
-    kwargs = {"model": "gemini-4-argon", "messages": [{"role": "user", "content": "prove it"}], "max_tokens": 262_144}
-
-    response = client.chat.completions.create(**kwargs)
-    assert sent[1] == {**sent[0], "continuationToken": "tok-1"}
-    assert sent[0]["generationConfig"]["maxOutputTokens"] == 262_144  # not clamped to the per-request cap
-    assert response.choices[0].message.content == "part one part two"
-    assert response.choices[0].finish_reason == "stop"
-    usage = response.usage
-    assert (usage.prompt_tokens, usage.completion_tokens, usage.initial_prompt_tokens) == (32968, 33268, 100)
-
-    sent.clear()
-    chunks = list(client.chat.completions.create(**kwargs, stream=True))
-    assert sent[1] == {**sent[0], "continuationToken": "tok-1"}  # the hop's final token, not the checkpoint
-    finishes = [c for c in chunks if c.choices[0].finish_reason]
-    assert [c.choices[0].finish_reason for c in finishes] == ["stop"]  # CONTINUATION is not the end
-    assert "".join(c.choices[0].delta.content or "" for c in chunks) == "part one part two"
-    assert (finishes[0].usage.prompt_tokens, finishes[0].usage.initial_prompt_tokens) == (32968, 100)
+# ── Google outbound denial: the native client and the tier probe never send ─────────────────
 
 
-def _blocking_client(monkeypatch, payload):
-    """Real GeminiNativeClient over a transport that answers HTTP 200 with ``payload`` (unary and SSE)."""
-    from agent.gemini_native_adapter import GeminiNativeClient
+class _Tripwire:
+    def __init__(self, name, touched):
+        self._name, self._touched = name, touched
 
-    class _Stream:
-        status_code, headers = 200, {}
+    def __call__(self, *_args, **_kwargs):
+        self._touched.append(self._name)
+        raise AssertionError(f"{self._name} was reached before the refusal")
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def iter_text(self):
-            yield f"data: {json.dumps(payload)}\n\n"
-
-    class DummyHTTP:
-        def post(self, url, json=None, headers=None, timeout=None):
-            return DummyResponse(payload=payload)
-
-        def stream(self, method, url, json=None, headers=None, timeout=None):
-            return _Stream()
-
-        def close(self):
-            return None
-
-    monkeypatch.setattr("agent.gemini_native_adapter.httpx.Client", lambda *a, **k: DummyHTTP())
-    return GeminiNativeClient(api_key="AQ.test", base_url="https://generativelanguage.googleapis.com/v1beta")
+    def __getattr__(self, attr):
+        self._touched.append(f"{self._name}.{attr}")
+        raise AssertionError(f"{self._name}.{attr} was read before the refusal")
 
 
-@pytest.mark.parametrize("stream", [False, True])
-def test_prompt_block_reason_is_terminal_content_policy_error(monkeypatch, stream):
-    # Google answers a blocked prompt with HTTP 200, promptFeedback.blockReason and no candidates.
-    from agent.error_classifier import FailoverReason, classify_api_error
-    from agent.gemini_native_adapter import GeminiAPIError
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda m: m.GeminiNativeClient(api_key="k", base_url="https://generativelanguage.googleapis.com/v1beta"),
+                 id="native-client"),
+    pytest.param(lambda m: m.GeminiNativeClient(api_key="", base_url="https://relay.example.test/v1"),
+                 id="native-client-any-endpoint"),
+    pytest.param(lambda m: m.probe_gemini_tier("k"), id="tier-probe"),
+])
+def test_the_native_gemini_adapter_refuses_before_any_http(monkeypatch, call):
+    import agent.gemini_native_adapter as adapter
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
 
-    payload = {"promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}, "usageMetadata": {"promptTokenCount": 7}}
-    client = _blocking_client(monkeypatch, payload)
-    kwargs = {"model": "gemini-2.5-flash", "messages": [{"role": "user", "content": "hi"}], "stream": stream}
-    with pytest.raises(GeminiAPIError) as excinfo:
-        result = client.chat.completions.create(**kwargs)
-        list(result) if stream else None
-    assert "blockReason=PROHIBITED_CONTENT" in str(excinfo.value)
-    verdict = classify_api_error(excinfo.value, provider="gemini", model="gemini-2.5-flash")
-    assert (verdict.reason, verdict.retryable, verdict.should_fallback) == (FailoverReason.content_policy_blocked, False, True)
-
-
-def test_prompt_block_surfaces_vertex_block_reason_message(monkeypatch):
-    # Vertex explains the block in promptFeedback.blockReasonMessage; the user sees that, not canned text.
-    from agent.gemini_native_adapter import GeminiAPIError
-
-    payload = {"promptFeedback": {"blockReason": "MODEL_ARMOR", "blockReasonMessage": "Blocked by Model Armor policy X."}}
-    client = _blocking_client(monkeypatch, payload)
-    with pytest.raises(GeminiAPIError, match=r"blockReason=MODEL_ARMOR\): Blocked by Model Armor policy X\."):
-        client.chat.completions.create(model="gemini-2.5-flash", messages=[{"role": "user", "content": "hi"}])
-
-
-def test_prompt_feedback_without_block_reason_keeps_empty_turn(monkeypatch):
-    client = _blocking_client(monkeypatch, {"promptFeedback": {"safetyRatings": []}})
-    out = client.chat.completions.create(model="gemini-2.5-flash", messages=[{"role": "user", "content": "hi"}])
-    assert out.choices[0].finish_reason == "stop"
+    touched = []
+    monkeypatch.setattr(adapter, "httpx", _Tripwire("httpx", touched))
+    with pytest.raises(GeminiOutboundDenied):
+        call(adapter)
+    assert touched == []

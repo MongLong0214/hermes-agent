@@ -3441,10 +3441,10 @@ class TestDenormalizeProviderSwitch:
         })
 
         with _patch("hermes_cli.models_detect.provider_has_credentials", lambda p: p == "openrouter"):
-            result = _denormalize_config_from_web({"model": "google/gemini-2.5-flash"})
+            result = _denormalize_config_from_web({"model": "anthropic/claude-opus-4.6"})
         model = result["model"]
         assert model["provider"] == "openrouter"
-        assert model["default"] == "google/gemini-2.5-flash"
+        assert model["default"] == "anthropic/claude-opus-4.6"
         # The old ollama-local endpoint must not carry over to openrouter (the switch resolves
         # the aggregator's own endpoint instead of leaving the field blank or stale).
         assert model.get("base_url") != "http://localhost:11434/v1"
@@ -3461,7 +3461,7 @@ class TestDenormalizeProviderSwitch:
 
         with _patch("hermes_cli.models_detect.provider_has_credentials", lambda p: p == "openrouter"):
             result = _denormalize_config_from_web({
-                "model": "google/gemini-2.5-flash",
+                "model": "anthropic/claude-opus-4.6",
                 "model_context_length": 128000,
             })
         model = result["model"]
@@ -3498,6 +3498,70 @@ class TestDenormalizeProviderSwitch:
         resp = client.put("/api/config", json={"config": {"model": "openai/gpt-5.5-zzz"}})
 
         assert resp.status_code == 400 and "models.dev offline" in resp.json()["detail"]
+        assert cfg_path.read_bytes() == before
+
+
+class TestGoogleOutboundModelSwitch:
+    """``/model`` and the dashboard main-slot pick refuse a Google-bound target before credentials."""
+
+    def test_a_gemini_provider_switch_is_refused_before_credentials(self, monkeypatch):
+        from hermes_cli import model_switch
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        touched = []
+        monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider",
+                            lambda **_kw: touched.append("resolve_runtime_provider"))
+        result = model_switch.switch_model("gemini-2.5-flash", "custom", "ordinary-model", explicit_provider="gemini")
+
+        assert result.success is False and result.error_message == GeminiOutboundDenied.public_message
+        assert touched == []
+
+    def test_a_user_provider_block_on_a_google_host_is_refused_before_its_key(self, monkeypatch):
+        from hermes_cli import model_switch
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        touched = []
+        monkeypatch.setattr(model_switch, "_entry_configured_key", lambda *a, **k: touched.append("key") or "k")
+        monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider",
+                            lambda **_kw: touched.append("resolve_runtime_provider"))
+        user_providers = {"relay": {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+                                    "key_env": "RELAY_KEY"}}
+        result = model_switch.switch_model("ordinary-model", "custom", "other-model", explicit_provider="relay",
+                                           user_providers=user_providers)
+
+        assert result.success is False and result.error_message == GeminiOutboundDenied.public_message
+        assert touched == []
+
+    def test_a_target_that_resolves_to_a_google_endpoint_is_refused_before_validation(self, monkeypatch):
+        from hermes_cli import model_switch
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        validated = []
+        monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **_kw: {
+            "api_key": "k", "base_url": "https://us-central1-aiplatform.googleapis.com/v1", "api_mode": "chat_completions"})
+        monkeypatch.setattr(model_switch, "_validate_switch", lambda st: validated.append(st) or None)
+        result = model_switch.switch_model("ordinary-model", "custom", "other-model", explicit_provider="openrouter")
+
+        assert result.success is False and result.error_message == GeminiOutboundDenied.public_message
+        assert validated == []
+
+    def test_the_dashboard_refuses_a_gemini_pick_and_leaves_the_model_block_byte_identical(self, monkeypatch):
+        from starlette.testclient import TestClient
+        from hermes_constants import get_hermes_home
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+        from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+        cfg_path = get_hermes_home() / "config.yaml"
+        cfg_path.write_text("model:\n  default: llama3.2\n  provider: ollama-local\n"
+                            "  base_url: http://localhost:11434/v1\n", encoding="utf-8")
+        before = cfg_path.read_bytes()
+        monkeypatch.setattr("hermes_cli.models_detect.provider_has_credentials", lambda p: p == "openrouter")
+
+        client = TestClient(app)
+        client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+        resp = client.put("/api/config", json={"config": {"model": "google/gemini-2.5-flash"}})
+
+        assert resp.status_code == 400 and GeminiOutboundDenied.public_message in resp.json()["detail"]
         assert cfg_path.read_bytes() == before
 
 

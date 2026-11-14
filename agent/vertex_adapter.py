@@ -14,6 +14,7 @@ import time
 from typing import Any, Optional, Tuple
 
 from agent.credential_source import VERTEX_OAUTH, tag_credential_source
+from agent.gemini_outbound_policy import deny_gemini_outbound
 from agent.secret_scope import get_secret as _get_secret, is_multiplex_active
 
 try:
@@ -163,6 +164,7 @@ def _cached_credentials(resolved_path: Optional[str], sa_raw: Optional[bytes], c
 
 def get_vertex_credentials(credentials_path: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
     """Return (fresh access_token, project_id) or (None, None); Credentials cached per file content."""
+    deny_gemini_outbound(canonical_provider="vertex")
     if not _ensure_google_auth():
         return None, None
 
@@ -210,6 +212,7 @@ def get_vertex_base_url(credentials_path: Optional[str] = None, region: Optional
     """The Vertex base_url WITHOUT minting a token (no OAuth exchange), or None when the credentials
     cannot be loaded or no project resolves. For processes that route but never send — the
     gateway-backed CLI, whose gateway session mints its own token for the turn."""
+    deny_gemini_outbound(canonical_provider="vertex")  # it loads the credential file, like get_vertex_credentials
     if not _ensure_google_auth():
         return None
     resolved_path = _resolve_credentials_path(credentials_path)

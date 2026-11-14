@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterator, List, Optional
 import httpx
 
 from agent.bounded_response import read_streaming_error_body
+from agent.gemini_outbound_policy import deny_gemini_outbound
 from agent.gemini_long_decode import continuation_token, long_decode_hops, merge_hop_responses, merge_hop_usage, split_stream_continuation
 from agent.retry_utils import parse_retry_after_seconds
 from agent.gemini_schema import prepare_gemini_tool_parameters, sanitize_gemini_tool_parameters
@@ -199,6 +200,7 @@ def probe_gemini_tier(
     api_key: str, base_url: str = DEFAULT_GEMINI_BASE_URL, *, model: str = "gemini-3.7-flash", timeout: float = 10.0
 ) -> str:
     """Probe a Google AI Studio key → ``"free"`` | ``"paid"`` | ``"unknown"`` (probe failed; callers proceed without blocking)."""
+    deny_gemini_outbound(canonical_provider="gemini")
     key = (api_key or "").strip()
     if not key:
         return "unknown"
@@ -909,6 +911,7 @@ class GeminiNativeClient:
         self, *, api_key: str, base_url: Optional[str] = None, default_headers: Optional[dict[str, str]] = None,
         timeout: Any = None, http_client: Optional[httpx.Client] = None, **_: Any,
     ) -> None:
+        deny_gemini_outbound(canonical_provider="gemini")
         if not (api_key or "").strip():
             raise RuntimeError(self.MISSING_KEY_ERROR)
         self.api_key, self.is_closed = api_key, False
