@@ -664,15 +664,17 @@ def _ensure_codex_session(agent, messages: list[dict[str, Any]] | None = None) -
     )
 
 
-def _persist_projected_messages(agent, turn, messages: list[dict[str, Any]]) -> bool:
-    """Splice the projected messages into ``messages`` and flush them to the session DB; True when the
-    rows are durable in the session DB (the codex thread binding may then be published).
+def _persist_projected_messages(agent, turn, messages: list[dict[str, Any]]) -> bool | None:
+    """Splice the projected messages into ``messages`` and flush them to the session DB. Returns None
+    when no flush was attempted (nothing projected, or no session DB), else whether this turn's rows
+    are durable: the flush returned exactly True AND every row carries the marker. Only then may the
+    codex thread binding be published and the gateway skip its own write.
 
     Bypasses conversation_loop's per-step _persist_session(); the flush dedups via _DB_PERSISTED_MARKER so
-    only the new codex rows are written. The agent stays the sole persister (agent_persisted=True): a
-    gateway re-write would re-INSERT the user turn."""
+    only the new codex rows are written. The agent is normally the sole persister: a gateway re-write
+    would re-INSERT the user turn."""
     if not turn.projected_messages:
-        return False
+        return None
     from agent.message_metadata import append_message
     projected_messages = turn.projected_messages
     # Turn-start persistence owns the accepted input. Codex's leading user item
@@ -685,17 +687,20 @@ def _persist_projected_messages(agent, turn, messages: list[dict[str, Any]]) -> 
     for projected_message in projected_messages:
         append_message(messages, projected_message)
     if getattr(agent, "_session_db", None) is None:
-        return False
+        return None
+    from agent.turn_truncation import turn_rows_persisted
+
     flush_ok = False
     try:
         flush_ok = agent._flush_messages_to_session_db(messages)
     except Exception:
         logger.warning("codex app-server projected-message flush failed", exc_info=True)
-    if flush_ok is False:
-        # Output already streamed and agent_persisted cannot flip to False: surface the gap loudly.
+    durable = flush_ok is True and turn_rows_persisted(agent, messages)
+    if not durable:
+        # Output already streamed; agent_persisted=False lets the gateway write its recovery copy.
         logger.warning("codex app-server turn was delivered but could NOT be persisted to the session DB "
-                       "(session=%s) — this turn will be missing after restart/resume", getattr(agent, "session_id", None))
-    return flush_ok is True
+                       "(session=%s) — reporting agent_persisted=False", getattr(agent, "session_id", None))
+    return durable
 
 
 def _finish_codex_turn(agent, turn, messages: list[dict[str, Any]], *, original_user_message: Any,
@@ -799,16 +804,22 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     reply = _transform_codex_reply(agent, turn, turn_id)
     # The binding is published only once the transcript it belongs to is durable, and never for a
     # retired thread (the next agent would only resume into the same wedge).
-    if _persist_projected_messages(agent, turn, messages) and not getattr(turn, "should_retire", False):
+    flushed = _persist_projected_messages(agent, turn, messages)
+    if flushed and not getattr(turn, "should_retire", False):
         _store_codex_thread_id(agent, turn.thread_id)
+    # This turn's own outcome, never a flag an earlier turn set. With no flush attempted here the
+    # turn-start flush's outcome stands, read from the marker it left on this turn's rows.
+    from agent.turn_truncation import turn_rows_persisted
+
+    agent_persisted = turn_rows_persisted(agent, messages) if flushed is None else flushed
     usage_result = _finish_codex_turn(
         agent, turn, messages, original_user_message=original_user_message, should_review_memory=should_review_memory,
         final_response=reply["final_response"],
     )
     return _turn_result(
         interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
-        # We flushed the projected rows ourselves (agent_persisted); the gateway must skip its own DB write.
-        agent_persisted=True, codex_thread_id=turn.thread_id, codex_turn_id=turn.turn_id, **reply, **usage_result,
+        # True only when this turn's rows are durable; False keeps the gateway's own recovery write.
+        agent_persisted=agent_persisted, codex_thread_id=turn.thread_id, codex_turn_id=turn.turn_id, **reply, **usage_result,
         **_codex_answer_provenance(agent, turn, turn_id),
     )
 

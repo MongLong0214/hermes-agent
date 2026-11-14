@@ -168,13 +168,36 @@ def normalize_response_for_agent(agent: Any, response: Any) -> Any:
     return agent._get_transport().normalize_response(response)
 
 
+def turn_rows_persisted(agent: Any, messages: Any) -> bool:
+    """``agent_persisted`` for this turn, read from its rows: the gateway skips its own transcript
+    write only on True. A committed flush stamps ``_DB_PERSISTED_MARKER`` on every live dict it
+    wrote, so the proof is that ``messages`` holds rows and each one the flush writes (ephemeral
+    scaffolding never is) carries the stamp. A flush call that returned True is not that proof (an
+    empty batch returns True too), and an agent-wide flag would let an earlier turn's success
+    answer for this one. With no session DB configured nothing was owed: True."""
+    if getattr(agent, "_session_db", None) is None:
+        return True
+    if not isinstance(messages, list):
+        return False
+    from agent.context_compressor import _DB_PERSISTED_MARKER
+    from agent.session_persistence import _is_ephemeral_scaffolding
+
+    rows = [m for m in messages if isinstance(m, dict) and not _is_ephemeral_scaffolding(m)]
+    return bool(rows) and all(m.get(_DB_PERSISTED_MARKER) for m in rows)
+
+
 def partial_result(
     messages: list[dict[str, Any]], api_call_count: int, final_response: str,
     error: Optional[str] = None, *, failed: bool = False, compression_exhausted: bool = False,
+    agent: Any = None,
 ) -> dict[str, Any]:
     """Typed incomplete-turn result (``partial`` unless ``failed``); ``error`` defaults to
     ``final_response``. ``compression_exhausted`` carries the #98722 typed bit the gateway
-    consumes to reset/move future input to a clean session (see run_turn.py)."""
+    consumes to reset/move future input to a clean session (see run_turn.py).
+
+    An early return that bypasses ``finalize_turn``. Passing ``agent`` (each caller runs
+    ``agent._persist_session()`` just before, which binds ``agent._session_messages`` to the list
+    it flushed) reports whether that flush landed, so a failed one is not taken as durable."""
     result = {
         "final_response": final_response,
         "messages": messages,
@@ -185,6 +208,8 @@ def partial_result(
     }
     if compression_exhausted:
         result["compression_exhausted"] = True
+    if agent is not None:
+        result["agent_persisted"] = turn_rows_persisted(agent, getattr(agent, "_session_messages", None))
     return result
 
 
@@ -246,7 +271,7 @@ class _Trunc(TruncationVerdict):
         agent._persist_session(self.messages, self.conversation_history)
         return self.done("return", stamp_failure(partial_result(
             self.messages if result_messages is None else result_messages, self.api_call_count,
-            final_response, error, failed=failed, compression_exhausted=compression_exhausted,
+            final_response, error, failed=failed, compression_exhausted=compression_exhausted, agent=agent,
         ), *failure))
 
     @property
@@ -700,7 +725,8 @@ def continue_codex_incomplete(
     agent._codex_reasoning_only_streak = 0
     agent._persist_session(messages, conversation_history)
     return partial_result(
-        messages, api_call_count, "Codex response remained incomplete after 3 continuation attempts"
+        messages, api_call_count, "Codex response remained incomplete after 3 continuation attempts",
+        agent=agent,
     )
 
 
