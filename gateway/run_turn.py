@@ -1,4 +1,4 @@
-# health: allow FILE_LINES -- canonical surface seam: _build_agent_for_resolved_session is a hook only; the build lives in gateway/run_turn_runner.py (build_agent_for_resolved_session)
+# health: allow FILE_LINES -- canonical surface seams: _build_agent_for_resolved_session is a hook only (the build lives in gateway/run_turn_runner.py, build_agent_for_resolved_session), and the /reload-mcp notice is typed as a system notice (its kind and marker live in hermes_state_messages_peer.py)
 """Agent-turn execution for GatewayRunner: _handle_message_with_agent, _run_agent*, proxy path,
 MCP reload. Bound onto ``GatewayRunner`` via the MRO; ``gateway.run`` internals
 are imported lazily inside method bodies (import cycle) so ``patch("gateway.run.X")`` still works.
@@ -555,9 +555,14 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             ]
             tool_summary = f"{len(new_tools)} MCP tool(s) now available" if new_tools else "No MCP tools available"
             change_detail = ". ".join(change_parts) + ". " if change_parts else ""
+            from hermes_state_messages_peer import MCP_RELOAD_NOTICE_DISPLAY_KIND, MCP_RELOAD_NOTICE_METADATA
             reload_msg = {
                 "role": "user",
                 "content": f"[IMPORTANT: MCP servers have been reloaded. {change_detail}{tool_summary}. The tool list for this conversation has been updated accordingly.]",
+                # A system notice, not a principal's message: a canonical (Buzz/ACP) turn may follow it
+                # without the history counting as unanswered (open_user_tail_is_delivery_only).
+                "display_kind": MCP_RELOAD_NOTICE_DISPLAY_KIND,
+                "display_metadata": dict(MCP_RELOAD_NOTICE_METADATA),
             }
             with suppress(Exception):  # Best-effort; don't fail the reload over a transcript write
                 session_entry = await self.async_session_store.get_or_create_session(event.source)
