@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import collections
 import contextvars
+import inspect
 import json
 import logging
 import os
@@ -203,18 +204,22 @@ def _persist_dispatch(record: dict[str, Any]) -> None:
 
 
 def _prune_durable_records() -> None:
-    """Bound terminal history, preferring delivered records for deletion."""
+    """Bound terminal history, preferring delivered records for deletion.
+
+    The history cap only considers delivered/dropped rows: a completion still
+    ``delivery_state='pending'`` has not reached the parent yet, so it is never an eviction
+    candidate there. Pending rows are bounded solely by their own cap below."""
     require_ledger_owner()
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?", (cutoff,))
-        terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')").fetchone()[0]
+        terminal_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
+               WHERE state NOT IN ('running','finalizing') AND delivery_state != 'pending'""").fetchone()[0]
         if terminal_count > _MAX_RETAINED_COMPLETED:
             conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing')
+                     WHERE state NOT IN ('running','finalizing') AND delivery_state != 'pending'
                      ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
                               updated_at ASC LIMIT ?
                    )""", (terminal_count - _MAX_RETAINED_COMPLETED,))
@@ -294,7 +299,13 @@ def _owner_liveness() -> Optional[Callable[[Any, Any], bool]]:
 
 def recover_abandoned_delegations() -> int:
     """Classify records whose owning process disappeared as outcome unknown; children a multi-child unit had already
-    recorded (``record_unit_child``) are replayed with their real results."""
+    recorded (``record_unit_child``) are replayed with their real results.
+
+    Only the SELECT holds ``_DB_LOCK``. The forensic hints (transcript reads, up to three serial 5 s ``git``
+    probes per row, tools/async_delegation_recovery_hints.py) run outside it, so one abandoned unit's slow
+    probe never blocks every other ledger writer, such as a concurrent dispatch. Each classification is then
+    written in its own short transaction, conditional on the row still being live, so a row its owner
+    finished in the meantime is never overwritten with 'unknown'."""
     require_ledger_owner()
     alive = _owner_liveness()
     if alive is None:
@@ -305,42 +316,43 @@ def recover_abandoned_delegations() -> int:
                       parent_session_id, dispatched_at, owner_pid,
                       owner_started_at, task_json, origin_session_id, result_json, state
                FROM async_delegations WHERE state IN ('running','finalizing')""").fetchall()
-        for row in rows:
-            delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json, origin_sid, result_json, last_state = row
-            if alive(pid, started):
-                continue
-            task = json.loads(task_json or "{}")
-            error = "Delegation owner exited before recording a terminal result; outcome unknown."
-            recovered_results = _recovered_results(task, result_json, error)
-            if recovered_results:
-                done = sum(1 for r in recovered_results if r.get("status") != "unknown")
-                error = (f"Delegation owner exited before the unit finished; {done}/{len(recovered_results)} child "
-                         "results were recorded and are included below, the rest are unknown.")
-            diagnostics = {"last_known_status": last_state, "task_transcripts": task.get("task_transcripts") or {}}
-            # Verbatim transcript tails + a git snapshot of the owner's cwd, so the parent can
-            # continue or re-dispatch from the event alone instead of opening files (#116000).
-            from tools.async_delegation_recovery_hints import git_state_hint, transcript_tails
-            if tails := transcript_tails(diagnostics["task_transcripts"]):
-                diagnostics["transcript_tails"] = tails
-            if hint := git_state_hint(task.get("owner_cwd")):
-                diagnostics["git_state_hint"] = hint
-            event = {
-                "type": "async_delegation", "delegation_id": delegation_id, "session_key": session_key,
-                "origin_ui_session_id": origin_ui, "origin_session_id": origin_sid or "",
-                "parent_session_id": parent_id, "goal": task.get("goal", ""), "goals": task.get("goals"),
-                "context": task.get("context"), "toolsets": task.get("toolsets"), "role": task.get("role"),
-                "model": task.get("model"), "is_batch": bool(task.get("is_batch")),
-                "status": "unknown", "summary": None, "error": error, **diagnostics,
-                **({"results": recovered_results} if recovered_results else {}),
-                "dispatched_at": dispatched_at, "completed_at": now,
-                **{k: task[k] for k in _ROUTING_KEYS if task.get(k)}}
-            result = {"status": "unknown", "summary": None, "error": event["error"], **diagnostics,
-                      **({"results": recovered_results} if recovered_results else {})}
-            event, result = redact_completion_event(event), redact_child_result(result)
-            conn.execute("""UPDATE async_delegations SET state='unknown', completed_at=?,
+    for row in rows:
+        delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json, origin_sid, result_json, last_state = row
+        if alive(pid, started):
+            continue
+        task = json.loads(task_json or "{}")
+        error = "Delegation owner exited before recording a terminal result; outcome unknown."
+        recovered_results = _recovered_results(task, result_json, error)
+        if recovered_results:
+            done = sum(1 for r in recovered_results if r.get("status") != "unknown")
+            error = (f"Delegation owner exited before the unit finished; {done}/{len(recovered_results)} child "
+                     "results were recorded and are included below, the rest are unknown.")
+        diagnostics = {"last_known_status": last_state, "task_transcripts": task.get("task_transcripts") or {}}
+        # Verbatim transcript tails + a git snapshot of the owner's cwd, so the parent can
+        # continue or re-dispatch from the event alone instead of opening files (#116000).
+        from tools.async_delegation_recovery_hints import git_state_hint, transcript_tails
+        if tails := transcript_tails(diagnostics["task_transcripts"]):
+            diagnostics["transcript_tails"] = tails
+        if hint := git_state_hint(task.get("owner_cwd")):
+            diagnostics["git_state_hint"] = hint
+        event = {
+            "type": "async_delegation", "delegation_id": delegation_id, "session_key": session_key,
+            "origin_ui_session_id": origin_ui, "origin_session_id": origin_sid or "",
+            "parent_session_id": parent_id, "goal": task.get("goal", ""), "goals": task.get("goals"),
+            "context": task.get("context"), "toolsets": task.get("toolsets"), "role": task.get("role"),
+            "model": task.get("model"), "is_batch": bool(task.get("is_batch")),
+            "status": "unknown", "summary": None, "error": error, **diagnostics,
+            **({"results": recovered_results} if recovered_results else {}),
+            "dispatched_at": dispatched_at, "completed_at": now,
+            **{k: task[k] for k in _ROUTING_KEYS if task.get(k)}}
+        result = {"status": "unknown", "summary": None, "error": event["error"], **diagnostics,
+                  **({"results": recovered_results} if recovered_results else {})}
+        event, result = redact_completion_event(event), redact_child_result(result)
+        with _DB_LOCK, _transaction() as conn:
+            recovered += conn.execute("""UPDATE async_delegations SET state='unknown', completed_at=?,
                    updated_at=?, event_json=?, result_json=?, delivery_state='pending'
-                   WHERE delegation_id=?""", (now, now, json.dumps(event), json.dumps(result), delegation_id))
-            recovered += 1
+                   WHERE delegation_id=? AND state IN ('running','finalizing')""",
+                (now, now, json.dumps(event), json.dumps(result), delegation_id)).rowcount
     return recovered
 
 
@@ -812,6 +824,58 @@ def failed_delegations_for_session(
 
 
 # ── In-memory registry queries ──────────────────────────────────────────────
+def _discard_queued_work_item(executor, fn) -> Optional[bool]:
+    """Find the queued work item that wraps *fn* (by identity) and drop it so it never runs.
+
+    True: found and dropped. False: the queue was readable but held no such item, so a worker
+    already took it and it may be running now. None: *executor* exposes no queue (a test double),
+    which callers treat as a clean rejection. ``DaemonThreadPoolExecutor.submit`` wraps *fn* in a
+    closure whose ``__wrapped__`` is *fn*; on Python 3.14 the item holds ``task = (fn, args, kwargs)``."""
+    work_queue = getattr(executor, "_work_queue", None)
+    if work_queue is None:
+        return None
+
+    def wraps_fn(item) -> bool:
+        queued = getattr(item, "fn", None)
+        if queued is None and isinstance(getattr(item, "task", None), tuple) and item.task:
+            queued = item.task[0]
+        return queued is not None and inspect.unwrap(queued, stop=lambda f: f is fn) is fn
+
+    drained, found = [], False
+    try:
+        while True:
+            item = work_queue.get_nowait()
+            if not found and wraps_fn(item):
+                found = True
+                continue
+            drained.append(item)
+    except Exception:  # queue.Empty, or any queue implementation quirk
+        pass
+    for item in drained:
+        try:
+            work_queue.put(item)
+        except Exception:
+            logger.warning("Async delegation: could not return a drained work item to the pool queue", exc_info=True)
+    return found
+
+
+def _forget_unsubmitted(delegation_id: str) -> None:
+    """Undo an admission whose worker will never run: free its slot, then remove its ledger row.
+
+    The ledger may be what just failed, so this never raises; a row it cannot remove is logged
+    (restart recovery then reports it as outcome unknown)."""
+    with _records_lock:
+        _records.pop(delegation_id, None)
+    try:
+        if remote := worker_ledger():
+            remote.unscheduled(delegation_id)
+        else:
+            with _DB_LOCK, _transaction() as conn:
+                conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+    except Exception:  # cleanup of a failed dispatch must not turn it into a raise
+        logger.warning("Async delegation %s never started; could not remove its ledger row", delegation_id, exc_info=True)
+
+
 def _get_executor(max_workers: int) -> ThreadPoolExecutor:
     """Lazily create (or grow in place, never shrink) the shared daemon executor. Raising
     ``_max_workers`` is enough: the next ``submit`` spawns threads up to the new cap."""
@@ -961,10 +1025,14 @@ def _dispatch_admitted(
             return {"status": "rejected", "error": capacity_error}
         _records[delegation_id] = record
         live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
-    _persist_dispatch(record)
-    # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
-    # unit queues behind a full pool and the stale monitor kills it before its child ever starts.
-    executor = _get_executor(max(max_async_children, live_units))
+    try:
+        _persist_dispatch(record)
+    except Exception as exc:  # a locked/full state.db must not strand the slot
+        _forget_unsubmitted(delegation_id)
+        # ``reason`` tells callers this is not a full pool: running the unit inline would hide the failure.
+        return {"status": "rejected", "reason": "persistence", "error": f"Failed to persist async delegation{label}: {exc}"}
+
+    from hermes_cli.backend_retirement import retirement
 
     def _worker() -> None:
         result: dict[str, Any] = {}
@@ -981,28 +1049,47 @@ def _dispatch_admitted(
             logger.exception(f"Async delegation{label} %s crashed", delegation_id)
             result = crash_result(f"{type(exc).__name__}: {exc}", round(time.time() - dispatched_at, 2))
         finally:
-            _finalize(delegation_id, result, status)
+            try:
+                _finalize(delegation_id, result, status)
+            finally:
+                # The worker's own exit is the only release that is right on every path: the item
+                # can run even when submit() raised (see below), and then nobody else may release.
+                retirement.release()
 
-    from hermes_cli.backend_retirement import retirement
-
-    # The outer dispatch reservation prevents a freeze during this handoff. Retain a worker
-    # reservation too: the stall monitor may finalize its registry record before it really exits.
-    retirement.acquire()
+    worker_reserved = in_submit = False
+    executor = submitted = None
+    dispatch_error = None
     try:
-        future = executor.submit(propagate_context_to_thread(_worker))
-        future.add_done_callback(lambda _: retirement.release())
-    except Exception as exc:  # pragma: no cover — pool submit failure is rare
-        retirement.release()
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        if remote := worker_ledger():
-            remote.unscheduled(delegation_id)
-        else:
-            with _DB_LOCK, _transaction() as conn:
-                conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
-        return {"status": "rejected", "error": f"Failed to schedule async delegation{label}: {exc}"}
+        # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
+        # unit queues behind a full pool and the stale monitor kills it before its child ever starts.
+        executor = _get_executor(max(max_async_children, live_units))
+        # The outer dispatch reservation prevents a freeze during this handoff. Retain a worker
+        # reservation too: the stall monitor may finalize its registry record before it really exits.
+        retirement.acquire()
+        worker_reserved = True
+        submitted = propagate_context_to_thread(_worker)
+        in_submit = True
+        executor.submit(submitted)
+    except Exception as exc:  # classified below, never re-raised
+        dispatch_error = f"Failed to schedule async delegation{label}: {exc}"
+        # submit() puts the item on the queue before it starts a worker, so an untagged failure does
+        # not prove the item never ran. ``never_enqueued`` (DaemonThreadPoolExecutor.submit) does;
+        # otherwise look for the item and drop it. Not found means a worker already took it: keep the
+        # record and the reservation (a real completion still arrives) and report the outcome unresolved.
+        unresolved = (in_submit and not getattr(exc, "never_enqueued", False)
+                      and _discard_queued_work_item(executor, submitted) is False)
+        if not unresolved:
+            if worker_reserved:
+                retirement.release()
+            _forget_unsubmitted(delegation_id)
+            return {"status": "rejected", "error": dispatch_error}
+        logger.warning("Async delegation%s %s: submit raised after a worker took the item; outcome unresolved",
+                       label, delegation_id, exc_info=True)
+    # An unresolved unit may be running right now, so it is monitored like a dispatched one.
     if progress_fn is not None:
         _ensure_stale_monitor()
+    if dispatch_error is not None:
+        return {"status": "rejected", "reason": "raised", "error": dispatch_error}
     return {"status": "dispatched", "delegation_id": delegation_id}
 
 
@@ -1016,7 +1103,9 @@ def dispatch_async_delegation(
     ``session_key``/``parent_session_id`` are captured on the parent thread (the worker carries
     no contextvars) and route the completion back to the spawning session.
     ``progress_fn() -> (token, in_tool)`` enables stale monitoring; omitted = unmonitored.
-    Returns ``{"status": "dispatched", "delegation_id"}`` or ``{"status": "rejected", "error"}``."""
+    Returns ``{"status": "dispatched", "delegation_id"}`` or ``{"status": "rejected", "error"}``. A rejection
+    with ``"reason": "persistence"`` was never submitted because state.db could not record it; one with
+    ``"reason": "raised"`` may already be running (its completion still arrives). Neither is a full pool."""
     delegation_id = _new_delegation_id()
     handle = _dispatch(
         delegation_id=delegation_id, goal=goal, goals=None, context=context,

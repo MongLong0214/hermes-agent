@@ -7,12 +7,15 @@ concurrent.futures.thread._threads_queues, whose atexit hook joins every
 worker unconditionally — even after shutdown(wait=False).
 """
 
+import inspect
 import subprocess
 import sys
 import threading
 import time
 
 from concurrent.futures.thread import _threads_queues
+
+import pytest
 
 from tools import daemon_pool
 from tools.daemon_pool import DaemonThreadPoolExecutor
@@ -168,6 +171,66 @@ def test_worker_gets_initializer_when_executor_stores_initializer_fields(monkeyp
     assert executor_ref() is pool
     assert work_queue is pool._work_queue
     assert (initializer, initargs) == (init, (1, 2))
+
+
+class _SpyQueue:
+    """Stands in for ``_work_queue``: records every ``put`` and never hands an item to a worker."""
+
+    def __init__(self):
+        self.puts = []
+
+    def put(self, item):
+        self.puts.append(item)
+
+
+@pytest.mark.parametrize("site", ["context_capture", "after_shutdown"])
+def test_failure_before_enqueue_is_tagged_never_enqueued(monkeypatch, site):
+    """A submit() that raises before ``_work_queue.put`` is reached tags the exception
+    ``never_enqueued``: the item can never run, so the caller may release what it reserved."""
+    pool = DaemonThreadPoolExecutor(max_workers=1)
+    if site == "context_capture":
+        def failing_copy_context():
+            raise MemoryError("injected: context capture")
+
+        monkeypatch.setattr(daemon_pool, "copy_context", failing_copy_context)
+        expected = MemoryError
+    else:
+        pool.shutdown(wait=True)  # puts its own wake-up sentinel, so the spy goes in after it
+        expected = RuntimeError
+    spy = _SpyQueue()
+    monkeypatch.setattr(pool, "_work_queue", spy)
+    with pytest.raises(expected) as raised:
+        pool.submit(lambda: None)
+    assert getattr(raised.value, "never_enqueued", False) is True
+    assert spy.puts == [], "the put was reached, so the failure is not before enqueue"
+    assert not pool._threads
+
+
+def test_worker_start_failure_after_enqueue_is_not_tagged_never_enqueued(monkeypatch):
+    """A worker-start failure comes after the item is queued (another worker can still run it), so it
+    stays untagged; the queued item still names the callable the caller submitted."""
+    pool = DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix="start-fail-probe")
+    real_start = threading.Thread.start
+
+    def failing_start(self):
+        if self.name.startswith("start-fail-probe_"):
+            raise RuntimeError("injected: can't start new thread")
+        return real_start(self)
+
+    def submitted():
+        return None
+
+    monkeypatch.setattr(threading.Thread, "start", failing_start)
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            pool.submit(submitted)
+        assert not getattr(raised.value, "never_enqueued", False)
+        assert pool._work_queue.qsize() == 1, "the item was queued before the worker start failed"
+        item = pool._work_queue.get_nowait()
+        queued = getattr(item, "fn", None) or item.task[0]
+        assert inspect.unwrap(queued) is submitted
+    finally:
+        pool.shutdown(wait=False)
 
 
 def _repo_root():
