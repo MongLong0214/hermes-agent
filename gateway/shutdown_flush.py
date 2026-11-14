@@ -234,9 +234,11 @@ def next_inbound_order() -> list:
 
 
 def store_inbound_record(event: Any, *, session_key: str, transport_profile: Optional[str],
-                         recovery_id: str, order) -> None:
+                         recovery_id: str, order, run: int = 0) -> None:
     """Write *event*'s inbound record atomically (temp file, fsync, rename, directory fsync). Raises
-    when the record is not durably on disk; rewriting a record keeps its file and recovery id."""
+    when the record is not durably on disk; rewriting a record keeps its file and recovery id. *run* is
+    the run of the message the record admits next (0 on arrival; gateway/run_startup.py,
+    _allocate_inbound_run, writes each rerun's before it is admitted)."""
     from datetime import datetime
 
     from utils import atomic_json_write
@@ -252,20 +254,37 @@ def store_inbound_record(event: Any, *, session_key: str, transport_profile: Opt
                       **{flag: bool(getattr(source, flag, False)) for flag in _INBOUND_SOURCE_FLAGS}}
     atomic_json_write(_inbound_record_path(recovery_id), {
         "reason": INBOUND_TURN_REASON, "recovery_id": recovery_id, "session_key": session_key,
-        "transport_profile": transport_profile, "order": list(order), "event": data,
+        "transport_profile": transport_profile, "order": list(order), "run": int(run), "event": data,
     }, mode=0o600, default=str, fsync_dir=True)
+
+
+def set_inbound_record_run(record: Dict[str, Any], run: int) -> None:
+    """Rewrite a stored record with the run it admits next, atomically, everything else as read (raises
+    when it is not durably on disk; the caller then admits nothing)."""
+    from utils import atomic_json_write
+    atomic_json_write(_inbound_record_path(record["recovery_id"]), {**record, "run": int(run)},
+                      mode=0o600, default=str, fsync_dir=True)
+
+
+def inbound_record_run(record: Dict[str, Any]) -> int:
+    """The run a stored record last admitted (``store_inbound_record``); 0 for its first run."""
+    run = record.get("run", 0)
+    return run if isinstance(run, int) and not isinstance(run, bool) and run >= 0 else 0
 
 
 def inbound_record_exists(recovery_id: Any) -> bool:
     return isinstance(recovery_id, str) and bool(recovery_id) and _inbound_record_path(recovery_id).exists()
 
 
-def discard_inbound_record(recovery_id: str) -> None:
-    """Delete a record once its turn has ended (a failure is logged; the next start then judges it)."""
+def discard_inbound_record(recovery_id: str) -> bool:
+    """Delete a record. Only the settlement boundary calls this (gateway/run_inbound.py,
+    _settle_inbound). False when the delete failed (logged; the next start then judges the record)."""
     try:
         _inbound_record_path(recovery_id).unlink(missing_ok=True)
+        return True
     except OSError as exc:
         logger.warning("Could not delete inbound record %s: %s", recovery_id, exc)
+        return False
 
 
 def load_inbound_records() -> list:

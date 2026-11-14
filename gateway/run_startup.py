@@ -801,107 +801,168 @@ class GatewayStartupMixin:
         return event, self._delivery_adapter_for(event.source)
 
     async def _readmit_session_records(self, session_key: str, targets: list) -> None:
-        """Run one session's stored messages in order. The record, not an empty auto-resume, answers
-        the interrupted turn, so the session's resume flag is cleared first. Each message goes through
-        the ordinary inbound path, which settles its record: its turn when it claims one, otherwise
-        ``_settle_unclaimed_inbound`` (a declined message is consumed, a queued one keeps it). One whose
-        answer is already in the transcript is delivered through the ledger instead of run again."""
+        """Run one session's stored messages in order. Each is first settled through the boundary from
+        what the ledger and the transcript hold (``_settle_stored_inbound``): a delivered answer, or one
+        owed and now redelivered, ends it without a second turn. A message with no completed answer runs
+        again, through the ordinary inbound path, under a run fixed in its record first
+        (``_allocate_inbound_run``); the record, not an empty auto-resume, answers the interrupted turn,
+        so the session's resume flag is cleared first. A lookup that fails, or a run that cannot be
+        fixed, stops the session here with every remaining record kept: nothing is run on an unknown,
+        and a later call (a reconnect) or the next start tries again."""
         cleared = False
-        for record, event, adapter in targets:
+        live = self._inbound_live_ids()
+        for index, (record, event, adapter) in enumerate(targets):
             recovery_id = record["recovery_id"]
-            if await self._consume_if_answered(record):
-                with _log_suppressed(logging.WARNING, "Redelivering an answered stored message failed: %s"):
-                    await self._redeliver_pending_obligations()
+            state = await self._settle_stored_inbound(record)
+            if state in ("settled", "owed"):
                 continue
-            if not cleared:
-                cleared = True
-                with suppress(Exception):
-                    await self.async_session_store.clear_resume_pending(session_key)
-            with _log_suppressed(logging.WARNING, "Choosing the run of stored message failed: %s"):
-                event._inbound_run = await asyncio.to_thread(self._inbound_run_for, record, event.source)
-            try:
-                await adapter.handle_message(event)
-                session_tasks = getattr(adapter, "_session_tasks", {})
-                task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
-                if task is not None:
-                    await asyncio.shield(task)
-            except Exception:
-                logger.warning("Re-admitting stored owner message %s failed; kept", recovery_id, exc_info=True)
+            if state == "unanswered":
+                run = await self._allocate_inbound_run(record, event)
+                if run is not None:
+                    if not cleared:
+                        cleared = True
+                        with suppress(Exception):
+                            await self.async_session_store.clear_resume_pending(session_key)
+                    try:
+                        await adapter.handle_message(event)
+                        session_tasks = getattr(adapter, "_session_tasks", {})
+                        task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
+                        if task is not None:
+                            await asyncio.shield(task)
+                    except Exception:
+                        logger.warning("Re-admitting stored owner message %s failed; kept", recovery_id,
+                                       exc_info=True)
+                    continue
+            logger.warning("Stored owner message %s on %s could not be settled or run (%s); it and the "
+                           "session's later stored messages are kept", recovery_id, session_key, state)
+            live.difference_update(later["recovery_id"] for later, _event, _adapter in targets[index:])
+            return
+
+    async def _allocate_inbound_run(self, record: dict, event: MessageEvent) -> Optional[int]:
+        """Fix the run a stored message is about to start, in its record, before it is admitted: one past
+        the run the record last admitted (gateway/shutdown_flush.py, inbound_record_run), so a rerun's
+        reply never takes over an earlier run's obligation, owed or delivered. None, and nothing is
+        admitted, when the record could not be rewritten."""
+        from gateway import shutdown_flush
+        run = shutdown_flush.inbound_record_run(record) + 1
+        try:
+            await asyncio.to_thread(shutdown_flush.set_inbound_record_run, record, run)
+        except Exception:
+            logger.warning("Could not fix the next run of stored owner message %s; it is not admitted",
+                           record["recovery_id"], exc_info=True)
+            return None
+        record["run"] = event._inbound_run = run
+        return run
+
+    async def _settle_stored_inbound(self, record: dict) -> str:
+        """Settle a stored message an earlier process left, through the boundary (gateway/run_inbound.py,
+        _settle_inbound), from what its transcript and the ledger hold: "settled" when the transcript's
+        answer owes nothing, or its obligation reads back delivered; "owed" when that answer is in the
+        ledger but not yet delivered (the record stays; a later start reads it back again);
+        "unanswered" when the transcript holds no completed answer (it runs again); "unknown" when a
+        lookup or a write failed (it stays, and is not run). An answer is owed through the ledger, the
+        ledger redelivered, and the obligation read back before anything is deleted."""
+        from gateway import shutdown_flush
+        from gateway.delivery_ledger import InboundObligation
+        from gateway.run_inbound import INBOUND_NO_REPLY
+        key, recovery_id = record["session_key"], record["recovery_id"]
+        try:
+            source = shutdown_flush.inbound_event_from_record(record).source
+            status, answer_ref = await self._owe_stored_answer(record)
+        except Exception:
+            logger.warning("Reading the stored answer of %s failed; kept", recovery_id, exc_info=True)
+            return "unknown"
+        if status == "unanswered":
+            return status
+        if status == "no_reply":
+            settled = await self._settle_inbound([recovery_id], INBOUND_NO_REPLY)
+        else:
+            with _log_suppressed(logging.WARNING, "Redelivering an answered stored message failed: %s"):
+                await self._redeliver_pending_obligations()
+            settled = await self._settle_inbound([recovery_id], InboundObligation.to(key, answer_ref, source))
+        return "settled" if settled else ("unknown" if settled is None else "owed")
 
     async def _ledger_answered_inbound_records(self) -> int:
-        """Boot pass, before the delivery sweep: every stored message of an earlier process whose answer
-        the transcript already holds (its turn was cut off after the agent answered, before delivery)
-        is handed to the delivery ledger and only then consumed. Returns how many were consumed."""
+        """Boot pass, before the marker recovery and the delivery sweep: every stored message of an
+        earlier process whose answer the transcript already holds (its turn was cut off after the agent
+        answered, before delivery) owes that answer through the delivery ledger. Nothing is deleted here:
+        the record goes once that obligation reads back delivered (``_settle_stored_inbound``). Returns
+        how many answers were owed."""
         from gateway import shutdown_flush
         live = self._inbound_live_ids()
-        consumed = 0
+        owed = 0
         for record in shutdown_flush.load_inbound_records():
             if record["recovery_id"] not in live:
-                consumed += await self._consume_if_answered(record)
-        return consumed
+                try:
+                    owed += (await self._owe_stored_answer(record))[0] == "owed"
+                except Exception:
+                    logger.warning("Reading the stored answer of %s failed; kept", record["recovery_id"],
+                                   exc_info=True)
+        return owed
 
-    async def _consume_if_answered(self, record: dict) -> bool:
-        """When the record's message already has its final reply in the transcript, owe that reply
-        through the delivery ledger and then delete the record. The reply is owed under the record the
-        user row names and its destination (delivery_ledger.inbound_obligation_id), the identity normal
-        delivery ledgers it under (platforms/base.py, _record_delivery_obligation), never its text: the
-        crash-left row the boot sweep claims and redelivers is a no-op when that reply was already
-        ledgered or delivered, even with text the transcript lacks (a runtime footer), and every record
-        folded into the row's message owes the same one row. False, keeping the record to be
-        re-admitted, when there is no answer, it cannot be matched, or no ledger can owe it."""
+    async def _owe_stored_answer(self, record: dict) -> Tuple[str, Optional[str]]:
+        """``("owed", answer ref)`` when the record's message already has its final reply in the
+        transcript: that reply is owed through the delivery ledger under the record the user row names,
+        its run and its destination (delivery_ledger.inbound_obligation_id), the identity normal
+        delivery ledgers it under (platforms/base.py, _record_delivery_obligation), never its text. The
+        row is insert-only, so a reply already ledgered or delivered under it (even with text the
+        transcript lacks, a runtime footer) is left as it is, and every record folded into the row's
+        message owes the same one row. ``("no_reply", None)`` when that answer presents nothing (a
+        muted or silent machinery reply), ``("unanswered", None)`` when there is no completed answer or
+        no ledger can owe it (the message runs again). Raises when the transcript or the ledger cannot
+        be read or written: a failed lookup is never "no answer"."""
         from gateway import shutdown_flush
         from gateway.delivery_ledger import (
             inbound_answer_ref, inbound_obligation_id, ledger_enabled, record_crash_left_reply)
         from hermes_cli.timefmt import coerce_epoch
         found = await self._inbound_record_answer(record)
         if found is None:
-            return False
+            return "unanswered", None
         history, asked_at, origin, answered_as, answered_run = found
         text = self._crash_left_reply(history, 0.0, origin)
         if text is None:
-            return False
-        key, recovery_id = record["session_key"], record["recovery_id"]
-        if text:
-            if not await asyncio.to_thread(ledger_enabled):
-                return False  # nothing could owe the answer: the message runs again instead
-            source = shutdown_flush.inbound_event_from_record(record).source
-            platform = str(getattr(source.platform, "value", source.platform))
-            # Keyed by the answered record alone: another message answered with the same text is its own
-            # delivery.
-            await asyncio.to_thread(
-                record_crash_left_reply,
-                obligation_id=inbound_obligation_id(
-                    key, inbound_answer_ref(answered_as, answered_run), platform=platform,
-                    chat_id=source.chat_id, thread_id=source.thread_id),
-                session_key=key, platform=platform, chat_id=source.chat_id,
-                thread_id=source.thread_id, content=text, since=coerce_epoch(asked_at) or 0.0,
-                adapter_profile=record.get("transport_profile"), same_reply_dedupe=False)
+            return "unanswered", None
+        if not text:
+            return "no_reply", None
+        if not await asyncio.to_thread(ledger_enabled):
+            return "unanswered", None  # nothing could owe the answer: the message runs again instead
+        key = record["session_key"]
+        source = shutdown_flush.inbound_event_from_record(record).source
+        platform = str(getattr(source.platform, "value", source.platform))
+        answer_ref = inbound_answer_ref(answered_as, answered_run)
+        # Keyed by the answered record alone: another message answered with the same text is its own
+        # delivery.
+        await asyncio.to_thread(
+            record_crash_left_reply,
+            obligation_id=inbound_obligation_id(
+                key, answer_ref, platform=platform, chat_id=source.chat_id, thread_id=source.thread_id),
+            session_key=key, platform=platform, chat_id=source.chat_id,
+            thread_id=source.thread_id, content=text, since=coerce_epoch(asked_at) or 0.0,
+            adapter_profile=record.get("transport_profile"), same_reply_dedupe=False)
         logger.info("Stored owner message %s on %s was answered before the restart; its answer is owed "
-                    "through the delivery ledger", recovery_id, key)
-        shutdown_flush.discard_inbound_record(recovery_id)
-        return True
+                    "through the delivery ledger", record["recovery_id"], key)
+        return "owed", answer_ref
 
     async def _inbound_record_answer(self, record: dict):
         """``(history up to the answer, asked-at timestamp, origin, answered record id, its run)`` when
-        the record's message already has its final, completed answer in the transcript, else None. The
-        user row is the one that names the record, as its own (``display_metadata.inbound_recovery_id``,
-        written when the turn persists it, the answered record id) or as a message folded into it
-        (``inbound_absorbed_ids``), and names the run (``inbound_run``, absent for the first). The answer is the next assistant row before another user row that
-        completed the turn: no tool calls, text, not the failed-turn notice, and either the model ended
-        its turn there (``finish_reason`` "stop") or the finalizer closed a completed turn with it
-        (``display_metadata.turn_completed``, agent/turn_finalizer.py, a recovery or fallback reply). A
-        fragment, a truncated ("length"), interrupted or failed reply does not count: the message runs
-        again."""
+        the record's message already has its final, completed answer in the transcript; None when it
+        has none (or the session does not exist). Raises when the session or its transcript cannot be
+        read: an unreadable transcript is never "no answer". The user row is the one that names the
+        record, as its own (``display_metadata.inbound_recovery_id``, written when the turn persists it,
+        the answered record id) or as a message folded into it (``inbound_absorbed_ids``), and names the
+        run (``inbound_run``, absent for the first). The answer is the next assistant row before another
+        user row that completed the turn: no tool calls, text, not the failed-turn notice, and either
+        the model ended its turn there (``finish_reason`` "stop") or the finalizer closed a completed
+        turn with it (``display_metadata.turn_completed``, agent/turn_finalizer.py, a recovery or
+        fallback reply). A fragment, a truncated ("length"), interrupted or failed reply does not count:
+        the message runs again."""
         from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND
         from agent.message_metadata import TURN_COMPLETED_METADATA_KEY
         recovery_id = record["recovery_id"]
         entry = self.session_store.lookup_by_session_key_existing(record["session_key"])
         if entry is None:
             return None
-        try:
-            history = await self.async_session_store.load_transcript(entry.session_id)
-        except Exception:
-            return None
+        history = await self.async_session_store.load_transcript(entry.session_id)
         answer = asked_at = answered_as = answered_run = None
         asking = False
         for index, row in enumerate(history):
@@ -929,21 +990,45 @@ class GatewayStartupMixin:
             origin = shutdown_flush.inbound_event_from_record(record).source
         return history[:answer + 1], asked_at, origin, answered_as or recovery_id, answered_run
 
-    def _inbound_run_for(self, record: dict, source) -> int:
-        """The run a re-admitted stored message is about to start: the first whose reply obligation is
-        not in the delivery ledger. An earlier run's reply that reached the ledger (its record then
-        outlived it: a death before the delete, a failed delete, a restart that cut the turn short) keeps
-        its own row, still owed or already delivered, and this run's reply gets a row of its own."""
-        from gateway.delivery_ledger import inbound_answer_ref, inbound_obligation_id, ledger_enabled, obligation_exists
-        if not ledger_enabled():
-            return 0
-        platform = str(getattr(source.platform, "value", source.platform))
-        run = 0
-        while obligation_exists(inbound_obligation_id(
-                record["session_key"], inbound_answer_ref(record["recovery_id"], run), platform=platform,
-                chat_id=source.chat_id, thread_id=source.thread_id)):
-            run += 1
-        return run
+    async def _inbound_turn_markers(self) -> dict:
+        """Marker token -> (session key, token) of every crash-left turn marker whose turn's user row (the
+        session's last) names a stored message on disk, or whose transcript could not be read while
+        the session holds one. That message's record owes the turn's answer (``_settle_stored_inbound``),
+        so the marker recovery neither ledgers it a second time nor resumes the turn: the marker is left
+        exactly as it is and goes with the record, once its answer reads back delivered
+        (gateway/run_inbound.py, _settle_inbound)."""
+        from gateway import shutdown_flush
+        try:
+            records = shutdown_flush.load_inbound_records()
+        except Exception:
+            return {}
+        live = self._inbound_live_ids()
+        stored: Dict[str, list] = {}
+        for record in records:
+            if record["recovery_id"] not in live:
+                stored.setdefault(record["session_key"], []).append(record["recovery_id"])
+        if not stored:
+            return {}
+        with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
+            self.session_store._ensure_loaded_locked()  # noqa: SLF001
+            marked = [(e.session_key, e.session_id, e.active_turn_token)
+                      for e in self.session_store._entries.values()  # noqa: SLF001
+                      if e.active_turn_token and e.session_key in stored]
+        held, holds = {}, self._inbound_held_markers()
+        for key, session_id, token in marked:
+            try:
+                history = await self.async_session_store.load_transcript(session_id)
+                prompt = next((m for m in reversed(history) if m.get("role") == "user"), {})
+                meta = prompt.get("display_metadata") if isinstance(prompt.get("display_metadata"), dict) else {}
+                named = [meta.get("inbound_recovery_id"), *(meta.get("inbound_absorbed_ids") or ())]
+                owners = [rid for rid in stored[key] if rid in named]
+            except Exception:
+                owners = list(stored[key])  # unreadable: the stored messages may own it
+            if owners:
+                held[token] = (key, token)
+                for recovery_id in owners:
+                    holds[recovery_id] = (key, token)
+        return held
 
     def _event_is_queued(self, session_key: str, event: MessageEvent) -> bool:
         """*event* waits in the session's queue: the pending slot, the FIFO overflow, or a busy-text
@@ -1076,11 +1161,15 @@ class GatewayStartupMixin:
             logger.warning("Crash-left managed /acp turn on %s: not resumed, its answer not redelivered", key)
             with _log_suppressed(logging.WARNING, "Managed marker cleanup failed: %s"):
                 await self.async_session_store.clear_turn_active(key, token)
+        # A marker whose turn a stored owner message answers for stays with that record.
+        inbound = {}
+        with _log_suppressed(logging.WARNING, "Reading the stored messages' turn markers failed: %s"):
+            inbound = await self._inbound_turn_markers()
         with _log_suppressed(logging.WARNING, "Crash-left reply recovery on startup failed: %s"):
-            ledgered += await self._ledger_crash_left_replies(max_age, held=held)
+            ledgered += await self._ledger_crash_left_replies(max_age, held={**held, **inbound})
         with _log_suppressed(logging.WARNING, "Exact active-turn recovery on startup failed: %s"):
             resumed = await self.async_session_store.recover_interrupted_turns(
-                max_age_seconds=max_age, hold_tokens=frozenset(held))
+                max_age_seconds=max_age, hold_tokens=frozenset(held) | frozenset(inbound))
         return resumed, ledgered
 
     async def _ledger_managed_chain_followup(self, key: str, token: str) -> bool:

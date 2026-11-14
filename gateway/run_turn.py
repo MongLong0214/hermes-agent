@@ -176,9 +176,19 @@ def _inbound_row_metadata(event: Any) -> dict:
     if not (isinstance(recovery_id, str) and recovery_id):
         return {}
     absorbed = [rid for rid in absorbed or () if isinstance(rid, str) and rid and rid != recovery_id]
-    run = getattr(event, "_inbound_run", 0)  # a rerun after a restart (gateway/run_startup.py, _inbound_run_for)
+    run = getattr(event, "_inbound_run", 0)  # fixed before admission (run_startup.py, _allocate_inbound_run)
     return {"inbound_recovery_id": recovery_id, **({"inbound_absorbed_ids": absorbed} if absorbed else {}),
             **({"inbound_run": run} if isinstance(run, int) and run > 0 else {})}
+
+
+def _inbound_owes_nothing(event: Any) -> None:
+    """The turn of *event* completed and owes no reply (a muted wake, intentional silence, a result a
+    newer run superseded, a refusal before the run): the explicit end that lets the settlement boundary
+    release its message's inbound records (gateway/run_inbound.py, INBOUND_NO_REPLY). An empty reply
+    without it proves nothing and keeps them."""
+    from gateway.run_inbound import INBOUND_NO_REPLY
+    if event is not None:
+        event._inbound_outcome = INBOUND_NO_REPLY
 
 
 def _inbound_answer_ref_of(row_metadata: Any) -> Optional[str]:
@@ -2007,11 +2017,13 @@ class GatewayTurnMixin:
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
         if diagnostic_wake_muted(event):
+            _inbound_owes_nothing(event)
             return None
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
             response = ""
+            _inbound_owes_nothing(event)
 
         adapter = self._delivery_adapter_for(source)
         # Auto voice reply (TTS audio before the text) unless streaming TTS already delivered audio.
@@ -2040,9 +2052,32 @@ class GatewayTurnMixin:
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):
                 event._streamed_final_response = str(response or "")
+            await self._record_streamed_inbound_answer(event, source, session_key, response)
             return None
 
         return response
+
+    async def _record_streamed_inbound_answer(self, event, source, session_key, response) -> None:
+        """The stream consumer confirmed the final reply of an owner message's turn reached the chat:
+        that delivery goes into the ledger under the reply's obligation (delivery_ledger.record_delivered),
+        so the settlement boundary reads it back delivered like a ledgered send (gateway/run_inbound.py,
+        _settle_inbound). A failed write leaves no proof, and the records stay for the next start."""
+        answer_ref = getattr(event, "_inbound_answer_ref", None)
+        if not answer_ref:
+            return
+        from gateway.delivery_ledger import InboundObligation, ledger_enabled, record_delivered
+        proof = InboundObligation.to(session_key, answer_ref, source)
+        try:
+            if await asyncio.to_thread(ledger_enabled):
+                await asyncio.to_thread(
+                    record_delivered, obligation_id=proof.obligation_id, session_key=session_key,
+                    platform=proof.platform, chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
+                    content=str(response or ""))
+        except Exception:
+            logger.warning("Recording a streamed reply as delivered failed; its inbound record stays",
+                           exc_info=True)
+            return
+        event._inbound_outcome = "streamed"
 
     # Chat-side next steps keyed by HTTP status; Hermes commands only (/login is the gateway's own
     # sign-in, `{relogin}` the profile-aware host equivalent, filled from the turn's agent provider).
@@ -2056,6 +2091,10 @@ class GatewayTurnMixin:
     async def _hmwa_agent_error_reply(self, e, event, source, session_entry, session_key, prepared):
         """``except Exception`` body of the agent turn: stop typing, log, persist the inbound user
         turn once and close it, and build the sanitized user-facing error reply."""
+        if getattr(e, "_inbound_answer_ref", None) is not None:
+            # A queued chain raised past an answer it had already sent: the notice is owed under the
+            # follow-up it failed on ("" when that follow-up has no record: owed under none).
+            event._inbound_answer_ref = e._inbound_answer_ref or None
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)
@@ -2347,6 +2386,10 @@ class GatewayTurnMixin:
         if "queued_terminal_inbound_id" in agent_result:
             # The chain's final is owed under its last message's inbound record, when it has one.
             event._inbound_answer_ref = agent_result.get("queued_terminal_inbound_record")
+        if agent_result.get("inbound_settle_groups"):
+            # The records of the follow-ups the chain ran, each group owed its own follow-up's answer.
+            event._inbound_groups = [*(getattr(event, "_inbound_groups", None) or ()),
+                                     *agent_result["inbound_settle_groups"]]
         if "queued_terminal_inbound_id" in agent_result and getattr(event, "_acp_admission", None) is not None:
             # A follow-up ran (with or without a platform id: a leftover steer has none), so the outer
             # final answers that follow-up, not the managed /acp task. It must never carry, and so
@@ -2374,6 +2417,7 @@ class GatewayTurnMixin:
 
         resolved = await self._hmwa_resolve_session(event, source)
         if resolved is None:
+            _inbound_owes_nothing(event)  # refused before the run
             return
         source, session_entry, session_key = resolved
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
@@ -2381,6 +2425,8 @@ class GatewayTurnMixin:
         )
         if not isinstance(prepared, self._PreparedTurn):
             await self._acp_release_failed_turn(event)  # a refusal before the run is never the answer
+            if not prepared:
+                _inbound_owes_nothing(event)
             return prepared
         history, message_text = prepared.history, prepared.message_text
 
@@ -2400,15 +2446,16 @@ class GatewayTurnMixin:
             # (a /new may move session_entry.session_id while the old run is still unwinding).
             from gateway.run_heartbeat_acceptance import heartbeat_owner_is_current
             if not heartbeat_owner_is_current(self, event, session_key):
+                _inbound_owes_nothing(event)
                 return
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
             # Admission/typing is not execution. All routing, authorization and
             # turn preparation gates have passed when the agent runner is entered.
             event._heartbeat_execution_started = True
+            # The reply's obligation (``_inbound_answer_ref``) was fixed with the run at the claim
+            # (gateway/run_inbound.py), before agent:start above and before any error reply.
             _row_inbound = _inbound_row_metadata(event)
-            if _row_inbound:  # the reply is owed under this run of the row's record (run_inbound.py)
-                event._inbound_answer_ref = _inbound_answer_ref_of(_row_inbound)
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -2438,6 +2485,7 @@ class GatewayTurnMixin:
 
             if not self._is_session_run_current(_quick_key, run_generation):
                 self._hmwa_discard_stale_result(source, _quick_key, run_generation)
+                _inbound_owes_nothing(event)  # superseded by a newer run of the session
                 return None
 
             response, _intentional_silence, agent_messages = await self._hmwa_shape_agent_response(
@@ -4006,11 +4054,11 @@ class GatewayTurnMixin:
         self, turn_ctx: TurnContext, adapter: Any, response: Any, result: Any, stream_task: Any,
     ) -> bool:
         """Deliver the first response before a queued follow-up runs, unless streaming already did.
-        Returns whether that answer is settled: nothing was to be sent, it was delivered, or its
-        obligation is in the delivery ledger. False when its send raised or was refused with no ledger
-        row: its message's inbound records must then stay for the next start."""
+        Returns whether its text reached the chat. A message with an inbound record is owed under its
+        record and run; its records are settled by that obligation (gateway/run_inbound.py,
+        _settle_inbound)."""
         if turn_ctx.mute_notification_reply:
-            return True
+            return False
         session_key = turn_ctx.session_key
         _sc = turn_ctx.stream_consumer_holder[0]
         if _sc and stream_task:
@@ -4086,28 +4134,7 @@ class GatewayTurnMixin:
                 _bg_result = _bg_cb()
                 if inspect.isawaitable(_bg_result):
                     await _bg_result
-        return not first_response or _text_delivered or (
-            _row_ref is not None and await self._inbound_answer_ledgered(turn_ctx, _row_ref))
-
-    async def _inbound_answer_ledgered(self, turn_ctx: TurnContext, answer_ref: str) -> bool:
-        """The first response's obligation, under *answer_ref*, is in the delivery ledger."""
-        from gateway.delivery_ledger import inbound_obligation_id, ledger_enabled, obligation_exists
-        source = turn_ctx.source
-        try:
-            return await asyncio.to_thread(ledger_enabled) and await asyncio.to_thread(
-                obligation_exists, inbound_obligation_id(
-                    turn_ctx.session_key, answer_ref, platform=str(getattr(source.platform, "value", source.platform)),
-                    chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None)))
-        except Exception:
-            logger.warning("Reading the first response's delivery obligation failed", exc_info=True)
-            return False
-
-    def _keep_inbound_records(self, recovery_ids: list) -> None:
-        """An answer that was neither ledgered nor delivered: its message's records stay on disk for the
-        next start, which delivers the stored answer or runs the message again. They still ride the
-        turn's event, so nothing in this process deletes them (gateway/run_inbound.py,
-        _inbound_records_owed)."""
-        self._inbound_records_owed().update(recovery_ids)
+        return bool(first_response) and bool(_text_delivered)
 
     async def _run_agent_queued_followup(
         self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,
@@ -4145,17 +4172,17 @@ class GatewayTurnMixin:
 
         # Interrupted: discard the response ("Operation interrupted." is noise).
         if not result.get("interrupted"):
-            _settled = await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
-            # This level's message has its answer delivered or handed to the delivery ledger: its inbound
-            # record, and those of the messages folded into it, are done before the follow-up runs. An
-            # answer neither ledgered nor delivered keeps them for the next start.
+            _sent = await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
+            # This level's message, and those folded into it, are answered by that first response: their
+            # records go now if its obligation reads back delivered (gateway/run_inbound.py,
+            # _settle_inbound), and otherwise stay; the turn's end tries them again with the same proof.
             _row = getattr(turn_ctx, "persist_user_display_metadata", None) or {}
-            _done = [rid for rid in (_row.get("inbound_recovery_id"), *(_row.get("inbound_absorbed_ids") or ())) if rid]
-            if _settled:
-                for _rid in _done:
-                    self._consume_inbound_record_id(_rid)
-            else:
-                self._keep_inbound_records(_done)
+            _row_ref = _inbound_answer_ref_of(_row)
+            if _row_ref:
+                from gateway.delivery_ledger import InboundObligation
+                await self._settle_inbound(
+                    [_row.get("inbound_recovery_id"), *(_row.get("inbound_absorbed_ids") or ())],
+                    InboundObligation.to(session_key, _row_ref, source, sent=_sent))
 
         updated_history = result.get("messages", history)
         next_source, next_message, next_session_key = source, pending, session_key
@@ -4265,18 +4292,24 @@ class GatewayTurnMixin:
         await _run_followup_processing_hook(
             _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
         # The drained message's own turn has ended, unless a restart cut that turn short (its record then
-        # stays for the next process, as the outer turn's would). Its answer is the final the adapter
-        # sends once the outer turn returns, so its records ride the outer turn's event and go with
-        # them, once that reply is in the delivery ledger (run_inbound.py, _settle_inbound_record).
+        # stays for the next process, as the outer turn's would). Its records go back up the chain in the
+        # result as a group of their own, owed this follow-up's answer (its row's record and run): the
+        # outer turn hands them to the adapter (_adopt_queued_terminal, run_inbound.py,
+        # _settle_inbound_record), which settles them once that answer reads back delivered, the chain's
+        # final or the first response a deeper follow-up was sent after.
         from gateway.run import _should_clear_resume_pending_after_turn
-        from gateway.shutdown_flush import carry_inbound_records
-        if not (self._draining and not _should_clear_resume_pending_after_turn(followup_result)):
-            _outer = getattr(getattr(self._peek_session_state(session_key), "turn", None), "event", None)
-            if _outer is not None and _outer is not pending_event:
-                carry_inbound_records(_outer, pending_event)
-            else:
-                self._discard_inbound_records(pending_event)
+        from gateway.shutdown_flush import inbound_record_ids
+        _followup_ids, _group = inbound_record_ids(pending_event), None
+        _followup_ref = _inbound_answer_ref_of(_inbound_row_metadata(pending_event))
+        if _followup_ids and not (self._draining and not _should_clear_resume_pending_after_turn(followup_result)):
+            _group = (_followup_ref, _followup_ids)
+            pending_event._inbound_absorbed = True
+            pending_event._inbound_record_id = pending_event._inbound_record_order = None
+            pending_event._inbound_carried = []
         merged = _preserve_queued_followup_history_offset(result, followup_result)
+        if _group is not None and isinstance(merged, dict):
+            _deeper = followup_result.get("inbound_settle_groups") if isinstance(followup_result, dict) else None
+            merged = {**merged, "inbound_settle_groups": [*(_deeper or ()), _group]}
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal
         # reply is recorded under the first message's id, so a first reply that was refused (flood
@@ -4287,7 +4320,7 @@ class GatewayTurnMixin:
             merged = {
                 **merged,
                 "queued_terminal_inbound_id": next_inbound_id,
-                "queued_terminal_inbound_record": _inbound_answer_ref_of(_inbound_row_metadata(pending_event)),
+                "queued_terminal_inbound_record": _followup_ref,
                 "queued_terminal_display_kind": next_display_kind,
                 "queued_terminal_notification_category": (
                     (pending_event.metadata or {}).get("notification_category", "result")
@@ -4689,9 +4722,19 @@ class GatewayTurnMixin:
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
             pending_event, pending = await self._run_agent_next_followup(turn_ctx, result, adapter, source, session_key)
             if pending_event or pending:
-                return await self._run_agent_queued_followup(
-                    turn_ctx, adapter, pending, pending_event, response, result, stream_task,
-                )
+                try:
+                    return await self._run_agent_queued_followup(
+                        turn_ctx, adapter, pending, pending_event, response, result, stream_task,
+                    )
+                except BaseException as exc:
+                    # This level's answer was already sent (or attempted) and owed under its own record:
+                    # whatever the turn sends for a chain that raised past it (its error notice) answers
+                    # the follow-up, never this message, so it cannot take over this message's
+                    # obligation (gateway/run_inbound.py, the settlement boundary).
+                    if getattr(exc, "_inbound_answer_ref", None) is None:
+                        with suppress(Exception):
+                            exc._inbound_answer_ref = _inbound_answer_ref_of(_inbound_row_metadata(pending_event)) or ""
+                    raise
         finally:
             await self._run_agent_cleanup_turn_tasks(
                 turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,

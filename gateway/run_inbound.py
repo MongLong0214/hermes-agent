@@ -39,6 +39,12 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# Explicit ends of an owner message that owe no reply (the settlement boundary, _settle_inbound_records):
+# a turn that completed with nothing to send, and a message no turn will answer (refused, a command,
+# dropped from its queue by /stop, /new or /reset). Never derived from a failed or empty lookup.
+INBOUND_NO_REPLY = "inbound:no_reply"
+INBOUND_DROPPED = "inbound:dropped"
+
 
 def discord_triggering_note(message_id: Any) -> str:
     """Model-facing routing note for a Discord turn (rides the API-bound user message only)."""
@@ -1383,9 +1389,12 @@ class GatewayInboundMixin:
 
         # The adapter stored the owner message when it arrived (it keeps the record while queued); one
         # that reaches this turn another way is stored here, off the loop, before the claim below. From the claim
-        # until its turn ends the inbound record is the copy that outlives a restart. Internal events
-        # and /acp tasks get none (neither is re-run as owner input).
+        # until its reply is proven delivered the inbound record is the copy that outlives a restart.
+        # Internal events and /acp tasks get none (neither is re-run as owner input), and neither does a
+        # turn no adapter delivers (``_turn_marker_handoff`` unset: a nested /retry, a direct caller):
+        # only an adapter's delivery can prove its reply delivered (_settle_inbound).
         if (not is_internal and not _acp_managed and not getattr(_incoming, "_inbound_record_id", None)
+                and getattr(_incoming, "_turn_marker_handoff", False)
                 and not await self._store_inbound_record(_incoming, _quick_key)):
             return self._INBOUND_RECORD_REFUSED
         if not _acp_managed and _reservation is None:
@@ -1431,14 +1440,19 @@ class GatewayInboundMixin:
                     event._inbound_record_claimed = True
         # The transcript's user row for this turn names its record and the records folded into it before
         # the turn, which is how a restart tells them answered (gateway/run_startup.py,
-        # _inbound_record_answer). The turn's reply is owed under the record the row names, or under a
-        # chained follow-up's when the turn ends on one (run_turn.py, _adopt_queued_terminal).
+        # _inbound_record_answer). The turn's reply is owed under the record the row names and the run
+        # the record admitted (fixed in the record before admission: gateway/run_startup.py,
+        # _allocate_inbound_run), or under a chained follow-up's when the turn ends on one (run_turn.py,
+        # _adopt_queued_terminal). Both are fixed here, before the turn's hooks, its execution and any
+        # error reply, so every reply of this run (an error notice too) is owed under this run.
+        from gateway.delivery_ledger import inbound_answer_ref
         event._inbound_row_id = getattr(_settled_event, "_inbound_record_id", None)
         event._inbound_row_absorbed = list(getattr(_settled_event, "_inbound_carried", ()))
-        # A rewritten event (a pre-dispatch hook) has none of these private attributes, so the run of a
-        # re-admitted message (gateway/run_startup.py, _inbound_run_for) is carried over with them.
+        # A rewritten event (a pre-dispatch hook) has none of these private attributes, so they are
+        # carried over from the event whose record this turn settles.
         event._inbound_run = getattr(_settled_event, "_inbound_run", 0)
-        event._inbound_answer_ref = event._inbound_row_id
+        event._inbound_answer_ref = event._inbound_row_ref = (
+            inbound_answer_ref(event._inbound_row_id, event._inbound_run) if event._inbound_row_id else None)
 
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:
@@ -1487,21 +1501,22 @@ class GatewayInboundMixin:
             # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.
             self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
             try:
-                # Record before marker: a death between the two leaves the marker, whose recovery
-                # already covers a turn that ended (gateway/run_startup.py, _recover_unclean_sessions).
-                # The adapter ledgers the reply under the record it answers and deletes the records
-                # once that obligation exists (platforms/base.py, _release_turn_marker).
+                # The adapter ledgers the reply under the record and run it answers, and its records
+                # and marker go only once that obligation reads back delivered (platforms/base.py,
+                # _release_turn_marker, through _settle_inbound).
                 _incoming._inbound_ledger_ref = getattr(event, "_inbound_answer_ref", None)
-                _stored = (frozenset() if _turn_ended
-                           else await self._inbound_answers_stored(_quick_key, _settled_event, event))
-                self._settle_inbound_record(_settled_event, _quick_key, completed=_turn_ended, also=event,
-                                            delivery=_incoming, answered=_stored)
+                if event is not _incoming:
+                    _incoming._inbound_outcome = getattr(event, "_inbound_outcome", None)
+                _kept = self._settle_inbound_record(_settled_event, _quick_key, completed=_turn_ended,
+                                                    also=event, delivery=_incoming)
                 # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean
                 # startup's recovery pass. A turn the adapter delivers hands its marker to that
-                # lifecycle, which clears it only once the reply is in the delivery ledger (else a
-                # kill in between left neither marker nor ledger row and the persisted reply was
-                # never sent).
-                if not getattr(event, "_turn_marker_handoff", False):
+                # lifecycle, which clears it only once the reply is proven delivered (else a kill in
+                # between left neither marker nor ledger row and the persisted reply was never sent).
+                # A turn whose records stay keeps its marker with them.
+                if _kept:
+                    self._let_go_of_turn_marker(event)
+                elif not getattr(event, "_turn_marker_handoff", False):
                     await self._clear_durable_active_turn(event)
             finally:
                 # A cancellation landing in the await above (/stop or shutdown while the marker CAS
@@ -1541,10 +1556,12 @@ class GatewayInboundMixin:
         from gateway.session_identity import transport_profile_of
         recovery_id = getattr(event, "_inbound_record_id", None) or uuid.uuid4().hex
         order = getattr(event, "_inbound_record_order", None) or shutdown_flush.next_inbound_order()
+        run = getattr(event, "_inbound_run", 0)
         try:
             await asyncio.to_thread(
                 shutdown_flush.store_inbound_record, event, session_key=session_key,
-                transport_profile=transport_profile_of(event.source), recovery_id=recovery_id, order=order)
+                transport_profile=transport_profile_of(event.source), recovery_id=recovery_id, order=order,
+                run=run if isinstance(run, int) else 0)
         except Exception as exc:
             logger.warning("Could not store the inbound record for %s, so the message is refused before "
                            "it is accepted or claimed: %s", session_key, exc)
@@ -1555,19 +1572,19 @@ class GatewayInboundMixin:
         return True
 
     def _settle_unclaimed_inbound(self, event: Optional[MessageEvent], *, ended: bool) -> None:
-        """A message whose record was stored on arrival left the inbound path with no turn
-        claiming it. Its record is deleted only when its handling is done: refused, or a command. It is
-        kept while the message waits in its queue (until its own turn settles it), when it was merged,
-        replaced or steered (the absorbing turn settles it), and when a restart cut it off before its
-        claim (``ended`` False while draining)."""
+        """A message whose record was stored on arrival left the inbound path with no turn claiming it.
+        Its record goes only when its handling is done, refused or a command (``INBOUND_DROPPED``:
+        nothing will answer it). It stays while the message waits in its queue (its own turn settles
+        it), when it was merged, replaced or steered (the absorbing turn settles it), and whenever the
+        inbound path raised or was cancelled before deciding (``ended`` False): the next start judges it."""
         recovery_id = getattr(event, "_inbound_record_id", None)
         if (not recovery_id or getattr(event, "_inbound_record_claimed", False)
                 or getattr(event, "_inbound_absorbed", False)):
             return
         try:
-            if not ended and self._draining:
-                logger.info("A restart cut off a message before its claim; its inbound record stays for "
-                            "the next process")
+            if not ended:
+                logger.info("A message left the inbound path before a turn claimed it; its inbound record "
+                            "stays for the next process")
                 return
             if self._event_is_queued(getattr(event, "_inbound_record_key", None) or "", event):
                 return
@@ -1575,18 +1592,91 @@ class GatewayInboundMixin:
         except Exception:
             logger.warning("Settling an unclaimed inbound record failed", exc_info=True)
 
-    def _discard_inbound_records(self, event: Optional[MessageEvent], keep: Any = ()) -> None:
-        """Delete every record *event* answers for (its own and those folded into it), except those in
-        *keep* and those whose answer is still owed (``_inbound_records_owed``); the event lets go of
-        them all."""
+    def _discard_inbound_records(self, event: Optional[MessageEvent]) -> None:
+        """No turn will answer *event* (dropped from its queue by /stop, /new or /reset, refused, or a
+        command): its records (its own and those folded into it) are settled as ``INBOUND_DROPPED``,
+        and the event lets go of them."""
         from gateway import shutdown_flush
-        keep = {*keep, *self._inbound_records_owed()}
-        for recovery_id in shutdown_flush.inbound_record_ids(event):
-            if recovery_id not in keep:
-                shutdown_flush.discard_inbound_record(recovery_id)
-        if event is not None:
+        if (self._settle_inbound_records(shutdown_flush.inbound_record_ids(event), INBOUND_DROPPED)
+                and event is not None):
             event._inbound_record_id = event._inbound_record_order = None
             event._inbound_carried = []
+
+    # ── The settlement boundary ──────────────────────────────────────────────────────────────────────
+    # The only code that deletes an owner message's inbound record (and, for its turn, the active-turn
+    # marker) is _settle_inbound_records / _settle_inbound below, and only on positive proof: the
+    # obligation of that exact input, run and destination reads back ``delivered`` in the delivery
+    # ledger, or the caller states an explicit end that owes nothing (``INBOUND_NO_REPLY``,
+    # ``INBOUND_DROPPED``). Anything else keeps both: a reply not yet delivered, a partial delivery, a
+    # failed lookup, an exception. The next start reads them back and settles them the same way
+    # (gateway/run_startup.py, _settle_stored_inbound).
+
+    def _inbound_release_proven(self, proof: Any) -> Optional[bool]:
+        """True when *proof* allows releasing the records it settles; False when it does not; None when
+        the ledger could not be read (never taken as either). *proof* is an explicit end
+        (``INBOUND_NO_REPLY``, ``INBOUND_DROPPED``) or a ``delivery_ledger.InboundObligation``: its row
+        must read back ``delivered`` and every required attachment of this reply must have been
+        delivered (``attachments_ok``). With the delivery ledger off nothing can be read back, so this
+        process's own sends of every component of the reply (``sent``) are the proof."""
+        from gateway.delivery_ledger import InboundObligation, ledger_enabled, obligation_state
+        if isinstance(proof, str) and proof in (INBOUND_NO_REPLY, INBOUND_DROPPED):
+            return True
+        if not isinstance(proof, InboundObligation) or not proof.attachments_ok:
+            return False
+        try:
+            if not ledger_enabled():
+                return bool(proof.sent)
+            return obligation_state(proof.obligation_id) == "delivered"
+        except Exception:
+            logger.warning("Reading the delivery obligation of an inbound record failed; the record stays",
+                           exc_info=True)
+            return None
+
+    def _settle_inbound_records(self, record_ids: Any, proof: Any) -> Optional[bool]:
+        """Delete the inbound records *record_ids* when *proof* holds (``_inbound_release_proven``).
+        True when every record is gone; False when the proof does not hold; None when it could not be
+        read, or held but a delete failed (the records left stay for the next start, which settles
+        them the same way). Reads the ledger inline: callers on the event loop pass only explicit ends,
+        or use ``_settle_inbound``."""
+        from gateway import shutdown_flush
+        ids = [rid for rid in dict.fromkeys(record_ids or ()) if isinstance(rid, str) and rid]
+        if not ids:
+            return False
+        proven = self._inbound_release_proven(proof)
+        if not proven:
+            return proven
+        return True if all([shutdown_flush.discard_inbound_record(rid) for rid in ids]) else None
+
+    async def _settle_inbound(self, record_ids: Any, proof: Any, *,
+                              marker_event: Optional[MessageEvent] = None) -> Optional[bool]:
+        """``_settle_inbound_records`` off the event loop, then, when every record is gone, the turn's
+        active-turn marker (*marker_event*'s; else one the startup recovery held for these records,
+        gateway/run_startup.py, _inbound_turn_markers)."""
+        record_ids = list(record_ids or ())
+        settled = await asyncio.to_thread(self._settle_inbound_records, record_ids, proof)
+        if not settled:
+            return settled
+        if marker_event is not None:
+            await self._clear_durable_active_turn(marker_event)
+        for recovery_id in record_ids:
+            held = self._inbound_held_markers().pop(recovery_id, None)
+            if held is not None:
+                with suppress(Exception):
+                    await self.async_session_store.clear_turn_active(*held)
+        return True
+
+    def _inbound_held_markers(self) -> dict:
+        """Recovery id -> (session key, marker token) of a crash-left turn marker the startup recovery
+        left in place because that record's turn left it (gateway/run_startup.py)."""
+        return self.__dict__.setdefault("_inbound_marker_holds", {})
+
+    @staticmethod
+    def _let_go_of_turn_marker(event: Optional[MessageEvent]) -> None:
+        """This process stops owning *event*'s active-turn marker without clearing it: it stays on disk
+        with the turn's inbound records for the next start."""
+        for attr in ("_gateway_active_turn_session_key", "_gateway_active_turn_token"):
+            with suppress(AttributeError):
+                delattr(event, attr)
 
     def _carry_steered_inbound(self, event: MessageEvent, session_key: str) -> None:
         """*event* was steered or redirected into the running turn: its record stays until that turn
@@ -1610,71 +1700,47 @@ class GatewayInboundMixin:
 
     def _settle_inbound_record(self, event: Optional[MessageEvent], session_key: str, *, completed: bool,
                                also: Optional[MessageEvent] = None,
-                               delivery: Optional[MessageEvent] = None, answered: Any = ()) -> None:
+                               delivery: Optional[MessageEvent] = None) -> bool:
         """The turn holding *event*'s inbound record (and the records folded into it or into *also*, the
-        turn's own event) has ended. Cut short by a restart, the records stay for the next process: the
-        turn raised or was cancelled while the gateway drains, or it returned while its session is
-        still resume_pending (the drain marks a running session before it interrupts it, and only a
-        completed turn clears the mark). A turn that returned to an adapter that delivers its reply
-        (*delivery*, the adapter's event, handed the turn marker) hands the records to that delivery:
-        they go only once the reply's obligation is in the delivery ledger or nothing is owed
-        (platforms/base.py, _release_turn_marker), so a death before then leaves the record for the next
-        start to deliver its answer or run it again. Any other end deletes them, except *answered*: a turn
-        that raised or was cancelled after its answer was stored (``_inbound_answers_stored``) never had
-        that answer delivered or ledgered, so those records stay for the next start to deliver it."""
+        turn's own event) has ended. A turn that returned to an adapter that delivers its reply
+        (*delivery*, the adapter's event, handed the turn marker) hands its records to that delivery,
+        grouped by the answer each group is owed (``_inbound_settle_groups``: this turn's row, and each
+        follow-up the turn ran in-band, gateway/run_turn.py): the delivery settles each group through
+        the boundary once its own answer is proven delivered (platforms/base.py, _release_turn_marker).
+        Every other end deletes nothing: a turn that raised or was cancelled, one a restart cut short (it
+        raised while the gateway drains, or returned while its session is still resume_pending), and
+        one no adapter delivers. Their records stay for the next start, which delivers the stored
+        answer or runs the message again. Returns True when records were left on disk unsettled (the
+        caller then keeps the turn marker too), False when there were none or they were handed on."""
         from gateway import shutdown_flush
-        events = [e for e in (event, also) if e is not None and shutdown_flush.inbound_record_ids(e)]
+        events = [e for e in (event, also) if e is not None
+                  and (shutdown_flush.inbound_record_ids(e) or getattr(e, "_inbound_groups", None))]
         if not events or (also is event and len(events) > 1):
             events = events[:1]
         if not events:
-            return
+            return False
         try:
             if self._draining and not (completed and not self._resume_still_pending(session_key)):
                 logger.info("A restart cut the turn on %s short; its inbound record stays for the next "
                             "process", session_key)
-                return
-            if completed and delivery is not None and getattr(delivery, "_turn_marker_handoff", False):
-                owed = [rid for each in events for rid in shutdown_flush.inbound_record_ids(each)]
-                for each in events:
-                    each._inbound_record_id = each._inbound_record_order = None
-                    each._inbound_carried = []
-                delivery._inbound_records_on_delivery = [
-                    *(getattr(delivery, "_inbound_records_on_delivery", None) or ()), *owed]
-                return
-            if answered:
-                logger.info("The turn on %s ended early after its answer was stored; its inbound record "
-                            "stays for the next process to deliver it", session_key)
+                return True
+            if not (completed and delivery is not None and getattr(delivery, "_turn_marker_handoff", False)):
+                logger.info("The turn on %s ended without a delivery that can prove its reply; its inbound "
+                            "record stays for the next process", session_key)
+                return True
+            own = [rid for each in events for rid in shutdown_flush.inbound_record_ids(each)]
+            row_ref = getattr(also if also is not None else event, "_inbound_row_ref", None)
+            groups = [(row_ref, own)] if own else []
             for each in events:
-                self._discard_inbound_records(each, keep=answered)
+                groups.extend(getattr(each, "_inbound_groups", None) or ())
+                each._inbound_groups = []
+                each._inbound_record_id = each._inbound_record_order = None
+                each._inbound_carried = []
+            delivery._inbound_settle_groups = [*(getattr(delivery, "_inbound_settle_groups", None) or ()), *groups]
+            return False
         except Exception:
-            logger.warning("Settling the inbound record of %s failed", session_key, exc_info=True)
-
-    async def _inbound_answers_stored(self, session_key: str, *events: Optional[MessageEvent]) -> frozenset:
-        """The records of *events* whose message's completed answer the transcript already holds
-        (gateway/run_startup.py, _inbound_record_answer). Unreadable counts as stored: the record stays and
-        the next start reads the transcript."""
-        from gateway import shutdown_flush
-        stored = set()
-        for recovery_id in {rid for each in events for rid in shutdown_flush.inbound_record_ids(each)}:
-            try:
-                found = await self._inbound_record_answer({"recovery_id": recovery_id, "session_key": session_key})
-            except Exception:
-                found = True
-            if found:
-                stored.add(recovery_id)
-        return frozenset(stored)
-
-    def _inbound_records_owed(self) -> set:
-        """Records of answers that were neither ledgered nor delivered, which this process must leave on
-        disk for the next start (gateway/run_turn.py, _keep_inbound_records)."""
-        return self.__dict__.setdefault("_inbound_records_kept", set())
-
-    def _consume_inbound_record_id(self, recovery_id: Optional[str]) -> None:
-        """An in-turn follow-up's turn completed, or its answer was handed to the delivery ledger. A
-        record whose answer is still owed (``_inbound_records_owed``) stays."""
-        if recovery_id and recovery_id not in self._inbound_records_owed():
-            from gateway import shutdown_flush
-            shutdown_flush.discard_inbound_record(recovery_id)
+            logger.warning("Settling the inbound record of %s failed; it stays", session_key, exc_info=True)
+            return True
 
     def _resume_still_pending(self, session_key: str) -> bool:
         try:

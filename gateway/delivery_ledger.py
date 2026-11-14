@@ -12,6 +12,7 @@ best-effort: ledger failures must never block a send; callers wrap every call in
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 import os
@@ -286,10 +287,10 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
 
 def inbound_answer_ref(recovery_id: str, run: Any = 0) -> str:
     """The ledger reference of the answer one run of an inbound record's message gave: the record id,
-    with the run's ordinal when the message ran again after a restart. The ordinal is chosen when the
-    record is re-admitted (gateway/run_startup.py, _inbound_run_for) and stamped on the run's user row
-    (``inbound_run``), so it is the same at delivery and at a later recovery, and a rerun's reply never
-    takes over the obligation an earlier run's reply still holds."""
+    with the run's ordinal when the message ran again after a restart. The ordinal is written into the
+    record before the run is admitted (gateway/run_startup.py, _allocate_inbound_run) and stamped on the
+    run's user row (``inbound_run``), so it is the same at delivery and at a later recovery, and a
+    rerun's reply never takes over the obligation an earlier run's reply still holds."""
     return f"{recovery_id}#{run}" if isinstance(run, int) and run > 0 else str(recovery_id)
 
 
@@ -298,26 +299,64 @@ def inbound_obligation_id(session_key: str, answer_ref: str, *, platform: str, c
     """Id of the reply owed to the owner message whose inbound record (gateway/shutdown_flush.py) and
     run *answer_ref* names (``inbound_answer_ref``): that and where the reply goes, never the reply's
     text. Normal delivery (platforms/base.py, _record_delivery_obligation) and startup recovery of an
-    answered record (gateway/run_startup.py, _consume_if_answered) agree on it even when the delivered
+    answered record (gateway/run_startup.py, _owe_stored_answer) agree on it even when the delivered
     text is not the transcript's (a runtime footer added at delivery), and two records answered alike
     stay two."""
     return compute_obligation_id(session_key, f"inbound:{answer_ref}|{platform}|{chat_id}|{thread_id or ''}", "")
 
 
-def obligation_exists(obligation_id: str) -> bool:
+@dataclasses.dataclass(frozen=True)
+class InboundObligation:
+    """The reply one run of one owner message owes one destination (``inbound_obligation_id``), with what
+    this process saw of its delivery: the proof the settlement boundary reads back before it deletes the
+    message's inbound record (gateway/run_inbound.py, _settle_inbound_records). ``attachments_ok``: every
+    attachment the reply requires was delivered (False when one was not). ``sent``: every send of the reply
+    succeeded here, the only proof there is with the ledger off."""
+    session_key: str
+    answer_ref: str
+    platform: str
+    chat_id: Any
+    thread_id: Any = None
+    attachments_ok: bool = True
+    sent: bool = False
+
+    @classmethod
+    def to(cls, session_key: str, answer_ref: str, source: Any, **outcome: Any) -> "InboundObligation":
+        return cls(session_key, str(answer_ref), str(getattr(source.platform, "value", source.platform)),
+                   source.chat_id, getattr(source, "thread_id", None), **outcome)
+
+    @property
+    def obligation_id(self) -> str:
+        return inbound_obligation_id(self.session_key, self.answer_ref, platform=self.platform,
+                                     chat_id=self.chat_id, thread_id=self.thread_id)
+
+
+def obligation_state(obligation_id: str) -> Optional[str]:
+    """The obligation's state read back from the ledger (``pending``, ``attempting``, ``failed``,
+    ``delivered``, ``abandoned``), or None when there is no such row. Raises when the ledger cannot be
+    read: a failed read is never "no row"."""
     with _DB_LOCK, _transaction() as conn:
-        return conn.execute("SELECT 1 FROM delivery_obligations WHERE obligation_id=?",
-                            (obligation_id,)).fetchone() is not None
+        row = conn.execute("SELECT state FROM delivery_obligations WHERE obligation_id=?",
+                           (obligation_id,)).fetchone()
+    return None if row is None else str(row[0])
+
+
+class ObligationTaken(RuntimeError):
+    """The obligation id already holds another reply (``record_obligation(replace=False)``)."""
 
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
                       thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
-                      acp_update_id: Optional[str] = None) -> None:
-    """Record a final response as owed to the platform (state='pending')."""
+                      acp_update_id: Optional[str] = None, replace: bool = True) -> None:
+    """Record a final response as owed to the platform (state='pending'). ``replace=False`` is for an
+    id that names the input, run and destination rather than the text (``inbound_obligation_id``): an
+    existing row is never replaced, so a later reply (an error notice, a retry) cannot take over an
+    earlier answer's row, delivered or not. The same text again leaves the row as it is; another text
+    raises ``ObligationTaken`` and records nothing."""
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO delivery_obligations
+            f"""INSERT OR {'REPLACE' if replace else 'IGNORE'} INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at, adapter_profile, acp_update_id)
@@ -325,8 +364,29 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
              content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default",
              str(acp_update_id) if acp_update_id is not None else None))
+        if not replace:
+            held = conn.execute("SELECT content FROM delivery_obligations WHERE obligation_id=?",
+                                (obligation_id,)).fetchone()
+            if held is None or held[0] != content:
+                raise ObligationTaken(f"obligation {obligation_id} already holds another reply")
         # Same transaction, same connection: the cron ledgers prune this way too
         # (cron/delivery_queue._prune_terminal_unlocked, cron/executions._prune_unlocked).
+        _prune_unlocked(conn, now)
+
+
+def record_delivered(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
+                     thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
+    """Record a reply that reached the chat without a ledgered send (a stream whose final delivery
+    the consumer confirmed) as 'delivered' under *obligation_id*. An existing row is left as it is."""
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO delivery_obligations
+               (obligation_id, session_key, platform, chat_id, thread_id,
+                content, state, attempts, created_at, updated_at, adapter_profile)
+               VALUES (?, ?, ?, ?, ?, ?, 'delivered', 1, ?, ?, ?)""",
+            (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
+             content, now, now, str(adapter_profile).strip() if adapter_profile else "default"))
         _prune_unlocked(conn, now)
 
 

@@ -86,6 +86,8 @@ def transcode_to_ogg_opus(path: str, *, bitrate: str = "32k", timeout: int = 60,
         os.unlink(work_path)
     return None
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+# ``_release_turn_marker`` called without the final reply's outcome (its delivery raised or was cancelled).
+_NO_OUTCOME = object()
 # History dedup is best-effort: stay well below the Discord heartbeat watchdog and fail open.
 _HISTORY_MEDIA_LOOKUP_TIMEOUT_SECONDS = 5.0
 # Timed-out reads can't be cancelled mid-SQLite: cap the isolated threads so wedged lookups
@@ -4269,7 +4271,7 @@ class BasePlatformAdapter(ABC):
             return None
         try:
             from gateway.delivery_ledger import (
-                compute_obligation_id, inbound_obligation_id, ledger_enabled, mark_attempting,
+                ObligationTaken, compute_obligation_id, inbound_obligation_id, ledger_enabled, mark_attempting,
                 record_obligation)
             if not await asyncio.to_thread(ledger_enabled):
                 return None
@@ -4283,7 +4285,7 @@ class BasePlatformAdapter(ABC):
             # The reply to an owner message that has an inbound record (the adapter's final, or the
             # queued lane's under ``inbound:<recovery id>``, gateway/run_turn.py) is owed under that
             # record and its destination, the identity startup recovery owes an answered record under
-            # (gateway/run_startup.py, _consume_if_answered), never the platform message id or the text:
+            # (gateway/run_startup.py, _owe_stored_answer), never the platform message id or the text:
             # a record still on disk after this obligation (its delete failed) is then recognised as
             # owed and never sent again, even when this text carries what the transcript lacks.
             _inbound_ref = getattr(event, "_inbound_ledger_ref", None) or (
@@ -4299,12 +4301,20 @@ class BasePlatformAdapter(ABC):
                     # id, or a same-text reply would overwrite that row and erase its ACP correlation.
                     _ledger_id = f"{_ledger_id or ''}#not-acp"
                 obligation_id = compute_obligation_id(session_key, str(_ledger_id or ""), text_content)
-            await asyncio.to_thread(
-                record_obligation, obligation_id=obligation_id, session_key=session_key,
-                platform=platform, chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
-                content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
-                acp_update_id=_acp.update_id if _acp is not None else None)
+            # An inbound obligation is insert-only: a later reply of the same input, run and destination
+            # (an error notice, a retry) never takes over the row of an earlier answer, delivered or not.
+            try:
+                await asyncio.to_thread(
+                    record_obligation, obligation_id=obligation_id, session_key=session_key,
+                    platform=platform, chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
+                    content=text_content,
+                    adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
+                    acp_update_id=_acp.update_id if _acp is not None else None,
+                    **({"replace": False} if _inbound_ref else {}))
+            except ObligationTaken:
+                logger.warning("[%s] An earlier reply already holds this message's delivery obligation; "
+                               "this one is sent unledgered", self.name)
+                return None
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
@@ -4436,42 +4446,97 @@ class BasePlatformAdapter(ABC):
             # the row unrecorded, the answer is withheld, the receipt is aborted as a definite
             # non-delivery, and the owner is told plainly — no unaccounted managed delivery.
             return await self._withhold_unrecorded_acp_answer(event, delivery_adapter, reply_to, metadata)
-        if obligation_id is not None:
-            await self._release_turn_marker(event)  # the ledger now owns the crash recovery
+        if obligation_id is not None and not getattr(event, "_inbound_settle_groups", None):
+            # The ledger now owns the crash recovery. A turn holding inbound records keeps its marker
+            # until its reply reads back delivered (_release_turn_marker, through the runner's boundary).
+            await self._release_turn_marker(event)
         result = await delivery_adapter._send_with_retry(
             chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
         return result, delivery_adapter
 
-    async def _release_turn_marker(self, event: MessageEvent, *, owed: bool = False) -> None:
+    async def _release_turn_marker(self, event: MessageEvent, *, owed: bool = False,
+                                   final: Any = _NO_OUTCOME, session_key: Optional[str] = None) -> None:
         """Clear the crash-recovery state the runner handed to this delivery lifecycle: the turn
-        marker (``_turn_marker_handoff``) and the turn's inbound records
-        (``_inbound_records_on_delivery``, gateway/run_inbound.py, _settle_inbound_record). Only once
-        the final reply is ledgered, delivered, or nothing more is owed, so no kill leaves a persisted
-        reply with neither marker, record nor ledger row. ``owed``: the reply was neither ledgered nor
-        delivered (its delivery raised or was cancelled, or every send failed with no ledger row), so
-        the marker and the records stay on disk for the next start, which delivers the stored answer
-        or runs the message again; this lifecycle only lets go of them. Idempotent."""
+        marker (``_turn_marker_handoff``) and, for an owner message's turn, its inbound records
+        (``_inbound_settle_groups``, gateway/run_inbound.py, _settle_inbound_record). Those records and
+        that marker go only through the runner's settlement boundary (_settle_inbound): each group of
+        records once its own answer is proven, *final* for the group the final reply answers
+        (``_inbound_ledger_ref``: a ``delivery_ledger.InboundObligation`` that must read back delivered,
+        or an explicit end that owes nothing; None proves nothing), the group's own obligation for any
+        other. The marker goes only with every group; whatever is not proven stays on disk for the next
+        start, and this lifecycle only lets go of it. Without *final* (the delivery raised or was
+        cancelled) nothing is settled. A turn without inbound records clears its marker once the final is ledgered, delivered or
+        nothing more is owed; ``owed`` (its reply was neither ledgered nor delivered) keeps it.
+        Idempotent."""
+        groups = getattr(event, "_inbound_settle_groups", None)
+        if groups:
+            event._inbound_settle_groups = []
+            released = final is not _NO_OUTCOME
+            if released:
+                from gateway.delivery_ledger import InboundObligation
+                final_ref = getattr(event, "_inbound_ledger_ref", None)
+                for answer_ref, record_ids in groups:
+                    if answer_ref is not None and answer_ref == final_ref:
+                        proof = final
+                    elif answer_ref is not None:
+                        proof = InboundObligation.to(session_key or self._event_session_key(event), answer_ref,
+                                                     event.source)
+                    else:
+                        proof = None  # no answer names these records: nothing can prove them answered
+                    released = bool(await self.gateway_runner._settle_inbound(record_ids, proof)) and released
+            if released and getattr(event, "_turn_marker_handoff", False) \
+                    and getattr(event, "_gateway_active_turn_token", None):
+                await self.gateway_runner._clear_durable_active_turn(event)
+            else:
+                owed = True
         if owed:
-            event._inbound_records_on_delivery = []
             for attr in ("_gateway_active_turn_session_key", "_gateway_active_turn_token"):
                 with contextlib.suppress(AttributeError):
                     delattr(event, attr)
             return
         if getattr(event, "_turn_marker_handoff", False) and getattr(event, "_gateway_active_turn_token", None):
             await self.gateway_runner._clear_durable_active_turn(event)
-        records = getattr(event, "_inbound_records_on_delivery", None)
-        if records:
-            event._inbound_records_on_delivery = []
+
+    async def _final_reply_proof(self, event: MessageEvent, session_key: str, response: Any, *,
+                                 text_content: str = "", caption_delivered: bool = False,
+                                 sent: bool = False, failed: bool = False) -> Any:
+        """What settles the inbound records of the answer this turn's final reply gives
+        (``_inbound_ledger_ref``): for a reply, its obligation, which the boundary reads back from the
+        delivery ledger (``failed``: one of its components, text or attachment, was not delivered, so
+        it is not proven whatever the ledger says; ``sent``: every send succeeded, the proof with the
+        ledger off); for no reply, the explicit end the turn declared (``_inbound_outcome``: nothing
+        owed, or a stream that delivered it, gateway/run_turn.py). None, which proves nothing, when the
+        turn declared neither."""
+        from gateway.delivery_ledger import InboundObligation
+        from gateway.run_inbound import INBOUND_NO_REPLY
+        answer_ref = getattr(event, "_inbound_ledger_ref", None)
+        if not response:
+            outcome = getattr(event, "_inbound_outcome", None)
+            if outcome == INBOUND_NO_REPLY:
+                return INBOUND_NO_REPLY
+            if outcome == "streamed" and answer_ref:  # the consumer confirmed it (gateway/run_turn.py)
+                return InboundObligation.to(session_key, answer_ref, event.source, sent=True)
+            return None
+        if not answer_ref:
+            return None
+        proof = InboundObligation.to(session_key, answer_ref, event.source, attachments_ok=not failed,
+                                     sent=sent and not failed)
+        if caption_delivered and text_content and not failed:
+            # The text rode a voice reply's caption, not a ledgered send: the caption's success is the
+            # delivery the ledger records.
+            from gateway.delivery_ledger import ledger_enabled, record_delivered
             try:
-                # The runner keeps those of an earlier answer of the chain that was neither ledgered nor
-                # delivered (gateway/run_inbound.py, _consume_inbound_record_id).
-                for recovery_id in records:
-                    self.gateway_runner._consume_inbound_record_id(recovery_id)
+                if await asyncio.to_thread(ledger_enabled):
+                    await asyncio.to_thread(
+                        record_delivered, obligation_id=proof.obligation_id, session_key=session_key,
+                        platform=proof.platform, chat_id=event.source.chat_id,
+                        thread_id=getattr(event.source, "thread_id", None), content=text_content,
+                        adapter_profile=getattr(self, "_owner_profile", None))
             except Exception:
-                logger.warning("[%s] Deleting the inbound records of a delivered turn failed", self.name,
-                               exc_info=True)
+                logger.warning("[%s] Recording a captioned reply as delivered failed", self.name, exc_info=True)
+        return proof
 
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],
@@ -4638,17 +4703,21 @@ class BasePlatformAdapter(ABC):
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
 
+        delivery_failed = False  # one component of the final reply (text, attachment, voice) was not delivered
+
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+            nonlocal delivery_attempted, delivery_succeeded, delivery_failed
             if result is not None:
                 delivery_attempted = True
                 delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
+                delivery_failed = delivery_failed or not bool(getattr(result, "success", False))
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
         _thread_metadata = _thread_metadata_for_event(event)
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         handler_returned = reply_owed = False  # reply_owed: a returned reply not yet ledgered or delivered
+        text_content, _tts_caption_delivered = "", False
         try:
             # An owner message was stored on arrival and keeps its record while it waits in the queue,
             # so a follow-up taken from it here is already durable.
@@ -4669,6 +4738,8 @@ class BasePlatformAdapter(ABC):
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
                             session_key)
                 response = None
+                from gateway.run_inbound import INBOUND_NO_REPLY
+                event._inbound_outcome = INBOUND_NO_REPLY  # superseded by the message that interrupted it
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
@@ -4715,11 +4786,16 @@ class BasePlatformAdapter(ABC):
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
-            # The final's obligation already released the marker and the records (send_final_ledgered).
-            # Otherwise they go once a send succeeded or nothing was sent; a reply whose every send failed
-            # with no ledger row (the ledger write failed, or the ledger is off) keeps them for the next start.
+            # An owner message's records and marker go only once its reply is proven delivered: every
+            # component of it, and its obligation read back delivered (_release_turn_marker, through
+            # the runner's boundary). Another turn's marker goes once a send succeeded or nothing was
+            # sent; a reply whose every send failed with no ledger row keeps it for the next start.
+            _final = await self._final_reply_proof(
+                event, session_key, response, text_content=text_content if response else "",
+                caption_delivered=bool(response) and _tts_caption_delivered,
+                sent=delivery_attempted and not delivery_failed, failed=delivery_failed)
             reply_owed = reply_owed and delivery_attempted and not delivery_succeeded
-            await self._release_turn_marker(event, owed=reply_owed)
+            await self._release_turn_marker(event, owed=reply_owed, final=_final, session_key=session_key)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
@@ -4774,13 +4850,12 @@ class BasePlatformAdapter(ABC):
                 raise
         finally:
             self._settle_unclaimed_inbound(event, ended=handler_returned)
-            # Still handed over here, the reply was neither ledgered nor delivered: the delivery raised or
-            # was cancelled after the handler returned, or the handler raised or was cancelled after its turn
+            # Still handed over here, the reply was not proven delivered: the delivery raised or was
+            # cancelled after the handler returned, or the handler raised or was cancelled after its turn
             # had answered (it handed its records over). Both stay for the next start.
-            await self._release_turn_marker(event, owed=reply_owed or (
-                not handler_returned and bool(getattr(event, "_inbound_records_on_delivery", None))))
+            await self._release_turn_marker(event, owed=reply_owed)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
-            event._inbound_ledger_ref = None
+            event._inbound_ledger_ref = event._inbound_outcome = None
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
