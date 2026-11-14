@@ -4105,9 +4105,9 @@ class GatewayTurnMixin:
     def _keep_inbound_records(self, recovery_ids: list) -> None:
         """An answer that was neither ledgered nor delivered: its message's records stay on disk for the
         next start, which delivers the stored answer or runs the message again. They still ride the
-        turn's event, so the adapter skips them when the chain's final is ledgered (platforms/base.py,
-        _release_turn_marker)."""
-        self.__dict__.setdefault("_inbound_records_kept", set()).update(recovery_ids)
+        turn's event, so nothing in this process deletes them (gateway/run_inbound.py,
+        _inbound_records_owed)."""
+        self._inbound_records_owed().update(recovery_ids)
 
     async def _run_agent_queued_followup(
         self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,

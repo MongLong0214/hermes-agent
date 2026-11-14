@@ -2137,13 +2137,15 @@ def test_a_first_response_neither_ledgered_nor_delivered_keeps_its_record_throug
         assert (turns, chats, left) == ([_OWNER_TEXT, follow_up], ["chat", "chat"], [])
 
 
+@pytest.mark.parametrize("admitted", ["as_is", "rewritten"])
 def test_a_rerun_after_a_restart_never_takes_over_the_reply_an_earlier_run_still_owes(
-        ingress, send, monkeypatch):
+        ingress, send, monkeypatch, admitted):
     """Open item 5 of r4 slice 1: a stored message's earlier run left a reply in the delivery ledger that
     is still owed, the transcript holds no completed answer (a truncated one), and the record outlived
     that reply (a death between the ledger write and the delete). The next process runs the message
-    again. The rerun's reply is owed under the record's next run, so the earlier run's obligation is
-    neither replaced nor lost."""
+    again, also through a pre-dispatch hook that rewrites the event. The rerun's reply is owed under the
+    record's next run, so the earlier run's obligation is neither replaced nor lost."""
+    import dataclasses
     from types import SimpleNamespace
 
     from agent.session_persistence import _db_flush_row
@@ -2165,9 +2167,44 @@ def test_a_rerun_after_a_restart_never_takes_over_the_reply_an_earlier_run_still
         key, "rerun", platform=platform, chat_id=source.chat_id, thread_id=source.thread_id)
     delivery_ledger.record_obligation(obligation_id=earlier, session_key=key, platform=platform,
                                       chat_id=source.chat_id, thread_id=source.thread_id, content=fragment)
-    turns, _inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch))
+
+    def rewriting(nxt):
+        async def rewrite(event, _source):
+            return dataclasses.replace(event)
+        monkeypatch.setattr(nxt.runner, "_hm_pre_gateway_dispatch_hook", rewrite)
+    nxt = _next_process(ingress, send, monkeypatch, prepare=rewriting if admitted == "rewritten" else None)
+    turns, _inputs, chats, left = _answered(ingress, nxt)
     assert (turns, chats, left) == ([_OWNER_TEXT], ["chat"], [])
     with delivery_ledger._connect() as conn:
         owed = dict(conn.execute("SELECT obligation_id, content FROM delivery_obligations WHERE session_key=?",
                                  (key,)).fetchall())
     assert owed.pop(earlier) == fragment and [_TERMINAL in content for content in owed.values()] == [True]
+
+
+@pytest.mark.parametrize("escape", ["cancelled", "raised"])
+def test_a_turn_that_raises_after_its_answer_was_stored_keeps_its_record(ingress, send, monkeypatch, escape):
+    """Finding 1 at the turn's own end: the agent wrote its completed answer, then the turn is cancelled
+    or raises out of the handler before it returns (here from the post-turn hooks; an exception escapes
+    only when the failed-turn reply raises too, as the turn otherwise ends on that notice), so the
+    adapter has no reply to deliver or ledger. The record of a message whose answer is stored is not
+    deleted with the turn: the next process delivers that answer once and runs no second turn."""
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    _persisting_agents(monkeypatch)
+
+    async def failing_hooks(*_args, **_kwargs):
+        raise asyncio.CancelledError() if escape == "cancelled" else RuntimeError("the post-turn hooks failed")
+
+    async def failing_error_reply(*_args, **_kwargs):
+        raise RuntimeError("the failed-turn reply failed")
+
+    async def exercise():
+        await h.warm()
+        monkeypatch.setattr(h.runner, "_hmwa_post_turn_hooks", failing_hooks)
+        monkeypatch.setattr(h.runner, "_hmwa_agent_error_reply", failing_error_reply)
+        await h.adapter.handle_message(h.owner_event())
+        await h.settle()
+    asyncio.run(exercise())
+    assert [chat for chat, text in h.owner_replies() if _TERMINAL in text] == []
+    assert _record_texts(ingress) == [_OWNER_TEXT]
+    turns, _inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch))
+    assert (turns, chats, left, _owner_rows(ingress)) == ([], ["chat"], [], 1)
