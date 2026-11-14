@@ -42,6 +42,7 @@ from cron.jobs import (
     resume_job,
     trigger_job,
     update_job)
+from cron.jobs_public_status import public_run_error
 from tools.cronjob_prompt_scan import _scan_cron_prompt
 from tools.cronjob_job_args import (
     _apply_continuity,
@@ -254,7 +255,9 @@ def _claim_for_manual_run(job_id: str, log_label: str):
         logger.error("Failed to claim cron job %s for %s: %s", job_id, log_label, e)
         with contextlib.suppress(Exception):
             mark_job_run(job_id, False, str(e))
-        return None, {"claimed": True, "success": False, "error": str(e)}
+        # The claim is Hermes's own store operation, never the job's script (no_agent=False).
+        return None, {"claimed": True, "success": False,
+                      "error": public_run_error(str(e) or type(e).__name__)}
 
 
 def _execute_job_now(job: dict[str, Any], extra_prompt: Optional[str] = None) -> dict[str, Any]:
@@ -399,13 +402,18 @@ def _run_claimed_job(job: dict[str, Any], extra_prompt: Optional[str] = None) ->
         ok = last_status in {"ok", "delivery_queued"}
         if execution is not None and execution.get("status") != "completed":
             ok = False
-            run_error = execution.get("error") or f"execution ended in {execution.get('status') or 'unknown'} state"
+            # The executions row holds the raw text (the operator's `hermes cron runs`); the calling
+            # agent relays this result to chat, so it gets the closed label of the same failure.
+            run_error = (
+                public_run_error(execution.get("error"), no_agent=bool(job.get("no_agent")))
+                or f"execution ended in {execution.get('status') or 'unknown'} state")
         return {"claimed": True, "success": bool(processed and ok), "error": run_error}
     except Exception as e:
         logger.error("Failed to execute cron job %s immediately: %s", job_id, e)
         with contextlib.suppress(Exception):
             mark_job_run(job_id, False, str(e), expected_fire_owner=fire_owner)
-        return {"claimed": True, "success": False, "error": str(e)}
+        return {"claimed": True, "success": False,
+                "error": public_run_error(str(e) or type(e).__name__, no_agent=bool(job.get("no_agent")))}
     finally:
         # Setup failures and BaseException must release only our registration.
         if _registered:
@@ -544,7 +552,10 @@ def _manual_run_completion(
     ]
     if refreshed.get("next_run_at"):
         lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
-    excerpt = _latest_job_output_excerpt(job_id)
+    # A failed run's output file holds its raw error (the operator's copy) and the parent relays
+    # this block to chat, so only a run that itself succeeded (last_error cleared) is excerpted.
+    ran_ok = refreshed.get("last_error") is None if refreshed else bool(res.get("success"))
+    excerpt = _latest_job_output_excerpt(job_id) if ran_ok else None
     if excerpt:
         lines += ["--- JOB OUTPUT ---", excerpt]
     return {

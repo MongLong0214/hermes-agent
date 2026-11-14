@@ -210,9 +210,11 @@ class TestCronjobRunExecutesImmediately:
              patch("tools.cronjob_tools.get_job", return_value=dict(_JOB)):
             res = _execute_job_now(dict(_JOB))
 
+        from cron.jobs_public_status import public_run_error
+
         assert res["claimed"] is True
         assert res["success"] is False
-        assert "profile adapters unavailable" in res["error"]
+        assert res["error"] == public_run_error("profile adapters unavailable")
         m_run.assert_not_called()
         m_mark.assert_called_once()
         assert m_mark.call_args.args[1] is False
@@ -243,15 +245,30 @@ class TestCronjobRunExecutesImmediately:
              patch("tools.cronjob_tools.mark_job_run") as m_mark, \
              patch("tools.cronjob_tools.get_job", return_value=dict(_JOB)):
             res = _execute_job_now(dict(_JOB))
+        from cron.jobs_public_status import public_run_error
+
         assert res["claimed"] is True
         assert res["success"] is False
-        assert "boom" in res["error"]
+        # The record store closes the raw text itself; the relayed tool result is already closed.
+        assert res["error"] == public_run_error("boom")
         m_mark.assert_called_once_with(
             "job-run-1",
             False,
             "boom",
             expected_fire_owner="manual-owner",
         )
+
+    def test_failed_manual_claim_relays_a_closed_error(self):
+        """The calling agent relays this result to chat: the claim's raw text stays in the log."""
+        from tools.cronjob_tools import _claim_for_manual_run
+
+        raw = "OSError: /Users/alice/.hermes/cron/jobs.json at https://u:hunter2@leakcanary.example"
+        with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=OSError(raw)), \
+             patch("tools.cronjob_tools.mark_job_run") as m_mark:
+            claimed, res = _claim_for_manual_run("job-run-1", "manual run")
+        assert claimed is None and res["claimed"] is True and res["success"] is False
+        assert res["error"] and "leakcanary" not in res["error"] and "/Users/alice" not in res["error"]
+        assert m_mark.call_args.args[2] == raw, "the store gets the raw text and closes it itself"
 
     def test_execute_job_now_heartbeats_while_job_runs(self):
         """A manual run ticks the caller's activity tracker while the job
