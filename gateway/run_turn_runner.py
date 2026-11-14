@@ -990,6 +990,14 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         self._prepend_pending_note("_pending_skills_reload_notes")
         if api_text is not None:
             persist_override = clean_text  # recovery wording is API-only too, never the stored row
+        if getattr(ctx, "acp_admission", None) is not None and isinstance(ctx.message, str):
+            # The server admitted this turn through ACP and stripped its ``/acp`` command, so the model
+            # would otherwise see a bare task. The note comes only from the admission object, never from
+            # message text, and is API-only: the transcript keeps the task as the user's turn.
+            from gateway.acp_managed_ingress import MANAGED_TURN_NOTE
+            if persist_override is None:
+                persist_override = ctx.message
+            ctx.message = MANAGED_TURN_NOTE + "\n\n" + ctx.message
         # Safety net: a startup auto-resume event carries empty text; if the resume_pending branch
         # did not fire (freshness signals disagreed, marker cleared) we must NOT hand the model a blank
         # user turn. Restricted to resume_pending sessions so caption-less image turns are untouched.
@@ -1072,11 +1080,15 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             if ctx.inbound_message_id is not None:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
             from agent.notification_presentation import notification_turn
+            from gateway.session_context import scoped_current_session_id
             from gateway.session_results import execution_result
             captured = execution_result.get()
             before = (getattr(agent, 'session_prompt_tokens', 0) or 0,
                       getattr(agent, 'session_completion_tokens', 0) or 0)
-            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
+            # A cached agent publishes its id only on the turn that built it, so the turn binds the
+            # agent's own id for its calls (MCP call provenance); compression may still rotate it inside.
+            with scoped_current_session_id(getattr(agent, "session_id", None) or None), \
+                    notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
                 from gateway.response_filters import silence_allowed
                 # Where a bare marker would become the "needed a reply" warning, the agent ends a
                 # marker that follows a written reply on that reply, before transform/persistence.
@@ -1403,8 +1415,17 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # session via contextvars (set_current_session_key / session context), and only the TUI slash-worker
         # *subprocess* exports HERMES_SESSION_KEY (from its own --session-key argv, a separate process) — so
         # removing this in-process gateway write does not affect any of them.
+        _acp = getattr(ctx, "acp_admission", None)
+
+        def setup_stream(platform_key):
+            if _acp is not None:
+                # A managed /acp answer is delivered only through the ledgered final send, whose row is
+                # the receipt's evidence: a stream would deliver it before (or instead of) that row.
+                return None, None, None, False
+            return self._setup_stream_consumer(platform_key)
+
         try:
-            resolved = self.resolve_turn_agent(before_route=self._setup_stream_consumer)
+            resolved = self.resolve_turn_agent(before_route=setup_stream)
         except TurnRuntimeUnavailable as unavailable:
             exc = unavailable.error
             # Model/credential resolution failed before the turn began; the raw text (URLs, status
@@ -1419,6 +1440,15 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         stream_consumer, stream_delta_cb, interim_cb, want_interim = resolved.before_route
         agent, reused_cached_agent = resolved.agent, resolved.reused
         turn_route, reasoning_config = resolved.turn_route, resolved.reasoning_config
+        if _acp is not None:
+            from gateway import acp_managed_ingress
+            # Under this turn's slot and lease, with the executor resolved: run only the session and
+            # lineage ACP approved; anything else is recorded as a definite non-run.
+            if not acp_managed_ingress.target_still_matches(
+                    _acp, ctx.session_key, getattr(agent, "_session_db", None), getattr(agent, "session_id", None)):
+                acp_managed_ingress.abort_claimed(_acp)
+                return {"final_response": acp_managed_ingress.REFUSED.format(reason="target mismatch"),
+                        "messages": [], "api_calls": 0, "tools": []}
         if resolved.pending_fallback_notice:
             # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
             agent._pending_fallback_notice = resolved.pending_fallback_notice
@@ -1490,6 +1520,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             # Usage-window limit (agent/plan_limits.py): the gateway offers the plan's model as a button.
             "usage_limit": result.get("usage_limit"),
             "partial": result.get("partial", False), "completed": result.get("completed"),
+            # Answer provenance, recorded where the agent produced the text; the gateway's ACP
+            # certification boundary (GatewayTurnMixin._acp_is_model_answer) judges it.
+            "answer_origin": result.get("answer_origin"), "answer_body": result.get("answer_body"),
+            "answer_disposition": result.get("answer_disposition"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
             "error": result.get("error"),
             **{key: result[key] for key in _FAILURE_DESCRIPTOR_KEYS if key in result},
@@ -1517,6 +1551,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 **({"warning": result["warning"]} if isinstance(result.get("warning"), str) and result["warning"] else {}),
             }
         if not final_response:
+            # Whatever text stands here was substituted by the gateway, not answered by the model.
+            common.update(answer_origin=None, answer_body=None, answer_disposition=None)
             final_response = _normalize_empty_agent_response(result, final_response or "", history_len=len(agent_history))
             final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
             if not final_response:
