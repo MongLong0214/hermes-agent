@@ -1,12 +1,15 @@
-"""Gateway-facing SessionDB persistence: routing index, peers, orphans, heartbeats, handoffs.
+"""Gateway-facing SessionDB persistence: routing index, peers, orphans, heartbeats, handoffs,
+and the canonical receipt's proven-handle ``state_meta`` claim / compare-and-set.
 
 Mixin bound onto ``SessionDB`` via the MRO; built on its ``_read_ctx`` /
-``_execute_write`` / ``_write_sql`` / ``_read_all`` primitives."""
+``_execute_write`` / ``_write_sql`` / ``_read_all`` primitives (the receipt writes alone use the
+open connection directly, by design)."""
 
 from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -396,6 +399,90 @@ class SessionGatewayMixin:
         """Load routing entries for *scope* as {session_key: entry_json}."""
         rows = self._read_all("SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?", (scope,))
         return {r["session_key"]: r["entry_json"] for r in rows}
+
+    def _require_proven_meta_write_handle(
+        self,
+        *,
+        proven_db_path: Path,
+        proven_db_identity: Optional[tuple[int, int]],
+    ) -> None:
+        """Refuse metadata writes unless the caller proves this live open generation."""
+        if (
+            proven_db_path != self.db_path
+            or proven_db_identity is None
+            or self._db_file_identity is None
+            or proven_db_identity != self._db_file_identity
+        ):
+            raise sqlite3.ProgrammingError(
+                "state metadata write requires a matching proven database path and identity"
+            )
+        if self.read_only:
+            raise sqlite3.OperationalError("cannot write state metadata on a read-only SessionDB")
+        if self._conn is None:
+            raise sqlite3.ProgrammingError("cannot write state metadata on a closed SessionDB")
+        self._raise_if_db_corrupt()
+        # The caller's proof identifies the handle we opened, not necessarily
+        # the file currently named by its path.  Refuse a stale descriptor
+        # before issuing DML if an out-of-band replacement occurred meanwhile.
+        self._raise_if_db_replaced()
+
+    def claim_meta_once(
+        self,
+        key: str,
+        receipt: str,
+        *,
+        proven_db_path: Path,
+        proven_db_identity: Optional[tuple[int, int]],
+    ) -> bool:
+        """Insert ``state_meta[key]`` once on a caller-proven already-open writable handle.
+
+        Callers must bind their receipt to this exact path and the ``(st_dev,
+        st_ino)`` identity captured for this handle.  It makes no connection,
+        schema, recovery, or write-wrapper lifecycle call; after validating the
+        caller proof and that the pathname still names this generation, it uses
+        SQLite's one-statement compare-and-set without reading or overwriting an
+        existing receipt.
+        """
+        with self._lock:
+            self._require_proven_meta_write_handle(
+                proven_db_path=proven_db_path,
+                proven_db_identity=proven_db_identity,
+            )
+            assert self._conn is not None
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO state_meta (key, value) VALUES (?, ?)",
+                (key, receipt),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def compare_and_set_meta(
+        self,
+        key: str,
+        expected_value: str,
+        value: str,
+        *,
+        proven_db_path: Path,
+        proven_db_identity: Optional[tuple[int, int]],
+    ) -> bool:
+        """Atomically replace matching metadata on this proven existing handle.
+
+        This is the companion to :meth:`claim_meta_once` for receipt transitions:
+        a terminal receipt replaces only the exact pending value it owns.  It
+        does not read, open, reopen, initialize, or recover the database.
+        """
+        with self._lock:
+            self._require_proven_meta_write_handle(
+                proven_db_path=proven_db_path,
+                proven_db_identity=proven_db_identity,
+            )
+            assert self._conn is not None
+            cursor = self._conn.execute(
+                "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?",
+                (value, key, expected_value),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def list_never_active_keyed_sessions(self, *, older_than_days: float) -> list[dict[str, Any]]:
         """Keyed, still-open rows with no evidence of a single turn (no messages, tokens, tool/API calls,

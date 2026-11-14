@@ -37,6 +37,28 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+
+class TurnRuntimeUnavailable(Exception):
+    """The turn's model runtime could not be resolved (``TurnRunner.resolve_turn_agent``); ``error``
+    is the original exception, which ``run_sync`` reports exactly as before."""
+
+    def __init__(self, error: BaseException):
+        super().__init__(str(error))
+        self.error = error
+
+
+@dataclasses.dataclass(frozen=True)
+class ResolvedTurnAgent:
+    """What ``TurnRunner.resolve_turn_agent`` resolved for one turn."""
+
+    agent: Any
+    reused: bool
+    turn_route: Any
+    reasoning_config: Any
+    pending_fallback_notice: Any
+    before_route: Any
+
+
 # Consecutive turns a session's persisted transcript may lag its live cached history before
 # _load_turn_history escalates the lag line from WARNING to ERROR (#114266: 11 days of WARNING).
 _TRANSCRIPT_LAG_ESCALATION_TURNS = 3
@@ -1238,65 +1260,28 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         unique_tags = (["[[audio_as_voice]]"] if has_voice_directive else []) + list(dict.fromkeys(media_tags))
         return final_response + "\n" + "\n".join(unique_tags)
 
-    def run_sync(self):
-        from contextlib import ExitStack
-        from gateway.session_policy import bind_turn_workspace, policy_for_source, policy_scope, refused_turn_result
-        from gateway.session_api_turn import api_policy_scope
-        from gateway.session_authorities import active_authority
-        from hermes_state_runtime import RuntimeStoreError
-        policy = policy_for_source(self._runner, self._ctx.source)
-        with ExitStack() as scope:
-            try:
-                scope.enter_context(policy_scope(policy, authority=active_authority(self._runner)))
-            except RuntimeStoreError as exc:
-                result = refused_turn_result(policy, exc)
-                if result is None:
-                    raise
-            else:
-                scope.enter_context(api_policy_scope())
-                bind_turn_workspace(policy, self._ctx.session_id)
-                result = self._run_sync_scoped()
-            from gateway.session_results import execution_result
-            captured = execution_result.get()
-            if captured is not None:
-                cli_fields = self.__dict__.pop("_cli_result_fields", None)
-                # A classic CLI viewer reads the run_conversation-shaped dict from the receipt; the
-                # delivered reply (message.complete text) keeps the gateway's own copy.
-                captured['result'] = (
-                    {**result, **cli_fields, **({'response_previewed': True} if result.get('response_previewed') else {})}
-                    if cli_fields else result
-                )
-            return result
+    def resolve_turn_agent(self, before_route=None) -> ResolvedTurnAgent:
+        """The one path that resolves the agent a turn on this context's session runs on: the session
+        policy's launch settings, the turn budget, runtime (model, credentials, the pre-agent fallback
+        notice), provider routing, reasoning, service tier, turn route and ephemeral prompt, then
+        ``_resolve_turn_agent`` (the cached agent, or a fresh one built and cached). ``run_sync``
+        resolves every ordinary turn's agent through it, and a canonical event that found none cached
+        builds its session's agent through it (``_build_agent_for_resolved_session``), so both
+        construct the identical agent with the identical cache signature.
 
-    def _run_sync_scoped(self):
-        """Executor-thread body of the turn; returns the gateway result dict.
-
-        The turn message lives on the shared TurnContext (``ctx.message``) so ``_run_agent_inner`` sees
-        every rebind. session_key propagates via contextvars (_set_session_env / set_current_session_key)
-        — never os.environ["HERMES_SESSION_KEY"], which would misroute approvals across sessions.
-        """
-        from gateway.run import (
-            _current_max_iterations, _normalize_empty_agent_response, _reload_runtime_env_preserving_config_authority,
-            _sanitize_gateway_final_response,
-        )
+        ``before_route(platform_key)`` runs where ``run_sync`` sets up its stream consumer (after the
+        service tier, before the route); its result is returned as ``before_route``. A runtime that
+        cannot be resolved raises ``TurnRuntimeUnavailable`` carrying the original error; nothing
+        else is caught."""
+        from gateway.run import _current_max_iterations, _reload_runtime_env_preserving_config_authority
         ctx = self._ctx
         runner = self._runner
-        # Platform.LOCAL ("local") maps to the "cli" hint key the agent understands.
-        # session_key is propagated via contextvars in _set_session_env() (_SESSION_KEY) and via
-        # set_current_session_key() (_approval_session_key) below — both concurrency-safe and inherited by
-        # tool worker threads. We deliberately do NOT write os.environ["HERMES_SESSION_KEY"] here:
-        # os.environ is process-global, so concurrent gateway sessions (e.g. two Discord threads) would
-        # clobber each other's value, and a tool thread whose contextvar is unset would fall back to
-        # os.environ and read the wrong session key — misrouting command-approval prompts to the wrong
-        # thread (#24100). The non-gateway surfaces don't depend on this write: CLI and cron bind the
-        # session via contextvars (set_current_session_key / session context), and only the TUI slash-worker
-        # *subprocess* exports HERMES_SESSION_KEY (from its own --session-key argv, a separate process) — so
-        # removing this in-process gateway write does not affect any of them.
         from gateway.session_policy import policy_for_source
         policy = policy_for_source(runner, ctx.source)
         if policy and policy.yolo and ctx.session_key:
             from tools.approval_yolo import apply_launch_yolo
             apply_launch_yolo(ctx.session_key)
+        # Platform.LOCAL ("local") maps to the "cli" hint key the agent understands.
         platform_key = policy.platform if policy else ("cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value)
         combined_ephemeral = self._combined_ephemeral_prompt()
         if policy and policy.skills_prompt:
@@ -1338,15 +1323,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
         except Exception as exc:
-            # Model/credential resolution failed before the turn began; the raw text (URLs, status
-            # codes) belongs in the log, and the chat gets the commands that fix it. The result is
-            # a FAILED turn: a one-shot client exits non-zero, transcript persistence closes the
-            # turn, and an API receipt reports failure, never a completed turn with an apology.
-            logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc, exc_info=True)
-            from agent.turn_failure_copy import stamp_failure
-            text, reason, retryable = _resolution_failure_reply(exc, ctx.source.platform)
-            return stamp_failure({"final_response": text, "messages": [], "api_calls": 0, "tools": [],
-                                  "failed": True, "completed": False, "error": str(exc)}, reason, retryable)
+            raise TurnRuntimeUnavailable(exc) from exc
         from gateway.session_authorities import active_authority
         from gateway.session_worker_construct import session_routing
         pr = session_routing(active_authority(runner), policy) if policy else runner._provider_routing
@@ -1367,14 +1344,84 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             if tier is not _REQUEST_OPTION_MISSING:
                 runner._service_tier = tier
         runner._reasoning_config = reasoning_config
-        stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
+        before_route_result = before_route(platform_key) if before_route is not None else None
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
-        agent, reused_cached_agent = self._resolve_turn_agent(
+        agent, reused = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )
-        if pending_fallback_notice:
+        return ResolvedTurnAgent(agent=agent, reused=reused, turn_route=turn_route,
+                                 reasoning_config=reasoning_config,
+                                 pending_fallback_notice=pending_fallback_notice,
+                                 before_route=before_route_result)
+
+    def run_sync(self):
+        from contextlib import ExitStack
+        from gateway.session_policy import bind_turn_workspace, policy_for_source, policy_scope, refused_turn_result
+        from gateway.session_api_turn import api_policy_scope
+        from gateway.session_authorities import active_authority
+        from hermes_state_runtime import RuntimeStoreError
+        policy = policy_for_source(self._runner, self._ctx.source)
+        with ExitStack() as scope:
+            try:
+                scope.enter_context(policy_scope(policy, authority=active_authority(self._runner)))
+            except RuntimeStoreError as exc:
+                result = refused_turn_result(policy, exc)
+                if result is None:
+                    raise
+            else:
+                scope.enter_context(api_policy_scope())
+                bind_turn_workspace(policy, self._ctx.session_id)
+                result = self._run_sync_scoped()
+            from gateway.session_results import execution_result
+            captured = execution_result.get()
+            if captured is not None:
+                cli_fields = self.__dict__.pop("_cli_result_fields", None)
+                # A classic CLI viewer reads the run_conversation-shaped dict from the receipt; the
+                # delivered reply (message.complete text) keeps the gateway's own copy.
+                captured['result'] = (
+                    {**result, **cli_fields, **({'response_previewed': True} if result.get('response_previewed') else {})}
+                    if cli_fields else result
+                )
+            return result
+
+    def _run_sync_scoped(self):
+        """Executor-thread body of the turn; returns the gateway result dict.
+
+        The turn message lives on the shared TurnContext (``ctx.message``) so ``_run_agent_inner`` sees
+        every rebind. session_key propagates via contextvars (_set_session_env / set_current_session_key)
+        — never os.environ["HERMES_SESSION_KEY"], which would misroute approvals across sessions.
+        """
+        from gateway.run import _normalize_empty_agent_response, _sanitize_gateway_final_response
+        ctx = self._ctx
+        # session_key is propagated via contextvars in _set_session_env() (_SESSION_KEY) and via
+        # set_current_session_key() (_approval_session_key) below — both concurrency-safe and inherited by
+        # tool worker threads. We deliberately do NOT write os.environ["HERMES_SESSION_KEY"] here:
+        # os.environ is process-global, so concurrent gateway sessions (e.g. two Discord threads) would
+        # clobber each other's value, and a tool thread whose contextvar is unset would fall back to
+        # os.environ and read the wrong session key — misrouting command-approval prompts to the wrong
+        # thread (#24100). The non-gateway surfaces don't depend on this write: CLI and cron bind the
+        # session via contextvars (set_current_session_key / session context), and only the TUI slash-worker
+        # *subprocess* exports HERMES_SESSION_KEY (from its own --session-key argv, a separate process) — so
+        # removing this in-process gateway write does not affect any of them.
+        try:
+            resolved = self.resolve_turn_agent(before_route=self._setup_stream_consumer)
+        except TurnRuntimeUnavailable as unavailable:
+            exc = unavailable.error
+            # Model/credential resolution failed before the turn began; the raw text (URLs, status
+            # codes) belongs in the log, and the chat gets the commands that fix it. The result is
+            # a FAILED turn: a one-shot client exits non-zero, transcript persistence closes the
+            # turn, and an API receipt reports failure, never a completed turn with an apology.
+            logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc, exc_info=exc)
+            from agent.turn_failure_copy import stamp_failure
+            text, reason, retryable = _resolution_failure_reply(exc, ctx.source.platform)
+            return stamp_failure({"final_response": text, "messages": [], "api_calls": 0, "tools": [],
+                                  "failed": True, "completed": False, "error": str(exc)}, reason, retryable)
+        stream_consumer, stream_delta_cb, interim_cb, want_interim = resolved.before_route
+        agent, reused_cached_agent = resolved.agent, resolved.reused
+        turn_route, reasoning_config = resolved.turn_route, resolved.reasoning_config
+        if resolved.pending_fallback_notice:
             # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
-            agent._pending_fallback_notice = pending_fallback_notice
+            agent._pending_fallback_notice = resolved.pending_fallback_notice
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
         from gateway.run_turn_progress import local_viewer_turn
         local_sinks = None
@@ -1496,3 +1543,76 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             # didn't — see codex_runtime.py); default True keeps skip-db for the standard runtime.
             "agent_persisted": result.get("agent_persisted", True),
         }
+
+
+def _redact_pii_enabled() -> bool:
+    """``privacy.redact_pii``, read fresh: the session context prompt's PII setting."""
+    from gateway.run import _load_gateway_config
+    with suppress(Exception):
+        return bool((_load_gateway_config().get("privacy") or {}).get("redact_pii", False))
+    return False
+
+
+async def build_agent_for_resolved_session(runner: GatewayRunner, entry: Any) -> None:
+    """Build and cache the agent for an existing, fully resolved live session, the way an
+    ordinary turn on it would: the same session context prompt (pinned per session), channel
+    prompt, display/toolset settings and ``TurnRunner`` resolution, under the source profile's
+    scope, on a worker thread. For a canonical event that found no agent cached (a clean
+    restart): it opens, creates, routes and persists nothing, and its caller holds the session's
+    turn lease, which every ordinary turn also holds while it resolves its agent, so the two never
+    build one each. Raises ``ValueError("canonical_runtime_refused")`` when no agent can be built
+    here (proxy mode, no origin, unresolvable model runtime).
+
+    Every piece is the ordinary turn's own builder, none reimplemented: ``build_session_context`` +
+    ``_redact_pii_enabled`` + ``_pinned_session_context_prompt`` (as ``_hmwa_prepare_turn``),
+    ``resolve_channel_prompt`` (as the Telegram adapter fills ``event.channel_prompt``),
+    ``_run_agent_display_settings`` + ``_run_agent_build_turn_context`` (as ``_run_agent_inner``),
+    ``_profile_scope_for_source`` (as ``_run_agent``) and ``TurnRunner.resolve_turn_agent`` (as
+    ``run_sync``). The owning profile's scope is entered before any of them, so its config, PII
+    setting and toolsets are the ones read, never the ambient profile's.
+
+    Cancellation never outlives the construction: a cancelled caller waits here until the worker
+    thread has finished, so the caller's turn lease is released only once no build is running."""
+    from gateway.platforms.base import resolve_channel_prompt
+    from gateway.session import build_session_context
+    from run_agent import AIAgent
+
+    source = getattr(entry, "origin", None)
+    if source is None:
+        raise ValueError("canonical_runtime_refused")
+    try:
+        # Nothing above reads configuration; everything below reads the owning profile's.
+        with runner._profile_scope_for_source(source):
+            if runner._get_proxy_url():
+                # This profile's turns run on its proxy (as ``_run_agent_inner`` routes them), where
+                # no agent of this process can run them.
+                raise ValueError("canonical_runtime_refused")
+            context_prompt = "" if source.platform == Platform.LOCAL else runner._pinned_session_context_prompt(
+                build_session_context(source, runner.config, entry), _redact_pii_enabled(), entry.session_key)
+            adapter = runner._intake_adapter_for(source) or runner._delivery_adapter_for(source)
+            thread_id = str(source.thread_id) if source.thread_id else None
+            channel_prompt = resolve_channel_prompt(
+                getattr(getattr(adapter, "config", None), "extra", None) or {},
+                thread_id or str(source.chat_id), str(source.chat_id) if thread_id else None)
+            disp = await asyncio.to_thread(runner._run_agent_display_settings, source)
+            _ctx, turn_runner, _ = runner._run_agent_build_turn_context(
+                disp, AIAgent, message="", source=source, session_key=entry.session_key,
+                run_generation=None, context_prompt=context_prompt, history=[],
+                session_id=entry.session_id, channel_prompt=channel_prompt,
+            )
+            # Created inside the scope, so the worker thread runs under it (copied context).
+            worker = asyncio.ensure_future(asyncio.to_thread(turn_runner.resolve_turn_agent))
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                while not worker.done():
+                    with suppress(asyncio.CancelledError):
+                        await asyncio.wait({worker})
+                if not worker.cancelled():
+                    worker.exception()  # retrieved: the caller is cancelled whatever it returned
+                raise
+    except Exception as exc:
+        if not (isinstance(exc, ValueError) and str(exc) == "canonical_runtime_refused"):
+            logger.warning("Agent for resolved session %s could not be built", entry.session_id,
+                           exc_info=True)
+        raise ValueError("canonical_runtime_refused") from None
