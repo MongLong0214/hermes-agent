@@ -6,7 +6,6 @@ its SessionDB are real (under a tmp home); the cached actor is a stand-in with n
 
 import asyncio
 import dataclasses
-import importlib.util
 import json
 import sqlite3
 from types import SimpleNamespace
@@ -21,12 +20,6 @@ from gateway.canonical_surface import (
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
-
-# A completed turn is proven this event's by ``turn_provenance``, which reads recovery-nudge markers
-# from agent.recovery_nudge; without that module every completed turn refuses (fail closed).
-needs_completed_turn_proof = pytest.mark.xfail(
-    importlib.util.find_spec("agent.recovery_nudge") is None, raises=AssertionError, strict=True,
-    reason="agent.recovery_nudge is not in this tree: a completed canonical turn refuses")
 
 
 class _Actor:
@@ -231,7 +224,6 @@ def test_an_actor_swapped_after_the_claim_never_runs(target, monkeypatch):
     assert target.actor.calls == [] and other.calls == []
 
 
-@needs_completed_turn_proof
 def test_the_admitted_actor_answers_once_and_a_replay_does_not_run_it_again(target):
     event = CanonicalIngressEvent.from_json_bytes(json.dumps({
         "binding": "canonical", "event_id": "one", "author_id": "author", "channel_id": "channel",

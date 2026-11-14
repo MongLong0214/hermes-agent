@@ -12,7 +12,6 @@ runner under a tmp home, and the turn through the real bound-turn runner. No mod
 
 import asyncio
 import contextlib
-import importlib.util
 import json
 import sqlite3
 from types import SimpleNamespace
@@ -26,12 +25,6 @@ from gateway.canonical_surface import CanonicalIngressEvent, CanonicalReceiptCoo
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner, _build_gateway_agent_history
 from gateway.session import SessionSource
-
-# A completed turn is proven this event's by ``turn_provenance``, which reads recovery-nudge markers
-# from agent.recovery_nudge; without that module every completed turn refuses (fail closed).
-needs_completed_turn_proof = pytest.mark.xfail(
-    importlib.util.find_spec("agent.recovery_nudge") is None, raises=AssertionError, strict=True,
-    reason="agent.recovery_nudge is not in this tree: a completed canonical turn refuses")
 
 
 def _author(prefix):
@@ -161,7 +154,6 @@ def test_each_intended_pair_is_admitted_and_runs_its_own_peer_turn(gateway):
     assert gw.receipts() == 2
 
 
-@needs_completed_turn_proof
 def test_each_intended_pair_gets_its_own_turns_answer(gateway):
     gw = gateway(PEER_BINDING)
     for n, (author, channel) in enumerate(PEERS, 1):

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 from types import SimpleNamespace
 
 import pytest
@@ -16,14 +15,6 @@ from gateway.canonical_surface import (
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
-
-# A completed turn is proven this event's by ``turn_provenance``, which reads recovery-nudge markers
-# from agent.recovery_nudge. Without that module the proof cannot be made and every completed turn
-# refuses (fail closed); the tests that expect a completed answer then hold once it is in the tree.
-_COMPLETED_TURN_PROVABLE = importlib.util.find_spec("agent.recovery_nudge") is not None
-needs_completed_turn_proof = pytest.mark.xfail(
-    not _COMPLETED_TURN_PROVABLE, raises=ValueError, strict=True,
-    reason="agent.recovery_nudge is not in this tree: a completed canonical turn refuses")
 
 
 def _event(text):
@@ -69,7 +60,6 @@ def test_request_local_reply_sink_is_opaque_single_use_and_normalizes_failure():
     asyncio.run(exercise())
 
 
-@needs_completed_turn_proof
 def test_existing_cached_actor_turn_returns_only_current_terminal(tmp_path, monkeypatch):
     async def exercise() -> None:
         home = tmp_path / "home"
@@ -153,7 +143,6 @@ def test_existing_cached_actor_turn_returns_only_current_terminal(tmp_path, monk
     asyncio.run(exercise())
 
 
-@needs_completed_turn_proof
 def test_existing_cached_actor_accepts_current_same_key_rotation_but_rejects_previous_entry(tmp_path, monkeypatch):
     async def exercise() -> None:
         home = tmp_path / "home"
@@ -404,7 +393,7 @@ def test_transcript_load_head_replacement_refuses_before_actor(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("swap_current_head", [
-    pytest.param(False, marks=needs_completed_turn_proof), True])
+    False, True])
 def test_actor_completion_requires_unchanged_existing_current_head(
     tmp_path, monkeypatch, swap_current_head
 ):
@@ -695,7 +684,7 @@ def test_a_sink_the_request_did_not_mint_refuses_before_any_lease_or_actor(tmp_p
 
 
 @pytest.mark.parametrize("outcome", [
-    pytest.param("completed", marks=needs_completed_turn_proof), "malformed", "raises"])
+    "completed", "malformed", "raises"])
 def test_the_turn_reaches_no_platform_adapter_and_the_runner_publishes_nothing(tmp_path, monkeypatch, outcome):
     """The cached actor still carries what an owner turn wired to the chat's adapter; a canonical turn
     reaches none of it, and the runner only returns the answer: the caller publishes it."""
@@ -800,8 +789,6 @@ def test_a_completed_turn_that_is_not_this_claims_own_is_refused(tmp_path, monke
     asyncio.run(exercise())
 
 
-@pytest.mark.xfail(not _COMPLETED_TURN_PROVABLE, raises=AssertionError, strict=True,
-                   reason="agent.recovery_nudge is not in this tree: no refused answer can be proven")
 def test_a_refused_shape_hands_over_only_this_claims_proven_answer_to_keep(tmp_path, monkeypatch):
     """The selector refuses an unanswered tool call; the turn is still this claim's own, so its final
     answer is handed to the observation to be kept, never returned as the event's answer."""
