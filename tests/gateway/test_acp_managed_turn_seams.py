@@ -23,7 +23,9 @@ from gateway.platforms.event import MessageEvent
 from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import TurnContext
 from tests.gateway.restart_test_helpers import RestartTestAdapter
-from tests.gateway.test_acp_managed_ingress import _ANSWERED, _admitted, _managed_event, _turn_ctx
+from tests.gateway.test_acp_managed_ingress import (
+    _ANSWERED, _admitted, _ledger_rows, _ledgered_adapter, _managed_event, _stored_status, _turn_ctx,
+)
 from tests.gateway.test_acp_managed_ingress import gw as acp_home
 
 gw = acp_home  # the ACP ingress temp home, under the name the imported helpers take
@@ -193,6 +195,24 @@ class TestQueuedFirstResponse:
         asyncio.run(gw.runner._run_agent_deliver_first_response(ctx, None, result, result, None))
         assert sent.await_args.kwargs["acp_admission"] is (admission if carried else None)
         assert receipts.lookup(gw.db, 901).status == status  # the answer is settled by its send's row
+
+
+    @pytest.mark.parametrize("result,content,correlated,status", [
+        ({"final_response": "the answer", "api_calls": 1, **_ANSWERED}, "the answer", "901", "COMPLETED"),
+        ({"final_response": "context overflow", "failed": True, "api_calls": 1}, "context overflow", None, "ABORTED"),
+    ], ids=["answer", "notice"])
+    def test_a_managed_answer_sent_first_settles_its_receipt(self, gw, monkeypatch, result, content, correlated,
+                                                             status):
+        """Through the real queued send and the adapter's ledgered final send: the answer's own row carries
+        the update id and, delivered, settles the receipt; a notice goes out uncorrelated and the receipt
+        is settled as a failed turn."""
+        adapter = _ledgered_adapter(gw)
+        monkeypatch.setattr(gw.runner, "_record_room_silence_decision", AsyncMock())
+        ctx = _turn_ctx(gw, _admitted(gw), session_id=gw.entry.session_id, history=[],
+                        inbound_message_id="55", event_message_id="55", run_generation=1)
+        asyncio.run(gw.runner._run_agent_deliver_first_response(ctx, adapter, result, result, None))
+        assert adapter.sent == [content] and _ledger_rows() == [(content, correlated)]
+        assert _stored_status(gw, 901) == status
 
 
 class TestDeclaredAdmission:

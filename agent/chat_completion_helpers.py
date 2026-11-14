@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- /acp answer provenance: handle_max_iterations records whether the model itself wrote the iteration summary (_iteration_summary_answered), which finalize_turn needs to certify a budget-exit answer; it is known only inside the summary call
 """API-call helpers extracted from :class:`AIAgent`: non-streaming and streaming
 request drivers, request kwargs builder, assistant-message materializer,
 provider-fallback activator, max-iterations handler, per-turn resource cleanup.

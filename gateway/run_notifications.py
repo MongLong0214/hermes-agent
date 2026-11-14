@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- /acp answer certification: the queued first-response send (_deliver_queued_first_response -> _send_queued_final_text) carries the managed turn's admission into the adapter's ledgered final send, whose row settles the receipt
 """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner.
 
 Split out of ``gateway/run.py``; bound onto ``GatewayRunner`` via the MRO.
