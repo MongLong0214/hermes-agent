@@ -20,6 +20,26 @@ from gateway.agent_cache_pressure import (
     resolve_memory_high_mb,
     transcript_persistence_caught_up,
 )
+from agent.context_compressor import _DB_PERSISTED_MARKER
+
+
+def _flushed_agent(messages=2, *, dirty_row=None, last_activity=None):
+    """A cached-agent stand-in whose transcript is fully on disk: every row carries the persisted marker and
+    the flush watermark has caught up. ``dirty_row`` pops one row's marker in place, the way the tail fill
+    and micro-compaction defrag do, without moving the watermark or the length."""
+    agent = MagicMock()
+    agent._session_messages = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}", _DB_PERSISTED_MARKER: True}
+        for i in range(messages)
+    ]
+    agent._last_flushed_db_idx = messages
+    if dirty_row is not None:
+        agent._session_messages[dirty_row]["content"] = "rewritten in place"
+        agent._session_messages[dirty_row].pop(_DB_PERSISTED_MARKER)
+    if last_activity is not None:
+        agent._last_activity_ts = last_activity
+    return agent
+
 
 class TestBoundsResolution:
     """Absent config must stay absent so gateway/run.py keeps its defaults."""
@@ -179,6 +199,61 @@ class TestPersistenceGuard:
         assert transcript_persistence_caught_up(object()) is False
         assert transcript_persistence_caught_up(None) is False
 
+    def test_a_filled_row_whose_marker_was_popped_blocks_eviction_at_unchanged_length(self, tmp_path):
+        """``turn_finalizer._close_transcript_tail`` fills an already-flushed blank tail in place and pops its
+        marker without changing ``len(messages)`` or ``_last_flushed_db_idx``: the positional watermark alone
+        reads that as caught up, and eviction would drop the only copy of the real answer."""
+        agent = self._agent(tmp_path, "filled-tail")
+        try:
+            messages = [
+                {"role": "user", "content": "do it"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "t1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                ]},
+            ]
+            agent._session_messages = messages
+            assert agent._flush_messages_to_session_db(messages) is True
+            assert transcript_persistence_caught_up(agent) is True
+
+            tail = messages[-1]
+            tail["content"] = "Here is your answer."
+            tail.pop(_DB_PERSISTED_MARKER, None)
+
+            assert agent._last_flushed_db_idx == len(messages)  # watermark never moved
+            assert transcript_persistence_caught_up(agent) is False
+        finally:
+            agent.close()
+
+    def test_a_dirtied_non_tail_row_blocks_eviction_too(self, tmp_path):
+        """Micro-compaction defrag rewrites an EARLIER summary row in place and pops ITS marker; the tail, the
+        length and the watermark all still look durable, so every row must be checked, not just the last."""
+        agent = self._agent(tmp_path, "dirtied-middle")
+        try:
+            messages = [
+                {"role": "assistant", "content": "summary of turns 1-50", "_compressed_summary": True},
+                {"role": "user", "content": "what's next"},
+                {"role": "assistant", "content": "next step"},
+            ]
+            agent._session_messages = messages
+            assert agent._flush_messages_to_session_db(messages) is True
+            assert transcript_persistence_caught_up(agent) is True
+
+            middle = messages[0]
+            middle["content"] = "re-summarized turns 1-50"
+            middle.pop(_DB_PERSISTED_MARKER, None)
+            assert messages[-1].get(_DB_PERSISTED_MARKER) is True  # tail still looks durable
+
+            assert agent._last_flushed_db_idx == len(messages)
+            assert transcript_persistence_caught_up(agent) is False
+        finally:
+            agent.close()
+
+    def test_an_empty_caught_up_transcript_has_nothing_to_lose(self):
+        agent = MagicMock()
+        agent._session_messages = []
+        agent._last_flushed_db_idx = 0
+        assert transcript_persistence_caught_up(agent) is True
+
 class TestEvictionPlanner:
     def _entries(self, n):
         return [(f"s{i}", MagicMock()) for i in range(n)]
@@ -247,10 +322,10 @@ class TestGatewayPressureSweep:
         )
         return runner
 
-    def _cached_agent(self, *, persisted=True, messages=2):
-        agent = MagicMock()
-        agent._session_messages = [{"role": "user", "content": "x"}] * messages
-        agent._last_flushed_db_idx = messages if persisted else 0
+    def _cached_agent(self, *, persisted=True, messages=2, dirty_row=None):
+        agent = _flushed_agent(messages, dirty_row=dirty_row)
+        if not persisted:
+            agent._last_flushed_db_idx = 0
         return agent
 
     def _at_rss(self, monkeypatch, mb):
@@ -326,6 +401,22 @@ class TestGatewayPressureSweep:
         )
         assert "s-durable" not in runner._agent_cache
 
+    def test_a_dirtied_non_tail_row_blocks_pressure_eviction(self, monkeypatch):
+        runner = self._runner()
+        self._at_rss(monkeypatch, 4000)
+        runner._commit_then_release_soft = lambda agent, key: None
+
+        runner._agent_cache["s-dirty"] = (self._cached_agent(messages=4, dirty_row=1), "sig")
+        runner._agent_cache["s-durable"] = (self._cached_agent(messages=4), "sig")
+        runner._agent_cache["s-new"] = (self._cached_agent(), "sig")
+
+        runner._sweep_agent_cache_under_pressure()
+
+        assert "s-dirty" in runner._agent_cache, (
+            "a row rewritten after its flush is only in memory; releasing the agent loses it"
+        )
+        assert "s-durable" not in runner._agent_cache
+
     def test_empty_cache_is_a_no_op(self, monkeypatch):
         """Heap pressure with nothing cached is somebody else's problem."""
         runner = self._runner()
@@ -382,7 +473,7 @@ class TestConfiguredBoundsReachTheCache:
 
         with runner._agent_cache_lock:
             for i in range(5):
-                runner._agent_cache[f"s{i}"] = (MagicMock(), "sig")
+                runner._agent_cache[f"s{i}"] = (_flushed_agent(), "sig")
             runner._enforce_agent_cache_cap()
 
         assert len(runner._agent_cache) == 2
@@ -398,12 +489,70 @@ class TestConfiguredBoundsReachTheCache:
         runner._release_evicted_agent_soft = lambda agent: None
         runner.session_store = None
 
-        stale = MagicMock()
-        stale._last_activity_ts = _t.time() - 5.0
+        stale = _flushed_agent(last_activity=_t.time() - 5.0)
         runner._agent_cache["s-stale"] = (stale, "sig")
 
         assert runner._sweep_idle_cached_agents() == 1
         assert "s-stale" not in runner._agent_cache
+
+    def _bounded(self, bounds):
+        runner = self._runner(bounds)
+        runner._agent_cache = OrderedDict()
+        runner._agent_cache_lock = threading.Lock()
+        runner._running_agents = {}
+        runner._release_evicted_agent_soft = lambda agent: None
+        runner._commit_then_release_soft = lambda agent, key: None
+        runner.session_store = None
+        return runner
+
+    def test_cap_skips_an_agent_with_a_dirtied_non_tail_row(self):
+        runner = self._bounded(AgentCacheBounds(max_size=1))
+        with runner._agent_cache_lock:
+            runner._agent_cache["s-dirty"] = (_flushed_agent(4, dirty_row=1), "sig")
+            runner._agent_cache["s-new"] = (_flushed_agent(), "sig")
+            runner._enforce_agent_cache_cap()
+
+        assert "s-dirty" in runner._agent_cache  # stays over cap rather than dropping an unflushed row
+
+    def test_idle_ttl_skips_an_agent_with_a_dirtied_non_tail_row(self):
+        import time as _t
+
+        runner = self._bounded(AgentCacheBounds(idle_ttl_secs=0.01))
+        runner._agent_cache["s-dirty"] = (_flushed_agent(4, dirty_row=1, last_activity=_t.time() - 5.0), "sig")
+
+        assert runner._sweep_idle_cached_agents() == 0
+        assert "s-dirty" in runner._agent_cache
+
+    def test_a_really_flushed_agent_is_evicted_by_the_cap_and_the_ttl(self, tmp_path):
+        """The real AIAgent flush stamps every row, so a fully flushed agent stays evictable."""
+        import time as _t
+
+        guard = TestPersistenceGuard()
+        homes = [tmp_path / f"a{i}" for i in range(3)]
+        for home in homes:
+            home.mkdir()
+        agents = [guard._agent(home, f"real-{i}") for i, home in enumerate(homes)]
+        try:
+            for agent in agents:
+                messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+                agent._session_messages = messages
+                assert agent._flush_messages_to_session_db(messages) is True
+
+            runner = self._bounded(AgentCacheBounds(max_size=1))
+            with runner._agent_cache_lock:
+                runner._agent_cache["s-old"] = (agents[0], "sig")
+                runner._agent_cache["s-new"] = (agents[1], "sig")
+                runner._enforce_agent_cache_cap()
+            assert list(runner._agent_cache) == ["s-new"]
+
+            runner = self._bounded(AgentCacheBounds(idle_ttl_secs=0.01))
+            agents[2]._last_activity_ts = _t.time() - 5.0
+            runner._agent_cache["s-stale"] = (agents[2], "sig")
+            assert runner._sweep_idle_cached_agents() == 1
+            assert "s-stale" not in runner._agent_cache
+        finally:
+            for agent in agents:
+                agent.close()
 
 def _wait_for(predicate, timeout: float = 3.0) -> None:
     """Wait for a background release thread to finish its work."""

@@ -200,11 +200,19 @@ def transcript_persistence_caught_up(agent: Any) -> bool:
 
     Soft eviction rebuilds from the persisted session, so it is only safe once
     ``_last_flushed_db_idx`` (advanced only on a fully successful write) has caught
-    up.  Unknown shapes are *not* caught up: a skipped eviction costs memory, a
-    wrong one costs the conversation.
+    up AND every row still carries ``_DB_PERSISTED_MARKER``.  The watermark cannot
+    see an already-flushed row rewritten in place: the tail fill in
+    ``turn_finalizer`` and micro-compaction defrag pop that row's marker (the
+    per-row "this content is durable" contract the flush itself re-reads) without
+    moving the watermark or the length.  Unknown shapes are *not* caught up: a
+    skipped eviction costs memory, a wrong one costs the conversation.
     """
+    from agent.context_compressor import _DB_PERSISTED_MARKER
+
     messages, flushed = getattr(agent, "_session_messages", None), getattr(agent, "_last_flushed_db_idx", None)
-    return isinstance(messages, list) and _is_int(flushed) and flushed >= len(messages)
+    if not (isinstance(messages, list) and _is_int(flushed) and flushed >= len(messages)):
+        return False
+    return all(isinstance(m, dict) and bool(m.get(_DB_PERSISTED_MARKER)) for m in messages)
 
 
 def plan_pressure_evictions(

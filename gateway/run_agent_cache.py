@@ -1095,8 +1095,10 @@ class GatewayAgentCacheMixin:
 
     def _enforce_agent_cache_cap(self) -> None:
         """Evict oldest cached agents past the LRU cap (requires _agent_cache_lock); cleanup on a
-        daemon thread. Mid-turn agents are SKIPPED, so the cache may stay over cap until the next
+        daemon thread. Mid-turn agents and agents whose transcript is not fully on disk are SKIPPED
+        (soft release drops the in-memory transcript), so the cache may stay over cap until the next
         insert."""
+        from gateway.agent_cache_pressure import transcript_persistence_caught_up
         _cache = getattr(self, "_agent_cache", None)
         # OrderedDict.popitem(last=False) pops oldest; plain dict lacks the arg so skip enforcement
         # if a test fixture swapped the cache type.
@@ -1110,14 +1112,17 @@ class GatewayAgentCacheMixin:
         # history) to protect a long-running one. Cache may stay over cap until the next insert.
         cap = self._agent_cache_cap()
         candidates = [(key, _tuple_agent(_cache.get(key))) for key in list(_cache.keys())[:max(0, len(_cache) - cap)]]
-        evict_plan = [(key, agent) for key, agent in candidates if agent is None or id(agent) not in running_ids]
+        evict_plan = [
+            (key, agent) for key, agent in candidates
+            if agent is None or (id(agent) not in running_ids and transcript_persistence_caught_up(agent))
+        ]
         for key, _ in evict_plan:
             _cache.pop(key, None)
         remaining_over_cap = len(_cache) - cap
         if remaining_over_cap > 0:
             logger.warning(
                 "Agent cache over cap (%d > %d); %d excess slot(s) held by "
-                "mid-turn agents — will re-check on next insert.",
+                "mid-turn or not-yet-persisted agents — will re-check on next insert.",
                 len(_cache), cap, remaining_over_cap,
             )
         for key, agent in evict_plan:
@@ -1130,7 +1135,9 @@ class GatewayAgentCacheMixin:
 
     def _sweep_idle_cached_agents(self) -> int:
         """Evict cached agents idle past the idle TTL (lock acquired internally; cleanup on daemon
-        threads; mid-turn agents SKIPPED); returns the number evicted."""
+        threads; mid-turn agents and agents whose transcript is not fully on disk SKIPPED); returns
+        the number evicted."""
+        from gateway.agent_cache_pressure import transcript_persistence_caught_up
         _cache = getattr(self, "_agent_cache", None)
         _lock = getattr(self, "_agent_cache_lock", None)
         if _cache is None or _lock is None:
@@ -1147,6 +1154,8 @@ class GatewayAgentCacheMixin:
                 last_activity = getattr(agent, "_last_activity_ts", None)
                 if last_activity is None or (now - last_activity) <= idle_ttl:
                     continue
+                if not transcript_persistence_caught_up(agent):
+                    continue  # the in-memory transcript holds rows state.db lacks
                 to_evict.append((key, agent))
             for key, _ in to_evict:
                 _cache.pop(key, None)

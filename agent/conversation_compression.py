@@ -33,6 +33,9 @@ from agent.context_compressor_summary import _accepts_keyword_argument
 from agent.context_engine import automatic_compaction_status_message, sanitize_memory_context
 from agent.conversation_compression_codex import _compress_context_via_codex_app_server
 from agent.conversation_compression_deadline import resolve_context_compression_timeouts
+from agent.conversation_compression_lock import (
+    _park_unreleased_lock, _release_lock_row, _resolve_lock_api, _retry_unreleased_locks,
+)
 from agent.conversation_compression_scaffolding import _SYNTHETIC_USER_FLAGS, _message_text, is_user_role_scaffolding
 from agent.conversation_compression_telemetry import (
     _emit_aborted_attempt_telemetry, _emit_blocked_attempt_telemetry, _emit_bypassed_attempt_telemetry,
@@ -1382,21 +1385,6 @@ from agent.conversation_compression_checkpoint import _checkpoint_blocked, _chec
 from agent.conversation_compression_feasibility import lazy_compression_feasibility_check
 
 
-def _lock_api_is_absent_on_session_db(lock_db: Any) -> bool:
-    """Whether the live in-memory SessionDB class structurally predates locks.
-    Only the exact old ``hermes_state.SessionDB`` class (hot-reload skew) may fail open; proxies, lookalikes,
-    non-callables and descriptor failures fail closed."""
-    try:
-        from hermes_state import SessionDB
-        missing = object()
-        return (
-            type(lock_db) is SessionDB
-            and inspect.getattr_static(SessionDB, "try_acquire_compression_lock", missing) is missing
-        )
-    except Exception:
-        return False
-
-
 def _refresh_persisted_compression_guards(compressor: Any, *, include_cooldown: bool = True) -> None:
     """Refresh durable automatic-compression guards on a built-in compressor."""
     method_calls = [("_load_fallback_compression_streak", {}), ("_load_ineffective_compression_count", {})]
@@ -2517,7 +2505,8 @@ class _CompressionLease:
     """The per-attempt durable compression lock plus its lifecycle plumbing.
     ``holder`` is None when no durable lock is owned (legacy DB, no session db); ``watermark`` is the highest
     active row the compaction already represents: MAX(id) at lease start, advanced to the newest row of an
-    adopted durable snapshot (None = archive everything, no concurrent-tail preservation this cycle)."""
+    adopted durable snapshot (None only without a durable lock = archive everything, no concurrent-tail
+    preservation; a held lock whose watermark cannot be read sits out instead)."""
 
     def __init__(
         self, agent: Any, *, db: Any, sid: str, ttl: float, refresh_interval: Any,
@@ -2532,6 +2521,8 @@ class _CompressionLease:
         self._lifecycle = lifecycle
         self.holder: Optional[str] = None
         self.watermark: Optional[int] = None
+        # The lock was won but its start watermark could not be read: this attempt sat out (fail closed).
+        self.watermark_unreadable = False
         self._refresher: Optional[_CompressionLockLeaseRefresher] = None
         self._released = False
         self._release_guard = threading.Lock()
@@ -2566,22 +2557,27 @@ class _CompressionLease:
             if not self._released:
                 self._refresher = candidate.start()
 
-    def release_holder_only(self) -> None:
-        """Stop this holder's refresher and release only its durable lock.
+    def release_holder_only(self) -> bool:
+        """Stop this holder's refresher and release only its durable lock; False when the DELETE kept failing.
         Holder-qualified and idempotent: safe for the host after a timeout because a newer holder's lease can
-        never be deleted by this stale release."""
+        never be deleted by this stale release. ``_released`` is set only once the DELETE committed (or there
+        was nothing to delete), so a later cleanup call on this lease retries it; the pending holder is also
+        parked on the agent, whose next acquisition retries it even when the failing caller drops the lease."""
         with self._release_guard:
             if self._released:
-                return
-            self._released = True
+                return True
             if getattr(self._agent, "_active_compression_lock_holder", None) == self.holder:
                 self._agent._active_compression_lock_holder = None
             if self._refresher is not None:
                 with _swallow('compression lock refresher stop failed: %s'):
                     self._refresher.stop()
+                self._refresher = None
             if self.db is not None and self.sid and self.holder:
-                with _swallow('compression lock release failed: %s'):
-                    self.db.release_compression_lock(self.sid, self.holder)
+                if not _release_lock_row(self.db, self.sid, self.holder):
+                    _park_unreleased_lock(self._agent, self.db, self.sid, self.holder)
+                    return False
+            self._released = True
+            return True
 
     def release(self) -> None:
         """Finish lifecycle cleanup and release the OLD session lock once."""
@@ -2596,23 +2592,6 @@ class _CompressionLease:
                         self._commit_fence.clear_cancelled_lock_release(self.release_holder_only)
                 finally:
                     self.finish_lock_setup()
-
-
-def _resolve_lock_api(lock_db: Any) -> tuple[Any, Optional[Exception]]:
-    """Return ``(try_acquire_compression_lock, lookup_error)`` for ``lock_db``.
-    ``(None, None)`` = no db or legacy SessionDB without the lock API (fail open); ``(None, exc)`` = lookup
-    itself failed (caller fails closed)."""
-    if lock_db is None:
-        return None, None
-    try:
-        if _lock_api_is_absent_on_session_db(lock_db):
-            return None, None
-        try_acquire = lock_db.try_acquire_compression_lock
-    except Exception as exc:
-        return None, exc
-    if not callable(try_acquire):
-        return None, TypeError("compression lock API is present but not callable")
-    return try_acquire, None
 
 
 def _abort_lease(
@@ -2630,9 +2609,9 @@ def _abort_lease(
 def _try_acquire_durable_lock(lease: _CompressionLease, try_acquire: Any, commit_fence: Any) -> bool:
     """Acquire the durable lock for ``lease.holder`` and capture the start watermark.
     Watermark = MAX(id) of active rows at START: appends aren't blocked during summary; later rows are
-    concurrent tail that archive_and_compact re-sequences. Capture is safety-additive (fallback archives
-    everything), so its failure never aborts. An acquire that raises is not version skew: fail closed and
-    release holder-qualified best-effort (safe if never acquired)."""
+    concurrent tail that archive_and_compact re-sequences. A failed capture fails closed (``None`` would
+    archive those rows unsummarized): release the lock and set ``lease.watermark_unreadable``. An acquire
+    that raises is not version skew: fail closed and release holder-qualified (safe if never acquired)."""
     try:
         acquired = try_acquire(lease.sid, lease.holder, ttl_seconds=lease.ttl)
         if acquired:
@@ -2645,14 +2624,15 @@ def _try_acquire_durable_lock(lease: _CompressionLease, try_acquire: Any, commit
                         commit_fence.mark_commit_watermark_fenced()
             except Exception as _wm_err:
                 logger.warning(
-                    "compression watermark capture failed for session=%s (%s) — concurrent appends this cycle "
-                    "will be archived with the snapshot", lease.sid, _wm_err,
+                    "compression watermark capture failed for session=%s (%s) — skipping compression this cycle "
+                    "so rows appended during the summary are not archived with the snapshot", lease.sid, _wm_err,
                 )
-                lease.watermark = None
+                lease.watermark_unreadable = True
+                lease.release_holder_only()
+                return False
         return acquired
     except Exception as _lock_err:
-        with _swallow('compression lock cleanup after failed acquire failed: %s'):
-            lease.db.release_compression_lock(lease.sid, lease.holder)
+        lease.release_holder_only()
         lease.holder = None
         logger.warning(
             "compression lock acquisition raised unexpectedly for session=%s (%s: %s) — skipping compression this cycle",
@@ -2705,6 +2685,7 @@ def _acquire_compression_lease(
     # Clear stale lock-skip so this call's outcome alone is visible; else a manual
     # /compress after an auto lock-skip falsely reports "already in progress".
     agent._compression_skipped_due_to_lock = None
+    _retry_unreleased_locks(agent)
     _try_acquire_lock, _lock_lookup_error = _resolve_lock_api(_lock_db)
     _lock_ttl = 300.0
     with contextlib.suppress(TypeError, ValueError):
@@ -2747,6 +2728,12 @@ def _acquire_compression_lease(
             _lock_acquired = _try_acquire_durable_lock(lease, _try_acquire_lock, commit_fence)
         if not _lock_acquired:
             lease.finish_lock_setup()
+            if lease.watermark_unreadable:
+                agent._last_compaction_in_place = False
+                # A transient defer, not proof the session cannot shrink: without the signal an unchanged
+                # transcript reaches the insufficient-progress / exhaustion branches.
+                agent._compression_blocked_transient = "watermark_unreadable"
+                return _abort_lease(agent, lifecycle, system_message, attempt, "watermark_unreadable")
             return _sit_out_lock_contention(
                 agent, lease, lifecycle, system_message, approx_tokens, attempt
             )
