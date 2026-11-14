@@ -3131,3 +3131,154 @@ def test_store_partial_delivery_interruption_restart_recovery_and_cleanup(ingres
     assert sent == [str(document), str(document)]  # the interrupted send, then the recovery's alone
     assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "delivered")]
     assert _marker(nxt) is None
+
+
+def _media_policy(monkeypatch, *, strict, trust_recent=False, allow=None):
+    """The media delivery policy every process reads from here on (gateway/media_policy.py): strict or not,
+    recent-file trust, and an operator allowlist."""
+    monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "1" if strict else "0")
+    monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "1" if trust_recent else "0")
+    if allow is None:
+        monkeypatch.delenv("HERMES_MEDIA_ALLOW_DIRS", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(allow))
+
+
+def _owner_turn_in_lane(ingress, send, monkeypatch, lane, attachment):
+    """The owner turn answers with its text and *attachment*, delivered by the adapter's final (``normal``)
+    or as the queued lane's first response while a follow-up waits (``queued``). Returns the harness and the
+    recovery id of the owner message's record."""
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    hold = (threading.Event(), threading.Event()) if lane == "queued" else None
+    _answering_with(monkeypatch, attachment, hold=hold)
+
+    async def exercise():
+        await h.warm()
+        await h.adapter.handle_message(h.owner_event())
+        if hold is not None:
+            await h.wait(hold[0].is_set, "the first turn")
+            await h.adapter.handle_message(h.owner_event("owner: followup", message_id="m2"))
+            await h.wait(lambda: h.queued() == ["owner: followup"], "the follow-up to queue")
+            hold[1].set()
+        await h.settle()
+    asyncio.run(exercise())
+    assert _record_texts(ingress) == [_OWNER_TEXT]  # the follow-up's record went with its own answer
+    [record_file] = _records(ingress)
+    return h, _recovery_id(record_file)
+
+
+@pytest.mark.parametrize("lane", ["normal", "queued"])
+def test_a_live_reply_whose_attachment_is_gone_keeps_it_owed_as_missing(
+        ingress, send, monkeypatch, tmp_path, lane):
+    """s1d review P1-1: the answer is text and a PDF that is not on disk when the reply goes out, in the
+    adapter's final or in the queued first response. The PDF is stored as one of the reply's components
+    before the first send, like any attachment it declares, then recorded missing: never sent, never
+    counted delivered. The text is delivered, the record stays, and the chat is told once. Once the file
+    is there, the next start sends the PDF alone and cleans up. The message is never run again."""
+    document = tmp_path / "gone.pdf"
+    sent = _attachment_sends(monkeypatch, set())
+    h, rid = _owner_turn_in_lane(ingress, send, monkeypatch, lane, f"MEDIA:{document}")
+    assert sent == []
+    assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "missing")]
+    assert len([t for _c, t in h.owner_replies() if "gone.pdf" in t]) == 1
+    if lane == "normal":
+        assert _marker(h) is not None
+    document.write_bytes(b"%PDF-test")
+    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    turns, _inputs, chats, left = _answered(ingress, nxt)
+    assert (turns, chats, left, _texts_sent(nxt)) == ([], [], [], [])
+    assert sent == [("document", str(document), True)]
+    assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "delivered")]
+
+
+@pytest.mark.parametrize("case", ["normal_refused", "queued_refused", "normal_restored", "queued_restored",
+                                  "stored_restored"])
+def test_an_attachment_the_current_media_policy_refuses_is_kept_blocked_and_never_uploaded(
+        ingress, send, monkeypatch, tmp_path, caplog, case):
+    """s1d review P1-3. Strict media delivery with recent-file trust off, so a PDF outside the allowlist is
+    refused. It is refused when the reply goes out (``*_refused``, in the adapter's final or the queued
+    first response), or it is restored outside the allowlist after the reply recorded it missing
+    (``*_restored``; ``stored_restored`` is the reviewer's reproduction, a stored answer whose PDF was gone
+    at the first start). It is never uploaded and never dropped: it stays one of the reply's components,
+    recorded blocked, the record stays, and an ERROR says why. The message is never run again."""
+    import logging
+
+    from gateway.platforms.base import validate_media_delivery_path
+
+    _media_policy(monkeypatch, strict=True)
+    document = tmp_path / "outside-allowlist.pdf"
+    lane, when = case.split("_")
+    if when == "refused":
+        document.write_bytes(b"%PDF-test: outside the media allowlist")
+    sent = _attachment_sends(monkeypatch, set())
+    if lane == "stored":
+        rid = "policy"
+        _stored_turn(ingress, rid, f"{_TERMINAL}\nMEDIA:{document}")
+        _next_process(ingress, send, monkeypatch, crashed=True)
+    else:
+        _h, rid = _owner_turn_in_lane(ingress, send, monkeypatch, lane, f"MEDIA:{document}")
+    first = "blocked" if when == "refused" else "missing"
+    assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", first)]
+    if when == "restored":
+        document.write_bytes(b"%PDF-test: outside the media allowlist")
+    assert validate_media_delivery_path(str(document)) is None  # the real policy refuses it
+    with caplog.at_level(logging.ERROR):
+        nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    turns, _inputs, chats, left = _answered(ingress, nxt)
+    assert (turns, chats, left, sent) == ([], [], [f"inbound-{rid}.json"], [])
+    assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "blocked")]
+    assert any("refused by the media delivery policy" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("change", ["allowed", "file_changed", "policy_changed", "symlink_swapped",
+                                    "symlink_to_allowed"])
+def test_an_owed_attachment_is_checked_again_right_before_each_send(
+        ingress, send, monkeypatch, tmp_path, change):
+    """The attachment check runs before each send, not only when the reply's components were stored. A PDF
+    the policy allows is stored with the reply, and the transport refuses its first upload, so the next
+    start still owes it. In between: nothing changes (``allowed``, a normal attachment: the next start
+    uploads it and cleans up); the file under its path is replaced by an older one, which the strict
+    policy's recent-file trust no longer covers (``file_changed``); the policy turns strict
+    (``policy_changed``); or the path is swapped for a symlink to a file outside the allowlist
+    (``symlink_swapped``): the next start never uploads it, it is recorded blocked and the record stays.
+    Or the path is swapped for a symlink to another file inside the allowlist (``symlink_to_allowed``): what
+    is uploaded is the file the check resolved, never the link. The message is never run again."""
+    import os
+    import time
+
+    allowed, outside = tmp_path / "allowed", tmp_path / "outside"
+    allowed.mkdir()
+    outside.mkdir()
+    document = allowed / "report.pdf"
+    document.write_bytes(b"%PDF-test")
+    _media_policy(monkeypatch, **{
+        "allowed": {"strict": False}, "file_changed": {"strict": True, "trust_recent": True},
+        "policy_changed": {"strict": False}, "symlink_swapped": {"strict": True, "allow": allowed},
+        "symlink_to_allowed": {"strict": True, "allow": allowed}}[change])
+    failing = {"document"}
+    sent = _attachment_sends(monkeypatch, failing)
+    _h, rid = _owner_turn_in_lane(ingress, send, monkeypatch, "normal", f"MEDIA:{document}")
+    assert sent == [("document", str(document), False)]
+    assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "failed")]
+    failing.clear()
+    if change == "file_changed":
+        document.unlink()
+        document.write_bytes(b"%PDF-test: an older file")
+        os.utime(document, (time.time() - 3600, time.time() - 3600))
+    elif change == "policy_changed":
+        _media_policy(monkeypatch, strict=True)
+    elif change.startswith("symlink"):
+        target = (outside if change == "symlink_swapped" else allowed) / "target.pdf"
+        target.write_bytes(b"%PDF-test: the link's target")
+        document.unlink()
+        document.symlink_to(target)
+    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    turns, _inputs, chats, left = _answered(ingress, nxt)
+    assert (turns, chats) == ([], [])
+    if change in ("allowed", "symlink_to_allowed"):
+        uploaded = document if change == "allowed" else allowed / "target.pdf"
+        assert left == [] and sent[1:] == [("document", str(uploaded), True)] and _texts_sent(nxt) == []
+        assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "delivered")]
+    else:
+        assert left == [f"inbound-{rid}.json"] and sent[1:] == []
+        assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "blocked")]

@@ -933,7 +933,7 @@ class GatewayStartupMixin:
                          part.get("path") or part.get("url"), part.get("state"), MAX_REACTIVATIONS)
         if claimed:
             await adapter.redeliver_owed_attachments(
-                source, obligation_id, claimed,
+                source, obligation_id, claimed, session_key=obligation.session_key,
                 metadata={"thread_id": source.thread_id} if getattr(source, "thread_id", None) else None)
 
     async def _ledger_answered_inbound_records(self) -> int:
@@ -1078,7 +1078,8 @@ class GatewayStartupMixin:
         """The components of a stored answer's presented content (``_crash_left_reply`` with its media
         kept) as the adapter's final would deliver it (platforms/base.py, extract_reply_parts), so its
         MEDIA: files and images are owed as attachments, not shown as text, and one whose file is gone
-        is still owed. A silence marker's notice is text only."""
+        or that the policy refuses is still owed (its send records it missing or blocked). A silence
+        marker's notice is text only."""
         try:
             scope = self._media_delivery_scope_for_source(origin)
         except Exception:

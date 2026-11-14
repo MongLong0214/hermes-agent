@@ -382,10 +382,13 @@ def obligation_state(obligation_id: str) -> Optional[str]:
     return None if row is None else str(row[0])
 
 
-# A component's states: ``pending`` (not sent yet), ``failed`` (a send was refused), ``missing`` (its source
-# was gone when a later start went to send it), ``delivered``. Only ``delivered`` is ever final.
+# A component's states: ``pending`` (not sent yet), ``failed`` (a send was refused), ``missing`` (its file was
+# gone when a send was due), ``blocked`` (the media delivery policy refused its file when a send was due; it is
+# never uploaded), ``delivered``. Only ``delivered`` is ever final: the check before each send (platforms/base.py,
+# attachment_verdict) can move a component between the others.
 COMPONENT_DELIVERED = "delivered"
 COMPONENT_MISSING = "missing"
+COMPONENT_BLOCKED = "blocked"
 # Payload flag of every component of a reply sent by a run that did not end its message (a restart cut it
 # short and its record stays for the next process): such a reply never settles the message by itself
 # (inbound_completion). A notice of such a run is superseded; an answer is provisional until the next start
@@ -400,6 +403,7 @@ ANSWER_STORED = "answer_stored"
 COMPLETE = "complete"    # every component of the reply delivered: the record and marker may go
 OWED = "owed"            # stored and not yet delivered: a component pending or refused, within its retries
 MISSING = "missing"      # a required attachment's source is gone: blocks completion and deletion
+BLOCKED = "blocked"      # the media policy refuses a required attachment: never uploaded; blocks completion, deletion
 EXPIRED = "expired"      # the text's retry budget is spent (abandoned, attempts cap, stale) undelivered
 OPEN = "open"            # only a reply of a run a restart cut short: the transcript decides what is owed
 UNTRACKED = "untracked"  # a text row without components (written before components were): never complete
@@ -476,9 +480,9 @@ def obligation_components(obligation_id: str) -> List[Dict[str, Any]]:
 
 
 def mark_components(obligation_id: str, outcomes: Dict[str, str]) -> List[str]:
-    """Record attachment outcomes (component id -> ``delivered`` / ``failed`` / ``missing``). A delivered
-    component stays delivered, and the text component follows its row (``_update_state``), so neither is
-    written here. Returns the ids whose state changed."""
+    """Record attachment outcomes (component id -> ``delivered`` / ``failed`` / ``missing`` / ``blocked``). A
+    delivered component stays delivered, and the text component follows its row (``_update_state``), so
+    neither is written here. Returns the ids whose state changed."""
     changed: List[str] = []
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
@@ -516,9 +520,10 @@ def inbound_completion(obligation: InboundObligation, *, now: Optional[float] = 
     provisional answer, never completion by itself), or is a notice sent after the run had stored its
     answer (``ANSWER_STORED``: superseded by that answer); ``COMPLETE`` when every component is delivered
     (an answer, or with no answer stored a notice that terminated the message); else ``EXPIRED`` when the
-    undelivered text's retry budget is spent, ``MISSING`` when an attachment's source is gone, ``OWED``
-    otherwise. ``UNTRACKED`` for a text row without components, ``(None, None)`` for nothing. Raises when
-    the ledger cannot be read: a failed read is never an answer."""
+    undelivered text's retry budget is spent, ``BLOCKED`` when the media policy refused an attachment,
+    ``MISSING`` when an attachment's source is gone, ``OWED`` otherwise. ``UNTRACKED`` for a text row
+    without components, ``(None, None)`` for nothing. Raises when the ledger cannot be read: a failed read
+    is never an answer."""
     now = time.time() if now is None else now
     with _DB_LOCK, _transaction() as conn:
         for reply_id in (obligation.reply_id(REPLY_ANSWER), obligation.reply_id(REPLY_NOTICE)):
@@ -537,6 +542,8 @@ def inbound_completion(obligation: InboundObligation, *, now: Optional[float] = 
             return COMPLETE, reply_id
         if any(part["kind"] == "text" for part in owed) and _text_expired_unlocked(conn, reply_id, now):
             return EXPIRED, reply_id
+        if any(part["state"] == COMPONENT_BLOCKED for part in owed):
+            return BLOCKED, reply_id
         if any(part["state"] == COMPONENT_MISSING for part in owed):
             return MISSING, reply_id
         return OWED, reply_id

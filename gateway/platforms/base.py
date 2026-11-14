@@ -1183,6 +1183,26 @@ def _existing_regular_file(raw: str) -> bool:
         return False
 
 
+# What ``attachment_verdict`` says of a reply's local attachment; ``missing`` and ``blocked`` are also the
+# states its component is recorded in (gateway/delivery_ledger.py).
+ATTACHMENT_SENDABLE, ATTACHMENT_MISSING, ATTACHMENT_BLOCKED = "sendable", "missing", "blocked"
+
+
+def attachment_verdict(path: str, session_key: str = "", *,
+                       label: str = "MEDIA directive path") -> Tuple[str, Optional[str]]:
+    """The one check of a local attachment of an owner message's reply (a MEDIA: file or a bare local
+    file), against the CURRENT media delivery policy and the file *path* names NOW, symlinks resolved:
+    ``(ATTACHMENT_SENDABLE, the host path to upload)``; ``(ATTACHMENT_MISSING, None)`` when no file is
+    there; ``(ATTACHMENT_BLOCKED, None)`` when the policy refuses the file. The adapter's final, the
+    queued first response and streamed final, and a later start reading a stored answer run it when the
+    reply's components are stored, and ``_deliver_owed_attachments`` runs it again right before every
+    send, so a policy change, a changed file or a swapped symlink in between is caught at the send."""
+    safe_path = _validated_delivery_path(path, session_key, label)
+    if safe_path:
+        return ATTACHMENT_SENDABLE, safe_path
+    return (ATTACHMENT_BLOCKED if _existing_regular_file(str(path)) else ATTACHMENT_MISSING), None
+
+
 SUPPORTED_DOCUMENT_TYPES = {
     ".pdf": "application/pdf", ".md": "text/markdown", ".txt": "text/plain", ".csv": "text/csv",
     ".log": "text/plain", ".json": "application/json", ".xml": "application/xml",
@@ -1678,7 +1698,7 @@ class _OwedReply:
                 logger.warning("Recording a reply's delivered text failed; the reply stays owed", exc_info=True)
         return await self.adapter._deliver_owed_attachments(
             MessageEvent(text="", source=self.source), self.extracted, dict(metadata or {}),
-            obligation_id=self.obligation_id, held=self.held)
+            obligation_id=self.obligation_id, held=self.held, session_key=self.session_key)
 
 
 _PLAINTEXT_GATEWAY_RESTART_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -3336,6 +3356,27 @@ class BasePlatformAdapter(ABC):
             if (safe_path := _validated_delivery_path(media_path, session_key, "MEDIA directive path", dropped))]
 
     @staticmethod
+    def _reply_media(media_files, session_key: str = "", *, owed: bool) -> List[Tuple[str, bool]]:
+        """The MEDIA: attachments a reply declares (``extract_media``), each checked by ``attachment_verdict``:
+        a sendable one under the host path it resolved to. An owner message's reply (*owed*) keeps every
+        declared attachment, before any existence or policy filtering, an unsendable one under its declared
+        path: the reply requires it, and its send records it missing or blocked (``_deliver_owed_attachments``).
+        Any other reply drops an unsendable one."""
+        kept = []
+        for media_path, is_voice in media_files or []:
+            _verdict, safe_path = attachment_verdict(media_path, session_key)
+            if safe_path or owed:
+                kept.append((safe_path or str(media_path), bool(is_voice)))
+        return kept
+
+    @staticmethod
+    def _reply_local_files(file_paths, session_key: str = "") -> List[str]:
+        """The bare local files a reply names (``extract_local_files``: files on disk), each checked by
+        ``attachment_verdict``. A named path is not a declared attachment: one the policy refuses is dropped."""
+        return [safe for path in file_paths or []
+                if (safe := attachment_verdict(path, session_key, label="local file path")[1])]
+
+    @staticmethod
     def filter_local_delivery_paths(file_paths, session_key: str = "") -> List[str]:
         """Drop unsafe bare local file paths and normalize accepted paths."""
         safe_paths = (_validated_delivery_path(p, session_key, "local file path") for p in file_paths or [])
@@ -4397,16 +4438,36 @@ class BasePlatformAdapter(ABC):
 
     async def _deliver_owed_attachments(
         self, event: MessageEvent, extracted: "_ExtractedResponse", metadata: Dict[str, Any], *,
-        obligation_id: Optional[str], held: list, record_delivery: Optional[Callable] = None,
-        anything_sent: bool = True) -> bool:
+        obligation_id: Optional[str], held: list, session_key: str = "",
+        record_delivery: Optional[Callable] = None, anything_sent: bool = True) -> bool:
         """Send the attachments of *extracted* that the reply's stored components (*held*) do not
         already show delivered, and record each one's outcome under *obligation_id* as soon as the
-        sends end, a cancellation included. An attachment the stored components do not name (another
-        reply already holds this obligation) is sent but proves nothing. True when every attachment of
+        sends end, a cancellation included. It is the one sender of an owner message's attachments (the
+        adapter's final, ``_OwedReply.finish``, ``redeliver_owed_attachments``): right before the sends,
+        each local attachment still owed is checked again (``attachment_verdict``, the policy and the file
+        of now), and what is uploaded is the host path that check resolved. One that is gone or refused
+        is never sent: it is recorded ``missing`` or ``blocked`` (never dropped, never delivered), logged,
+        and the chat is told once. An attachment the stored components do not name (another reply
+        already holds this obligation) is sent but proves nothing. True when every attachment of
         *extracted* is delivered: the proof with the ledger off."""
         parts = {p["id"]: p for p in extracted.components() if p["kind"] != "text"}
         tracked = {c["id"]: c for c in held if c.get("id") in parts and _same_component(c, parts[c["id"]])}
         skip = frozenset(cid for cid, c in tracked.items() if c.get("state") == "delivered")
+        with self._media_delivery_scope(event.source):
+            checked = {cid: attachment_verdict(part["path"], session_key, label=(
+                           "MEDIA directive path" if part["kind"] == "media" else "local file path"))
+                       for cid, part in parts.items() if cid not in skip and part["kind"] in ("media", "file")}
+        refused = {cid: verdict for cid, (verdict, safe_path) in checked.items() if safe_path is None}
+        if refused:
+            await self._record_unsendable_attachments(event.source, obligation_id, parts, tracked, refused, metadata)
+        cids = extracted.component_ids()
+        media = [((checked[cid][1], voice), cid) for (_path, voice), cid in zip(extracted.media_files, cids["media"])
+                 if cid in checked and cid not in refused]
+        files = [(checked[cid][1], cid) for _path, cid in zip(extracted.local_files, cids["files"])
+                 if cid in checked and cid not in refused]
+        outgoing = dataclasses.replace(
+            extracted, media_files=[m for m, _cid in media], local_files=[f for f, _cid in files],
+            ids={"images": cids["images"], "media": [cid for _m, cid in media], "files": [cid for _f, cid in files]})
         outcomes: Dict[str, str] = {}
 
         def component_done(ids: list, success: bool) -> None:
@@ -4414,7 +4475,7 @@ class BasePlatformAdapter(ABC):
                 outcomes[cid] = "delivered" if success else "failed"
         try:
             await self._deliver_attachments(
-                event, extracted, metadata, anything_sent=anything_sent,
+                event, outgoing, metadata, anything_sent=anything_sent,
                 record_delivery=record_delivery or (lambda _result: None), component_done=component_done,
                 skip=skip)
         finally:
@@ -4432,7 +4493,8 @@ class BasePlatformAdapter(ABC):
         media: list = []
         if attachments and response:
             media, _rest = self.extract_media(response)
-            media = BasePlatformAdapter.filter_media_delivery_paths(media)
+            with self._media_delivery_scope(source):
+                media = self._reply_media(media, session_key, owed=True)
         from gateway.delivery_ledger import ReplyNotStored
         extracted = _ExtractedResponse(
             text_content=(text or "").strip(), images=[], media_files=media, local_files=[],
@@ -4444,32 +4506,35 @@ class BasePlatformAdapter(ABC):
         return _OwedReply(self, source, session_key, obligation_id, held, extracted)
 
     async def redeliver_owed_attachments(self, source: Any, obligation_id: str, held: list, *,
-                                         metadata: Optional[Dict[str, Any]] = None) -> None:
+                                         session_key: str = "", metadata: Optional[Dict[str, Any]] = None) -> None:
         """A later start's half of an owner message's reply (gateway/run_startup.py, _settle_stored_inbound):
-        send the attachments its stored components (*held*) still owe, never one already delivered. A
-        file whose source is gone is never sent and never counted: it is recorded ``missing``, logged,
-        and the chat is told once; the reply stays owed."""
-        from urllib.parse import unquote
+        send the attachments its stored components (*held*) still owe, never one already delivered, through
+        ``_deliver_owed_attachments``, which checks each one again right before its send: a file that is gone,
+        or that the current policy refuses, is never sent and never counted (``missing`` / ``blocked``), and
+        the reply stays owed."""
         owed = [c for c in held if c.get("kind") != "text" and c.get("state") != "delivered"]
-        sendable, missing = [], []
-        for part in owed:
-            url = str(part.get("url") or "")
-            local = part.get("path") or (unquote(url[7:]) if url.startswith("file://") else None)
-            (missing if local is not None and not os.path.isfile(str(local)) else sendable).append(part)
-        if missing:
-            changed = await self._mark_components(obligation_id, {p["id"]: "missing" for p in missing})
-            for part in missing:
-                logger.error("[%s] An owed attachment of a reply (obligation %s) is gone from %s; the reply "
-                             "is not delivered and its record stays", self.name, obligation_id,
-                             part.get("path") or part.get("url"))
-                if part["id"] in changed:
-                    await self._notify_media_delivery_failure(
-                        source.chat_id, str(part.get("path") or part.get("url")),
-                        is_voice=bool(part.get("voice")), metadata=metadata)
-        if sendable:
+        if owed:
             await self._deliver_owed_attachments(
-                MessageEvent(text="", source=source), _ExtractedResponse.of_attachments(sendable),
-                metadata or {}, obligation_id=obligation_id, held=held)
+                MessageEvent(text="", source=source), _ExtractedResponse.of_attachments(owed),
+                metadata or {}, obligation_id=obligation_id, held=held, session_key=session_key)
+
+    async def _record_unsendable_attachments(self, source: Any, obligation_id: Optional[str], parts: Dict[str, Any],
+                                             tracked: Dict[str, Any], refused: Dict[str, str],
+                                             metadata: Optional[Dict[str, Any]]) -> None:
+        """The attachments of an owner message's reply the check before their send refused (*refused*:
+        component id -> ``missing`` / ``blocked``): each tracked one is recorded in that state, every one is
+        logged at ERROR, and the chat is told when a state is new (an untracked one: each time)."""
+        marks = {cid: verdict for cid, verdict in refused.items() if cid in tracked}
+        changed = set(await self._mark_components(obligation_id, marks)) if obligation_id and marks else set()
+        for cid, verdict in refused.items():
+            path = str(parts[cid]["path"])
+            logger.error("[%s] An attachment of an owner message's reply (obligation %s) is not sent: %s %s; the "
+                         "reply is not delivered and its record stays", self.name, obligation_id,
+                         "gone from" if verdict == ATTACHMENT_MISSING else "refused by the media delivery policy:",
+                         _log_safe_path(path))
+            if cid in changed or cid not in tracked:
+                await self._notify_media_delivery_failure(
+                    source.chat_id, path, is_voice=bool(parts[cid].get("voice")), metadata=metadata or None)
 
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
@@ -4857,20 +4922,17 @@ class BasePlatformAdapter(ABC):
         """``_extract_response_content``'s split of a stored reply, for a later start that owes it
         (gateway/run_startup.py): MEDIA tags, image URLs, residual directives, bare local paths, an
         emptied response recovered as text. No history dedupe: nothing of this reply was delivered.
-        A MEDIA file that is gone from this host stays one of the reply's attachments: the reply
-        requires it, and the send records it ``missing`` (redeliver_owed_attachments), which keeps the
-        reply owed; only a path the delivery policy refuses is dropped, as the live final drops it.
+        Every MEDIA file the reply declares stays one of its attachments, as the live final keeps it
+        (``_reply_media``): one that is gone or that the policy refuses is recorded ``missing`` or
+        ``blocked`` by its send (``_deliver_owed_attachments``), which keeps the reply owed.
         The caller holds the routed profile's media scope."""
         force_document = "[[as_document]]" in response
         tagged, rest = cls.extract_media(response)
-        media_files = []
-        for path, is_voice in tagged:
-            allowed = cls.filter_media_delivery_paths([(path, is_voice)], session_key=session_key)
-            media_files += allowed or ([] if _existing_regular_file(str(path)) else [(str(path), bool(is_voice))])
+        media_files = cls._reply_media(tagged, session_key, owed=True)
         images, text_content = cls.extract_images(rest)
         text_content = _strip_media_directives(text_content).strip()
         local_files, text_content = cls.extract_local_files(text_content)
-        local_files = cls.filter_local_delivery_paths(local_files, session_key=session_key)
+        local_files = cls._reply_local_files(local_files, session_key)
         if not (text_content or images or local_files or media_files):
             text_content = _strip_media_directives(response).strip()
         return _ExtractedResponse(
@@ -4878,11 +4940,12 @@ class BasePlatformAdapter(ABC):
             force_document_attachments=force_document, pre_extract=response)
 
     async def _extract_response_content(self, response: str, event: MessageEvent, session_key: str,
-                                        *, is_ephemeral_response: bool) -> "_ExtractedResponse":
+                                        *, is_ephemeral_response: bool, owed: bool = False) -> "_ExtractedResponse":
         """Split a handler response into deliverable text + attachments. Order matters: MEDIA tags →
         image URLs → residual directives → bare local paths (skipped for ephemeral notices so config
         paths stay text; unknown-extension MEDIA tags survive for the bare-path detector). History
-        dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is recovered."""
+        dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is recovered.
+        ``owed``: an owner message's reply, which keeps every MEDIA file it declares (``_reply_media``)."""
         # Captured before extract_media strips it: images then go via send_document (no recompression).
         force_document = "[[as_document]]" in response
         pre_extract = response
@@ -4890,7 +4953,7 @@ class BasePlatformAdapter(ABC):
         # bare-path validator infer the sandbox from the ACTIVE profile (#109024).
         with self._media_delivery_scope(event.source):
             media_files, response = self.extract_media(response)
-            media_files = self.filter_media_delivery_paths(media_files, session_key=session_key)
+            media_files = self._reply_media(media_files, session_key, owed=owed)
             images, text_content = self.extract_images(response)
             # Strip any remaining internal directives from message body (fixes #1561). _strip_media_directives
             # shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag with an unknown extension is intentionally left in
@@ -4901,7 +4964,7 @@ class BasePlatformAdapter(ABC):
             local_files = []
             if not is_ephemeral_response:
                 local_files, text_content = self.extract_local_files(text_content)
-                local_files = self.filter_local_delivery_paths(local_files, session_key=session_key)
+                local_files = self._reply_local_files(local_files, session_key)
         history = (await self._bounded_history_media_paths_for_session(session_key)
                    if local_files else None)
         if history:
@@ -5014,13 +5077,14 @@ class BasePlatformAdapter(ABC):
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
                 reply_owed = True
-                extracted = await self._extract_response_content(
-                    response, event, session_key, is_ephemeral_response=is_ephemeral_response)
-                text_content, media_files = extracted.text_content, extracted.media_files
-                # An owner message's reply: what it requires (text and every attachment) is stored before
-                # anything is sent, and a component an earlier send of it already delivered is not sent
-                # again.
+                # An owner message's reply: what it requires (text and every attachment it declares, before
+                # any existence or policy filtering) is stored before anything is sent, and a component an
+                # earlier send of it already delivered is not sent again.
                 _answer_ref = getattr(event, "_inbound_ledger_ref", None)
+                extracted = await self._extract_response_content(
+                    response, event, session_key, is_ephemeral_response=is_ephemeral_response,
+                    owed=bool(_answer_ref))
+                text_content, media_files = extracted.text_content, extracted.media_files
                 try:
                     _owed_id, _held = await self._record_reply_components(
                         event.source, session_key,
@@ -5073,7 +5137,7 @@ class BasePlatformAdapter(ABC):
                 elif _answer_ref:
                     _attachments_ok = await self._deliver_owed_attachments(
                         event, extracted, _final_thread_metadata, obligation_id=_owed_id, held=_held,
-                        record_delivery=_record_delivery,
+                        session_key=session_key, record_delivery=_record_delivery,
                         anything_sent=delivery_attempted or _tts_caption_delivered or _text_done)
                 else:
                     await self._deliver_attachments(
