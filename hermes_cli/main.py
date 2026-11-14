@@ -621,9 +621,10 @@ if sys.platform == "win32":
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
-# ``update`` and ``target bind`` resolve no external secret source (#73381): that argv check, for
-# every dotenv load in the process, is ``_early_recovery._should_skip_external_secret_sources``.
-load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+# ``update`` and ``target bind`` resolve no external secret source (#73381, _early_recovery). A dark
+# hermes-acp / python -m acp_adapter launch (acp_adapter.entry owns dark mode) skips this load; ``hermes acp`` keeps it.
+if not (sys.argv[1:2] == ["acp"] and getattr(sys.modules.get("acp_adapter.entry"), "dark_launch", bool)()):
+    load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
 # Bridge security.redact_secrets → HERMES_REDACT_SECRETS BEFORE hermes_logging
 # imports agent.redact, which snapshots the flag exactly once at import. A

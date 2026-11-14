@@ -6,6 +6,7 @@ owner's ``--yolo`` on, so a seam that lost the principal would auto-approve."""
 
 import json
 import threading
+from contextlib import contextmanager, nullcontext
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -88,8 +89,43 @@ def test_an_explicit_owner_principal_keeps_the_owner_bypass():
     assert _as("owner", _observe) == ("owner", True)
 
 
-@pytest.mark.parametrize("principal,expected", [(None, ("owner", True)), ("peer", ("peer", False))])
-def test_concurrent_tool_workers_carry_the_turn_principal(monkeypatch, principal, expected):
+_PEER_SERVER = "peer-srv"
+_GRANTED = ("mcp__peer_srv__tool_a", "mcp__peer_srv__tool_b")
+
+
+@contextmanager
+def _granted_peer_tools(monkeypatch, agent, *, grant=True):
+    """``_GRANTED`` as native MCP tools that the in-memory ``gateway.canonical_peer_tools`` policy
+    lists, plus (``grant``) the grant the verified canonical ingress binds for ``agent``'s peer turn.
+    No config file is read for the policy or written."""
+    from agent.canonical_peer_tools import PeerToolGrant, bind_grant, reset_grant
+    from hermes_cli import config
+    from tools.mcp_tool_handlers import _make_tool_handler
+    from tools.mcp_tool_registration import _forget_mcp_tool_server, _track_mcp_tool_server
+    from tools.registry import registry
+
+    policy = {"binding": "acp-canonical-ceo", "mcp_server": _PEER_SERVER, "read": list(_GRANTED), "mutate": {}}
+    real_load = config.load_config
+    monkeypatch.setattr(config, "load_config", lambda *a, **k: {
+        **real_load(), "gateway": {**(real_load().get("gateway") or {}), "canonical_peer_tools": policy}})
+    for name in _GRANTED:
+        schema = {"name": name, "description": name, "parameters": {"type": "object", "properties": {}}}
+        registry.register(name, f"mcp-{_PEER_SERVER}", schema,
+                          _make_tool_handler(_PEER_SERVER, name.rsplit("__", 1)[1], 30))
+        _track_mcp_tool_server(name, _PEER_SERVER)
+    token = bind_grant(PeerToolGrant(binding=policy["binding"], agent=agent, verify=lambda: None)) if grant else None
+    try:
+        yield _GRANTED
+    finally:
+        if token is not None:
+            reset_grant(token)
+        for name in _GRANTED:
+            registry.deregister(name)
+            _forget_mcp_tool_server(name)
+
+
+def _concurrent_agent(monkeypatch):
+    """The stub agent and the ``(worker thread, _observe())`` each dispatched tool saw."""
     agent = _make_agent(monkeypatch)
     agent._tool_guardrails = MagicMock()
     agent._tool_guardrails.before_call = lambda name, args: MagicMock(allows_execution=True)
@@ -100,10 +136,30 @@ def test_concurrent_tool_workers_carry_the_turn_principal(monkeypatch, principal
         return json.dumps({"ok": name})
 
     agent._invoke_tool = MagicMock(side_effect=_invoke)
-    calls = [_FakeToolCall("tool_a", "tc_a"), _FakeToolCall("tool_b", "tc_b")]
-    _as(principal, lambda: agent._execute_tool_calls_concurrent(_FakeAssistantMsg(calls), [], "task"))
+    return agent, seen
+
+
+@pytest.mark.parametrize("principal,expected", [(None, ("owner", True)), ("peer", ("peer", False))])
+def test_concurrent_tool_workers_carry_the_turn_principal(monkeypatch, principal, expected):
+    """A peer turn runs only tools its grant allows, so its batch is two granted native MCP tools."""
+    agent, seen = _concurrent_agent(monkeypatch)
+    names = _GRANTED if principal == "peer" else ("tool_a", "tool_b")
+    calls = [_FakeToolCall(names[0], "tc_a"), _FakeToolCall(names[1], "tc_b")]
+    with _granted_peer_tools(monkeypatch, agent) if principal == "peer" else nullcontext():
+        _as(principal, lambda: agent._execute_tool_calls_concurrent(_FakeAssistantMsg(calls), [], "task"))
     assert [verdict for _tid, verdict in seen] == [expected, expected]
     assert all(tid != threading.get_ident() for tid, _verdict in seen)  # really on worker threads
+
+
+def test_the_same_concurrent_peer_batch_without_a_grant_is_refused_and_runs_nothing(monkeypatch):
+    agent, seen = _concurrent_agent(monkeypatch)
+    messages = []
+    with _granted_peer_tools(monkeypatch, agent, grant=False) as names:
+        calls = [_FakeToolCall(names[0], "tc_a"), _FakeToolCall(names[1], "tc_b")]
+        _as("peer", lambda: agent._execute_tool_calls_concurrent(_FakeAssistantMsg(calls), messages, "task"))
+    assert seen == [] and agent._invoke_tool.call_count == 0
+    assert [m["tool_call_id"] for m in messages] == ["tc_a", "tc_b"]
+    assert all("canonical peer turn" in m["content"] and "not executed" in m["content"] for m in messages)
 
 
 def _delegate(principal, **kwargs):

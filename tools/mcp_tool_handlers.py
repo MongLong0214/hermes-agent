@@ -47,6 +47,15 @@ _SESSION_OUTCOME_UNCERTAIN_MSG = (
     "UNKNOWN — the operation may or may not have taken effect server-side. It was NOT automatically retried to "
     "avoid a duplicate side effect. The connection has {state}. Verify whether the operation took effect (e.g. "
     "with a read-only tool) before re-invoking it.")
+# A native ``tools/call`` handler carries the (server, tool) it was built for; see :func:`mcp_tool_origin`.
+_NATIVE_TOOL_ATTR = "mcp_native_tool"
+_PEER_REFUSAL = ("MCP tool '{tool}' was NOT run: in a canonical peer turn only the exact call the peer "
+                 "tool check approved may be sent, through the handler it checked, while the binding "
+                 "it was approved under is still current.")
+
+
+class _NotSent(str):
+    """A refusal for a call that never reached the server: no circuit-breaker bookkeeping."""
 
 
 def _tool_is_read_only(server_name: str, tool_name: str) -> bool:
@@ -62,6 +71,32 @@ def _trust_approval_key(server_name: str, tool_name: str) -> str:
     so allowing one write tool never covers the server's others. Session entries are per chat;
     always entries land in the active profile's ``command_allowlist``."""
     return f"mcp:{server_name}/{tool_name}"
+
+
+def _trust_gate_asks(server_name: str, tool_name: str) -> bool:
+    """Whether the trust gate treats ``tool_name`` as write-capable on a ``trust: untrusted`` server,
+    before any remembered answer (:func:`_trust_granted`) is consulted."""
+    from tools.mcp_tool_scope import _server_key
+    # Trust is the calling profile's own policy (an adopter of a shared connection keeps its own tier).
+    trust = _core._server_trust_levels.get(_server_key(server_name), _core._TRUST_FULL)
+    return trust == _core._TRUST_UNTRUSTED and not _tool_is_read_only(server_name, tool_name)
+
+
+def mcp_tool_origin(registry_name: str) -> Optional[tuple[str, bool, Callable]]:
+    """``(raw server name, trust gate would ask, handler)`` while the handler registered for
+    ``registry_name`` NOW is a native :func:`_make_tool_handler` handler of the server that registered
+    it, else None. Bound to the current registration, never to metadata left by an earlier discovery
+    (a reconnect rebuilds the handler; a ``tools/list_changed`` refresh can put a generated utility
+    under the same name)."""
+    from tools.mcp_tool_schema import mcp_prefixed_tool_name
+    from tools.registry import registry
+    handler = getattr(registry.get_entry(registry_name), "handler", None)
+    native = getattr(handler, _NATIVE_TOOL_ATTR, None)
+    with _core._lock:
+        server_name = _core._mcp_tool_server_names.get(registry_name)
+    if native is None or native[0] != server_name or mcp_prefixed_tool_name(*native) != registry_name:
+        return None
+    return server_name, _trust_gate_asks(*native), handler
 
 
 def _trust_granted(server_name: str, tool_name: str) -> bool:
@@ -131,9 +166,7 @@ def _trust_gate_check(server_name: str, tool_name: str, booked: Optional[list] =
     from tools import mcp_tool_costs as _costs
     # Trust and costs are the calling profile's own policy (an adopter of a shared connection keeps its own).
     key = _server_key(server_name)
-    trust = _core._server_trust_levels.get(key, _core._TRUST_FULL)
-    gated = (trust == _core._TRUST_UNTRUSTED and not _tool_is_read_only(server_name, tool_name)
-             and not _trust_granted(server_name, tool_name))
+    gated = _trust_gate_asks(server_name, tool_name) and not _trust_granted(server_name, tool_name)
     charge = None
     if key in _core._server_cost_policies:  # no table: not even a session lookup, main's path byte for byte
         from tools.approval_context import get_current_session_key
@@ -274,6 +307,8 @@ def _result_is_error(result) -> bool:
 def _record_call_outcome(server_name: str, result) -> Any:
     """Breaker bookkeeping: an error payload from the tool itself still counts as a strike (#10447),
     flagged as an application error so the open-breaker message stays truthful."""
+    if isinstance(result, _NotSent):
+        return str(result)
     if _result_is_error(result):
         _core._bump_server_error(server_name, application=True)
     else:
@@ -702,9 +737,19 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
 
     def _handler(args: dict, **kwargs) -> Any:
         from tools.mcp_call_provenance import PROVENANCE_META_KEY, build_call_provenance, strip_caller_provenance
+        from tools.approval_context import is_peer_turn
         # Host-derived provenance, read here on the turn's thread, whatever context the MCP loop runs _call in.
         args = strip_caller_provenance(args)
         call_meta = {PROVENANCE_META_KEY: build_call_provenance()}
+        claim = None
+        if is_peer_turn():
+            # A canonical peer turn sends only the exact call its batch pinned to this handler, as the
+            # pinned deep snapshot (agent.canonical_peer_tools); anything else never reaches the server.
+            from agent.canonical_peer_tools import claim_pinned_call
+            from tools.mcp_tool_schema import mcp_prefixed_tool_name
+            claim = claim_pinned_call(mcp_prefixed_tool_name(server_name, tool_name), args, _handler)
+            if claim is None:
+                return tool_error(_PEER_REFUSAL.format(tool=tool_name))
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
         booked: list = []  # a costed call's charge; refunded when the call never reaches the server
         error = _trust_gate_check(server_name, tool_name, booked, args)
@@ -729,13 +774,23 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
             if report is not None:
                 report(progress, total, message)
 
+        dispatched: list = []  # one mark per attempt that went on to the send
+
         async def _call():
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
+                # Every attempt (after a queue wait, or a retry) re-proves a peer turn's binding and
+                # that no alias changed the checked arguments, then sends the owned snapshot itself.
+                if claim is not None and not await asyncio.to_thread(claim.sendable, args):
+                    if not dispatched:  # nothing of this call reached the server
+                        while booked:
+                            booked.pop().refund()
+                    return _NotSent(tool_error(_PEER_REFUSAL.format(tool=tool_name)))
+                dispatched.append(None)
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
                 try:
                     result = await _call_tool_racing_stdio_death(
-                        server, server_name, tool_name, args, _on_progress if report is not None else None,
-                        meta=call_meta)
+                        server, server_name, tool_name, args if claim is None else claim.snapshot,
+                        _on_progress if report is not None else None, meta=call_meta)
                 finally:
                     server._pending_call_context = None
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy
@@ -753,6 +808,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
             _on_failure, record_outcome=True)
         # Off the MCP loop on purpose: image prep is CPU work (bounded vision pool) that must not stall other servers' I/O.
         return _mcp_result_with_native_images(text, image_paths) if native_images and not _result_is_error(text) else text
+    setattr(_handler, _NATIVE_TOOL_ATTR, (server_name, tool_name))
     return _handler
 
 
@@ -763,6 +819,9 @@ def _make_utility_handler(op: str, log_label: str, rpc, render, required: Option
     def _factory(server_name: str, tool_timeout: float):
         def _handler(args: dict, **kwargs) -> str:
             from tools import mcp_tool_discovery as _discovery  # lazy: import cycle
+            from tools.approval_context import is_peer_turn
+            if is_peer_turn():  # never a peer tool: no pin can name it (mcp_tool_origin)
+                return tool_error(_PEER_REFUSAL.format(tool=log_label))
             server = _discovery._get_connected_server_for_call(server_name)
             if not server or not server.session:
                 return tool_error(f"MCP server '{server_name}' is not connected")

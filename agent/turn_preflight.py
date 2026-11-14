@@ -19,6 +19,9 @@ from agent.conversation_compression import (
     compression_skipped_due_to_lock, context_compression_timed_out, conversation_history_after_compression,
 )
 from agent.conversation_compression_feasibility import ensure_compression_feasibility_checked
+from agent.native_compaction_grace import (
+    consume_native_compaction_preflight_fallback, defer_local_preflight_for_native_compaction,
+)
 from agent.turn_context import _review_fork_first_request_pending
 from agent.turn_context_compaction import (
     _apply_grown_window, _blocked_compress_reason, _clear_overflow_warn, _refund_api_call,
@@ -64,8 +67,10 @@ def run_preflight_compression(
     ``v.action``. A compression pass that never reaches the provider refunds the
     call/budget in every branch (skip, re-run, timeout) so ``api_call_count`` never
     over-reports; a lock/transient skip refunds the attempt and leaves the progress
-    blocker unarmed. A forced provider-overflow preflight that any gate blocks fails
-    closed (llama.cpp may silently truncate)."""
+    blocker unarmed (a forced one ends the turn deferred, unsent). A forced
+    provider-overflow preflight that any other gate blocks fails closed (llama.cpp may
+    silently truncate). The one native compaction attempt a threshold crossing gets
+    defers; a spent attempt never does (the caller never defers an anchored figure)."""
     from agent.conversation_loop import (
         _COMPRESSION_TIMEOUT_FINAL_RESPONSE, _HANDOFF_SKIP_FINAL_RESPONSE,
         _compression_deferred_result, _maybe_grow_local_window, _provider_overflow_exhausted_result,
@@ -82,6 +87,7 @@ def run_preflight_compression(
             max_compression_attempts,
         )
 
+    defer_preflight = _native_preflight_deferral(agent, request_pressure_tokens, v.messages, defer_preflight)
     _eligible = (
         agent.compression_enabled
         and len(v.messages) > 1
@@ -167,6 +173,17 @@ def run_preflight_compression(
             v._last_preflight_pressure = None
             if v.pending_moa_prepared_request is moa_prepared_request:
                 v.pending_moa_prepared_request = None
+            if provider_overflow_preflight:
+                # The provider proved this request cannot fit, so don't resend it — but nothing was
+                # spent, so end deferred (as the 413 recovery does), not via the forced-preflight
+                # exhaustion below. Never reaches the provider: refund the provisional call/budget
+                # like every other never-sent branch, else the result over-reports api_call_count.
+                v.api_call_count = _refund_api_call(agent, v.api_call_count)
+                agent._persist_session(v.messages, v.conversation_history)
+                return _done("return", _compression_deferred_result(
+                    agent, v.messages, v.api_call_count,
+                    reason="lock" if compression_skipped_due_to_lock(agent) else "transient_block",
+                ))
         else:
             _reset_retry_state_after_compaction(agent)
             # Re-baseline the flush cursor: rotation returns None (child flushes
@@ -224,6 +241,17 @@ def run_preflight_compression(
         # message request) must fail closed: the request is proven not to fit.
         return _done("return", _exhausted_result())
     return _done("fallthrough")
+
+
+def _native_preflight_deferral(agent: Any, request_pressure_tokens: Any, messages: Any, defer_preflight: Any) -> Any:
+    """The ``defer_preflight`` predicate for this request: the one native compaction attempt a
+    threshold crossing gets defers; a spent attempt never does; otherwise the caller's predicate
+    (which never defers an anchored figure) stands."""
+    if defer_local_preflight_for_native_compaction(agent, request_pressure_tokens, messages=messages):
+        return lambda _t: True
+    if consume_native_compaction_preflight_fallback(agent):
+        return lambda _t: False
+    return defer_preflight
 
 
 @dataclass
@@ -297,7 +325,19 @@ def compress_after_tool_results(
 
     if agent.compression_enabled and compression_attempts < max_compression_attempts:
         ensure_compression_feasibility_checked(agent, _real_tokens)
-    if (
+    # Consult the native grace only over the trigger: an under-trigger figure (the 0 sentinel
+    # right after a compaction) would clear an armed attempt.
+    _native_deferred = (
+        agent.compression_enabled
+        and _real_tokens >= int(getattr(_compressor, "threshold_tokens", 0) or 0)
+        and defer_local_preflight_for_native_compaction(agent, _real_tokens, messages=messages)
+    )
+    if _native_deferred:
+        logger.info(
+            "Deferring post-tool compression: ~%s request tokens get one native compaction "
+            "attempt first", f"{_real_tokens:,}",
+        )
+    elif (
         agent.compression_enabled
         and compression_attempts < max_compression_attempts
         and not bool(
@@ -316,33 +356,15 @@ def compress_after_tool_results(
         messages, active_system_prompt = agent._compress_context(
             messages, system_message, approx_tokens=_real_tokens, task_id=effective_task_id, trigger="post_tool",
         )
-        if messages is _post_tool_input and compression_skipped_due_to_lock(agent):
-            # Lock-skip no-op is a temporary defer, not evidence about compressibility:
-            # refund so a lock-loser loop doesn't burn the budget toward exhausted.
-            # #69870 lock-skip / #97488 transient-block: this pass no-oped for a TEMPORARY reason (another
-            # path holds the compression lock, or a timed cooldown/backoff guard is active). That is a
-            # temporary DEFER, not evidence about compressibility — refund the attempt (it must not burn the
-            # shared overflow-recovery budget toward compression_exhausted → gateway auto-reset,
-            # #9893/#35809) and leave the insufficient-progress blocker unarmed. Proceed with the current
-            # request: if it truly does not fit, the provider's 413/overflow handler returns the soft
-            # compression_deferred result with that stronger signal.
-            # #69870 lock-skip: the provider proved the request does not fit, but this compression pass
-            # no-oped only because another path holds the session's compression lock. Temporary defer, not
-            # exhaustion — refund the attempt and end the turn softly so the gateway does NOT auto-reset the
-            # session (#9893/#35809).
-            # #97488 transient-block: compression no-oped because a timed guard (host-timeout cooldown /
-            # structural backoff) is active — a temporary defer, not evidence of incompressibility. Never
-            # classify it as compression_exhausted (gateway auto-reset).
-            # bypass_cooldown=True,  # #100661 provider-proven overflow
-            # #97488: timed transient guard — defer, never exhaustion (gateway auto-reset).
-            # #69870 lock-skip: the provider proved the request does not fit, but this compression pass
-            # no-oped only because another path holds the session's compression lock. Temporary defer, not
-            # exhaustion — refund the attempt and end the turn softly so the gateway does NOT auto-reset the
-            # session (#9893/#35809).
-            # #97488 transient-block: a timed guard (host-timeout cooldown / structural backoff) no-oped
-            # this pass — defer softly, never compression_exhausted (which would auto-reset the session).
-            # #69870 lock-skip: this pass no-oped because another path holds the session's compression lock
-            # — a temporary defer, not evidence about compressibility.
+        if messages is _post_tool_input and (
+            compression_skipped_due_to_lock(agent) or compression_blocked_transiently(agent)
+        ):
+            # #69870 lock-skip / #97488 transient-block: this pass no-oped for a TEMPORARY reason
+            # (another path holds the compression lock, or a timed cooldown/backoff guard is
+            # active) — a defer, not evidence about compressibility. Refund the attempt so a
+            # lock-loser/cooldown loop never burns the shared overflow-recovery budget toward
+            # compression_exhausted, and proceed: if the request truly does not fit, the
+            # provider's 413/overflow handler returns the soft compression_deferred result.
             compression_attempts -= 1
         else:
             conversation_history = conversation_history_after_compression(

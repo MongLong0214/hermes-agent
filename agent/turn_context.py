@@ -145,6 +145,17 @@ def substitute_api_content(api_msg: dict[str, Any]) -> Optional[str]:
     return sidecar
 
 
+def substitute_message_wire_content(msg: Mapping[str, Any], api_msg: dict[str, Any]) -> None:
+    """:func:`substitute_api_content` on the wire copy *api_msg* of *msg*, except that a canonical peer row
+    is sent only as the rendering of its metadata (never its bare body or an unverified sidecar)."""
+    from agent.canonical_peer import peer_metadata, peer_wire_text
+    if peer_metadata(msg) is None:
+        substitute_api_content(api_msg)
+        return
+    api_msg.pop("api_content", None)
+    api_msg["content"] = peer_wire_text(msg)
+
+
 def drop_stale_api_content(msg: dict[str, Any]) -> None:
     """Drop the ``api_content`` sidecar from a message whose content was rewritten
     (replaying it would resend what the rewrite removed; cost is one cache miss)."""
@@ -1106,6 +1117,11 @@ def _stamp_api_content_sidecar(
     if _api_content is None or _api_content == durable_content:
         return
     _turn_user_msg["api_content"] = _api_content
+    from agent.canonical_peer import PEER_SIDECAR_VERIFIED_KEY, peer_metadata
+    if peer_metadata(_turn_user_msg) is not None:
+        # Hermes composed this sidecar itself on the live dict (not a stored value), so later
+        # consumers of THIS dict (iteration summary, next-turn replay) send what the live request sent.
+        _turn_user_msg[PEER_SIDECAR_VERIFIED_KEY] = True
 
     # When another writer materialized this turn's user row BEFORE the sidecar existed — in-place
     # preflight compaction, or a close/early flush that raced the prologue (#102194) — the crash
@@ -1289,8 +1305,13 @@ def build_turn_context(
     # user turn is user-initiated; tool-loop follow-ups are agent-initiated.
     agent._is_user_initiated_turn = True
 
-    # Preserve the original user message (no nudge injection).
-    original_user_message = persist_user_message if persist_user_message is not None else user_message
+    # Preserve the original user message (no nudge injection). A canonical peer turn's clean body is for
+    # storage only: semantic consumers (memory query, reactions, external memory) see the same quoted
+    # rendering the model does, never the peer's text as if the owner typed it.
+    if persist_user_display_kind == "canonical_peer":
+        original_user_message = user_message
+    else:
+        original_user_message = persist_user_message if persist_user_message is not None else user_message
     should_review_memory = _tick_memory_nudge(agent)
     _emit_reaction(agent, original_user_message, persist_user_display_kind)
 
@@ -1433,6 +1454,7 @@ def build_api_messages(
     beyond the sidecar stamp, and the system prompt is built ONCE per session and
     replayed verbatim."""
     from agent.agent_runtime_helpers import fill_empty_non_final_wire_payload
+    from agent.canonical_peer import peer_metadata, peer_wire_text
     from agent.conversation_loop import _clone_message_for_send
     from agent.replay_cleanup import canonicalize_replay_history
 
@@ -1465,21 +1487,29 @@ def build_api_messages(
         _api_content = api_msg.pop("api_content", None)
         for key in PERSISTENCE_ONLY_MESSAGE_FIELDS:
             api_msg.pop(key, None)
+        # A canonical peer row reaches the model only as the rendering of its metadata (plus a sidecar
+        # extension only a digest check or the live stamp verified). Raises on inconsistent provenance.
+        peer_text = peer_wire_text(msg) if peer_metadata(msg) is not None else None
 
         # Inject ephemeral context (memory prefetch + pre_llm_call user hooks)
         # at API time only; `messages` is untouched beyond the api_content stamp.
         if msg is current_turn_message and msg.get("role") == "user":
-            if isinstance(_api_content, str) and _api_content:
+            if isinstance(_api_content, str) and _api_content and (peer_text is None or _api_content == peer_text):
                 # Reuse the prologue's stamp so sidecar and wire cannot drift
                 # and every pass this turn sends identical bytes.
                 api_msg["content"] = _api_content
             else:
                 # Callers that bypass the prologue stamping: compose live.
                 _composed = compose_user_api_content(
-                    api_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
+                    api_msg.get("content", "") if peer_text is None else peer_text,
+                    ext_prefetch_cache, plugin_user_context,
                 )
                 if _composed is not None:
                     api_msg["content"] = _composed
+                elif peer_text is not None:
+                    api_msg["content"] = peer_text
+        elif peer_text is not None:
+            api_msg["content"] = peer_text
         elif (
             isinstance(_api_content, str) and _api_content
             and msg.get("role") in ("user", "assistant")

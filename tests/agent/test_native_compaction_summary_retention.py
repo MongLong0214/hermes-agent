@@ -21,6 +21,9 @@ from agent.native_compaction import (
     _is_summary_item,
     prune_pre_checkpoint_items,
 )
+from tests.agent.test_native_compaction_preflight_grace import (
+    _REQUEST, TRIGGER, _Server, _history, _native_agent,
+)
 
 
 def _standalone_summary_content(body: str = "## Active Task\nstuff") -> str:
@@ -392,3 +395,66 @@ class TestPrunePreCheckpointItemsMalformedInputs:
         assert len(pruned) == 2
         assert pruned[0]["type"] == "compaction"
         assert pruned[1]["content"] == "Valid user ask"
+
+
+# One-shot preflight grace: a native capture is never resent by the in-stream reconnect
+# (agent/codex_runtime.py ``withhold_native_capture_reconnect``). Real-loop harness in
+# test_native_compaction_preflight_grace.py.
+
+
+class _ConnectFailServer(_Server):
+    """``connect_error``: the SDK wraps a pre-stream transport failure in APIConnectionError."""
+
+    def create(self, **kw):
+        if self.plan and self.plan[0] == "connect_error":
+            import httpx
+            import openai
+
+            self.plan.pop(0)
+            probe = _Server(["text"])  # the same billing record, without answering
+            probe.create(**kw)
+            self.wire.append({**probe.wire[0], "action": "connect_error"})
+            error = openai.APIConnectionError(request=_REQUEST)
+            error.__cause__ = httpx.ConnectError("connection refused", request=_REQUEST)
+            raise error
+        return super().create(**kw)
+
+
+def test_a_capture_that_died_before_any_event_is_rebuilt_not_resent(tmp_path, monkeypatch):
+    server = _Server(["tool", "zero_event", "text", "tool", "text"])
+    agent = _native_agent(tmp_path / "failed", monkeypatch, server, [])
+    first = agent.run_conversation("run the log tool", conversation_history=_history(30_000))
+
+    failed, later = server.wire[1], server.wire[2:]
+    assert failed["native"] and failed["billed"] >= TRIGGER
+    assert later and failed["payload"] not in {w["payload"] for w in later}
+    assert all(w["billed"] < TRIGGER for w in later)
+
+    # The fallback is that turn's alone: the next turn's crossing gets its native attempt.
+    sent = len(server.wire)
+    agent.run_conversation("run it again", conversation_history=first["messages"])
+    crossing = [w for w in server.wire[sent:] if w["billed"] >= TRIGGER]
+    assert crossing and all(w["native"] and w["compacts"] for w in crossing)
+
+
+def test_a_capture_refused_at_connect_is_rebuilt_not_resent(tmp_path, monkeypatch):
+    server = _ConnectFailServer(["tool", "connect_error", "text"])
+    agent = _native_agent(tmp_path / "refused", monkeypatch, server, [])
+    agent.run_conversation("run the log tool", conversation_history=_history(30_000))
+
+    failed, later = server.wire[1], server.wire[2:]
+    assert failed["action"] == "connect_error" and failed["billed"] >= TRIGGER
+    assert later and failed["payload"] not in {w["payload"] for w in later}
+    assert all(w["billed"] < TRIGGER for w in later)
+
+
+def test_a_replay_that_died_before_any_event_reconnects_like_any_request(tmp_path, monkeypatch):
+    # The capture answers with another tool call, so its replay goes out in the same turn, still
+    # over the trigger by the anchored figure: the grace owns it, and it reconnects as base does.
+    server, summaries = _Server(["tool", "tool", "zero_event", "text"]), []
+    agent = _native_agent(tmp_path / "replay", monkeypatch, server, summaries)
+    agent.run_conversation("run the log tool", conversation_history=_history(30_000))
+
+    capture, died, reconnect = server.wire[1], server.wire[2], server.wire[3]
+    assert capture["compacts"] and died["action"] == "zero_event" and died["replays"]
+    assert reconnect["replays"] and len(server.wire) == 4 and summaries == []

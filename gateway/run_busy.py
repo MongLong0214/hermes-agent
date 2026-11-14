@@ -114,16 +114,18 @@ class GatewayBusySessionMixin:
         state = self._peek_session_state(session_key)
         return state.conversation.queued_events if state else None
 
-    def _enqueue_fifo(self, session_key: str, queued_event: MessageEvent, adapter: Any) -> None:
-        """Append a /queue event to the FIFO chain for a session."""
+    def _enqueue_fifo(self, session_key: str, queued_event: MessageEvent, adapter: Any) -> bool:
+        """Append a /queue event to the FIFO chain for a session. False: the adapter has no
+        pending slot, so nothing was queued."""
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if pending_slot is None:
-            return
+            return False
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(queued_event)
         else:
             pending_slot[session_key] = queued_event
         queued_event._gateway_accepted = True
+        return True
 
     def _promote_queued_event(
         self, session_key: str, adapter: Any, pending_event: Optional[MessageEvent]
@@ -502,11 +504,14 @@ class GatewayBusySessionMixin:
         "notification_category",
     )
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
+        """Queue ``event`` as a later turn (a photo burst merges into the head slot). False: it
+        was NOT queued (no adapter, or the queue is at ``_BUSY_QUEUE_MAX_PENDING``), and a caller
+        that acknowledges must refuse instead of claiming it will run."""
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._delivery_adapter_for(event.source)
         if not adapter:
-            return
+            return False
         # FIFO so each follow-up gets its own turn in arrival order (the single pending slot used to
         # be silently OVERWRITTEN). Photo bursts still merge into the head slot (album semantics).
         pending_slot = getattr(adapter, "_pending_messages", None)
@@ -544,16 +549,16 @@ class GatewayBusySessionMixin:
                 merge_text=event.message_type == MessageType.TEXT,
             )
             event._gateway_accepted = True
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
                 "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
                 session_key, self._BUSY_QUEUE_MAX_PENDING,
             )
-            return
+            return False
 
-        self._enqueue_fifo(session_key, event, adapter)
+        return self._enqueue_fifo(session_key, event, adapter)
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Steerable text for a busy follow-up, transcribing voice-message media first.
@@ -640,8 +645,11 @@ class GatewayBusySessionMixin:
         if not adapter:
             return
         if self._queue_during_drain_enabled(effective_mode):
-            self._queue_or_replace_pending_event(session_key, event)
-            message = t("gateway.busy.drain_queued", action=self._status_action_gerund())
+            from gateway.session_ingress import QUEUE_FULL_REPLY
+            message = (
+                t("gateway.busy.drain_queued", action=self._status_action_gerund())
+                if self._queue_or_replace_pending_event(session_key, event) else QUEUE_FULL_REPLY
+            )
         else:
             message = t("gateway.busy.drain_rejected", action=self._status_action_gerund())
         await self._send_busy_reply(event, adapter, message)
@@ -1000,8 +1008,12 @@ class GatewayBusySessionMixin:
         _steer = await self._resolve_busy_steer_or_redirect(event, session_key, effective_mode, running_agent)
         # Queue as the next turn — skipped after a successful steer/redirect (the text is already in
         # the run and must NOT replay). FIFO gives each text its own turn (raw merge would join them).
-        if not _steer.steered and not _steer.redirected:
-            self._queue_or_replace_pending_event(session_key, event)
+        if not _steer.steered and not _steer.redirected and not self._queue_or_replace_pending_event(session_key, event):
+            # At the cap nothing was queued: interrupting would discard the running turn with no
+            # replacement, and the ordinary ack would claim a turn that never runs.
+            from gateway.session_ingress import QUEUE_FULL_REPLY
+            await self._send_busy_ack_reply(event, adapter, QUEUE_FULL_REPLY)
+            return True
         # Store the message so it's processed as the next turn after the current run finishes (or is
         # interrupted). Skip this for a successful steer — the text already landed inside the run and must
         # NOT also be replayed as a next-turn user message. Route through _queue_or_replace_pending_event

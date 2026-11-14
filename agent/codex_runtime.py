@@ -751,6 +751,13 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
                               turn_id: Any = None) -> dict[str, Any]:
     """Hand the turn to a ``codex app-server`` subprocess and project its events into ``messages``.
     Returns the chat_completions result shape. The user message is ALREADY in ``messages`` — never append it again."""
+    # The app-server executes its own exec, patch and MCP tools and asks its own approvals outside
+    # Hermes' tool loop, where a canonical peer turn's restriction cannot be enforced: refused before
+    # any request (the canonical ingress refuses such a turn before it is claimed; this is the last line).
+    from agent.tool_executor import _peer_turn
+
+    if _peer_turn(agent):
+        raise PermissionError("canonical_peer_runtime_refused")
     # Defense in depth for compression.checkpoint_required: agent init refuses the combination, but
     # api_mode is mutable. Explicit-True check matches compress_context().
     if getattr(agent, "compression_checkpoint_required", False) is True:
@@ -1195,6 +1202,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     import httpx as _httpx
     from openai import APIConnectionError as _APIConnectionError
     from agent import relay_llm
+    from agent.native_compaction_grace import withhold_native_capture_reconnect
     transport_errors = (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ReadError, _httpx.ConnectError, ConnectionError)
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries, model = 1, api_kwargs.get("model")
@@ -1303,6 +1311,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             buffer_connect_exhausted_notice(
                 agent, exc, attempts=attempt + 1,
                 base_url=getattr(active_client, "base_url", None) or getattr(agent, "base_url", ""))
+
+    def _log_native_grace_failure(exc: BaseException) -> None:
+        # Not ``_log_failure``: its buffered connect-exhausted notice would outlive the rebuild.
+        logger.warning("Codex Responses native compaction capture failed before any stream event (%s); "
+                       "not reconnecting, the turn rebuilds it through local preflight. %s",
+                       type(exc).__name__, agent._client_log_context())
 
     def _codex_stream_created(_raw_stream: Any) -> None:
         # Claim the delta sink for THIS attempt; a newer attempt supersedes this token.
@@ -1433,6 +1447,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             except transport_errors as exc:
                 if attempt_state["accepted_event"]:
                     return _CodexStreamTerminalFailure(exc)
+                # A native capture that died before any event: its reconnect would resend the
+                # over-trigger payload, so the loop rebuilds it through local preflight instead.
+                if not intercepted_events and withhold_native_capture_reconnect(agent):
+                    _log_native_grace_failure(exc)
+                    raise
                 if attempt >= max_stream_retries:
                     _log_failure(exc)
                     raise
@@ -1456,6 +1475,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 # token is claimed the inference may already be billed, so mid-stream failures still raise.
                 if attempt_state["accepted_event"]:
                     return _CodexStreamTerminalFailure(exc)
+                if not intercepted_events and withhold_native_capture_reconnect(agent):
+                    _log_native_grace_failure(exc)
+                    raise
                 if (attempt < max_stream_retries and writer_token["value"] is None
                         and isinstance(exc.__cause__, _httpx.TransportError)):
                     logger.debug(

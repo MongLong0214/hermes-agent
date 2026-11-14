@@ -91,6 +91,15 @@ def _load_env() -> None:
         log.info("No .env found at %s, using system env", hermes_home / ".env")
 
 
+def dark_launch() -> bool:
+    """ACP dark mode: a parent launcher that already scoped this process's environment sets the
+    exact value 1 (whitespace ignored), and neither this module nor the ``hermes_cli.main`` import
+    a launch without argv re-enters through loads the profile .env. Any other value keeps both
+    loads. MCP is not loaded at ACP startup either way (it belongs to the gateway daemon)."""
+    # health: allow HX002 -- launcher contract carried from the fork; it must be read before .env or config.yaml
+    return os.environ.get("HERMES_ACP_SKIP_ENV_LOAD", "").strip() == "1"
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="hermes-acp", description="Run Hermes Agent as an ACP stdio server.")
     parser.add_argument("--version", action="store_true", help="Print Hermes version and exit")
@@ -177,7 +186,8 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     _setup_logging()
-    _load_env()
+    if not dark_launch():
+        _load_env()
 
     logger = logging.getLogger(__name__)
     logger.info("Starting hermes-agent ACP adapter")

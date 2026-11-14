@@ -19,6 +19,9 @@ from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE, PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock, conversation_history_after_compression,
 )
+from agent.native_compaction_grace import (
+    begin_native_compaction_turn, defer_turn_start_preflight_for_native_replay,
+)
 
 logger = logging.getLogger("agent.turn_context")
 
@@ -227,6 +230,27 @@ def _codex_native_auto_compaction(agent: Any) -> bool:
     )
 
 
+def _turn_start_deferral(agent: Any, compressor: Any, preflight_tokens: int, messages: Any) -> Optional[tuple]:
+    """Why turn-start compression waits, as a log record ``(format, *args)``, or None. An
+    anchored figure is real usage + delta: never deferred, except for the checkpoint replay a
+    native capture is owed. Turn start never arms a native attempt of its own."""
+    if defer_turn_start_preflight_for_native_replay(agent, preflight_tokens, messages=messages):
+        return (
+            "Deferring preflight compression: ~%s >= %s replays its native compaction checkpoint first",
+            f"{preflight_tokens:,}", f"{compressor.threshold_tokens:,}",
+        )
+    if getattr(agent, "_request_pressure_anchored", False) or not getattr(
+        compressor, "should_defer_preflight_to_real_usage", lambda _tokens: False
+    )(preflight_tokens):
+        return None
+    return (
+        "Skipping preflight compression: rough estimate ~%s >= %s is not anchored on "
+        "real usage (last real provider prompt %s); deferring to the next response",
+        f"{preflight_tokens:,}", f"{compressor.threshold_tokens:,}",
+        f"{compressor.last_real_prompt_tokens:,}",
+    )
+
+
 def _preflight_compression(
     agent: Any, out: CompactionOutcome, system_message: Optional[str], user_message: Any,
     effective_task_id: str,
@@ -237,6 +261,7 @@ def _preflight_compression(
 
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
+    begin_native_compaction_turn(agent)
     if not agent.compression_enabled:
         _rearm_uncompressed_overflow_warn(agent, out.messages, out.active_system_prompt)
         return
@@ -264,10 +289,8 @@ def _preflight_compression(
         # snapshot may arm the interrupted-turn rollback.
         if isinstance(_snapshot_val, int) and not isinstance(_snapshot_val, bool):
             agent._turn_preflight_display_snapshot = _snapshot_val
-    # An anchored figure is real usage + delta: never deferred.
-    _preflight_deferred = not getattr(agent, "_request_pressure_anchored", False) and getattr(
-        _compressor, "should_defer_preflight_to_real_usage", lambda _tokens: False
-    )(_preflight_tokens)
+    _deferral = _turn_start_deferral(agent, _compressor, _preflight_tokens, out.messages)
+    _preflight_deferred = _deferral is not None
     _codex_native_auto = _codex_native_auto_compaction(agent)
 
     if not _preflight_deferred:
@@ -284,12 +307,7 @@ def _preflight_compression(
     _should_compress_now = False
     _compress_block_reason = None
     if _preflight_deferred:
-        logger.info(
-            "Skipping preflight compression: rough estimate ~%s >= %s is not anchored on "
-            "real usage (last real provider prompt %s); deferring to the next response",
-            f"{_preflight_tokens:,}", f"{_compressor.threshold_tokens:,}",
-            f"{_compressor.last_real_prompt_tokens:,}",
-        )
+        logger.info(*_deferral)
     elif _compression_cooldown:
         logger.info(
             "Skipping preflight compression: same-session cooldown active "

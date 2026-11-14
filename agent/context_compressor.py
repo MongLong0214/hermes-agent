@@ -11,9 +11,11 @@ import sqlite3
 import re
 import time
 from dataclasses import dataclass
+from itertools import accumulate
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from agent.image_eviction_policy import images_all_within_many_image_limit, latched_retire_count, outbound_image_retire_count, outbound_retired_image_ids
+from agent.canonical_peer import peer_metadata, peer_wire_text
 from agent.compression_marker import (
     ELISION_MARKER_MAX_LEN,
     _elision_marker,
@@ -931,6 +933,11 @@ TAIL_MAX_CONTEXT_FRACTION = 0.20
 _LEAN_USER_MESSAGES_BUDGET_CHARS = 24_000  # ~6K tokens
 _LEAN_USER_MESSAGE_MAX_CHARS = 4_000
 _LEAN_USER_MESSAGES_HEADING = "## User Messages (verbatim, newest first)"
+# An echoed section: heading at a line start, its body through the next ``## `` heading (leading blank lines too).
+_LEAN_USER_SECTION_RE = re.compile(r"\n*^" + re.escape(_LEAN_USER_MESSAGES_HEADING) + r"[ \t]*$(.*?)(?=\n## |\Z)", re.M | re.S)
+_QUOTE_BLOCK_RE = re.compile(r"^>.*(?:\n>.*)*", re.M)
+# Its quotes ride under this label: they may hold a standing constraint later turns never restate, never re-certified.
+_LEAN_CARRIED_USER_MESSAGES_LABEL = "### Earlier user messages (from a previous summary, not re-verified)"
 _LEAN_RECOVERY_HEADING = "## Context Recovery"
 _SYNTHETIC_USER_ROW_PREFIXES = (
     "[System:", "[CONTEXT", "[PRIOR CONTEXT", "[IMPORTANT: Background", "[Your active task list",
@@ -940,9 +947,7 @@ _SYNTHETIC_USER_ROW_PREFIXES = (
 
 def _synthetic_user_row(content: str) -> bool:
     """True for scaffolding user rows that carry no real user words."""
-    if not isinstance(content, str) or not content.strip():
-        return True
-    return content.lstrip().startswith(_SYNTHETIC_USER_ROW_PREFIXES)
+    return not isinstance(content, str) or not content.strip() or content.lstrip().startswith(_SYNTHETIC_USER_ROW_PREFIXES)
 
 
 def _typed_user_text(content: str) -> str:
@@ -952,51 +957,55 @@ def _typed_user_text(content: str) -> str:
     return (describe_skill_invocation(content, separator=" ") or "") if skills_loaded_by_scaffold(content) else content
 
 
-def _build_verbatim_user_section(turns: list[dict[str, Any]]) -> str:
-    """Compacted region's REAL user messages verbatim, newest-first under a char budget (straddler truncated); "" if none."""
+def _build_verbatim_user_section(turns: list[dict[str, Any]], session_id: str = "", carried: Sequence[str] = ()) -> str:
+    """Compacted region's REAL user messages newest-first under a char budget (straddler truncated), then ``carried``
+    quotes; "" if neither. The note claims every message verbatim only when none was omitted or cut, else counts them."""
     collected: list[str] = []
-    used = 0
+    used = total = truncated = 0
     for msg in reversed(turns):
-        if msg.get("role") != "user":
-            continue
-        content = _typed_user_text(_content_text_for_contains(msg.get("content")))
+        content = _typed_user_text(_content_text_for_contains(msg.get("content"))) if msg.get("role") == "user" else ""
         if _synthetic_user_row(content):
             continue
-        remaining = _LEAN_USER_MESSAGES_BUDGET_CHARS - used
-        if remaining <= 0:
-            break
-        text = content.strip()
-        if len(text) > remaining and remaining <= ELISION_MARKER_MAX_LEN:
-            break  # no room for marker + content: a marker-only quote would overshoot the budget
-        text = elide(text, min(_LEAN_USER_MESSAGE_MAX_CHARS, remaining))
-        collected.append("> " + text.replace("\n", "\n> "))
-        used += len(text)
-    if not collected:
+        total += 1
+        remaining, text = _LEAN_USER_MESSAGES_BUDGET_CHARS - used, content.strip()
+        if len(collected) < total - 1 or remaining <= 0 or (len(text) > remaining and remaining <= ELISION_MARKER_MAX_LEN):
+            continue  # no room left (a marker-only quote would overshoot): this and every older one is omitted
+        quote = elide(text, min(_LEAN_USER_MESSAGE_MAX_CHARS, remaining))
+        truncated += quote != text
+        collected.append("> " + quote.replace("\n", "\n> "))
+        used += len(quote)
+    where = f"session_search(query='<keywords>', session_id='{session_id}')" if session_id else "session_search"
+    kept = sum(n <= _LEAN_USER_MESSAGES_BUDGET_CHARS for n in accumulate(map(len, carried)))
+    rest = f" {kept} of {len(carried)} carried quote(s) kept; recover the rest with {where}." if kept < len(carried) else ""
+    earlier = (f"\n\n{_LEAN_CARRIED_USER_MESSAGES_LABEL}\n" + "\n\n".join(carried[:kept]) + "\n(Carried forward from a "
+               f"previous summary as captured then; not re-verified against this round's turns or certified complete.{rest})")
+    if not collected and not kept:
         return ""
-    return (
-        "\n\n" + _LEAN_USER_MESSAGES_HEADING + "\n"
-        + "\n\n".join(collected)
-        + "\n(Every real user message from the compacted region, quoted "
-        "verbatim. These are the user's actual words and override any "
-        "paraphrase of them above.)"
-    )
+    omitted = total - len(collected)
+    note = ("(Every real user message from the compacted region, quoted verbatim. These are the user's actual words and "
+            "override any paraphrase of them above.)" if not omitted and not truncated else f"(A bounded selection, not "
+            f"every user message: {len(collected)} of {total} real user messages from the compacted region, newest first; "
+            f"{omitted} older message(s) omitted, {truncated} truncated. Quoted text is the user's own words and overrides "
+            f"any paraphrase of them above; recover omitted or truncated messages with {where} before relying on them.)")
+    current = "\n\n".join(collected) + "\n" + note if collected else ""
+    return "\n\n" + _LEAN_USER_MESSAGES_HEADING + "\n" + (current + (earlier if kept else "")).lstrip("\n")
+
+
+def _extract_user_sections(summary: str) -> tuple[str, list[str]]:
+    """Remove EVERY echoed user-messages section from ``summary``; return the rest and their quotes in order, once each.
+    An iterative reply can echo the previous section more than once: a heading never proves this round was quoted."""
+    bodies = [m.group(1) for m in _LEAN_USER_SECTION_RE.finditer(summary)]
+    summary = _LEAN_USER_SECTION_RE.sub(lambda m: "\n" if m.end() < len(m.string) else "", summary)
+    return summary, list(dict.fromkeys(q for body in bodies for q in _QUOTE_BLOCK_RE.findall(body)))
 
 
 def _build_recovery_footer(session_id: str, region_len: int) -> str:
-    """Deterministic pointer to the compacted region in session history.
-    state.db keeps every pre-compaction message; naming the session_search re-access path lets the model
-    treat compaction as deferred retrieval, not loss."""
-    if not session_id:
-        return ""
-    return (
-        "\n\n" + _LEAN_RECOVERY_HEADING + "\n"
-        f"The {region_len} compacted message(s) remain fully preserved in "
-        "session history. If you need any detail this summary does not carry "
-        "(exact command output, file contents, error text, earlier "
-        "reasoning), recover it with: "
-        f"session_search(query='<keywords>', session_id='{session_id}') — "
-        "do not guess at lost specifics when you can look them up."
-    )
+    """Deterministic pointer to the compacted region in session history. state.db keeps every pre-compaction
+    message; naming the session_search re-access path lets the model treat compaction as deferred retrieval, not loss."""
+    return (f"\n\n{_LEAN_RECOVERY_HEADING}\nThe {region_len} compacted message(s) remain fully preserved in session "
+            "history. If you need any detail this summary does not carry (exact command output, file contents, error "
+            f"text, earlier reasoning), recover it with: session_search(query='<keywords>', session_id='{session_id}') — "
+            "do not guess at lost specifics when you can look them up.") if session_id else ""
 
 
 # Detailed session log comes from the SAME single summary request (one aux LLM
@@ -1066,14 +1075,8 @@ def _build_anchor_index(turns: list[dict[str, Any]]) -> str:
             break
         sections.append(line)
         used += len(line)
-    if not sections:
-        return ""
-    return (
-        "\n\n" + _LEAN_ANCHOR_HEADING + "\n"
-        + "\n".join(sections)
-        + "\n(Exact identifiers from the compacted region — use these verbatim, "
-        "and as session_search query anchors to recover their full context.)"
-    )
+    return ("\n\n" + _LEAN_ANCHOR_HEADING + "\n" + "\n".join(sections) + "\n(Exact identifiers from the compacted region — "
+            "use these verbatim, and as session_search query anchors to recover their full context.)") if sections else ""
 
 
 # Message-count window (distinct from the token-based tail boundary) in which a
@@ -3410,12 +3413,12 @@ class ContextCompressor(
 
     def _serialize_records_for_summary(self, turns: list[dict[str, Any]]) -> list[str]:
         """Serialize turns into a list of labeled, redacted records for the summarizer."""
-        # Lazy import: agent_runtime_helpers pulls heavy transitive imports.
-        from agent.agent_runtime_helpers import strip_think_blocks
+        from agent.agent_runtime_helpers import strip_think_blocks  # lazy: heavy transitive imports
         parts = []
         for msg in turns:
             role = msg.get("role", "unknown")
-            content = msg.get("content")
+            is_peer = peer_metadata(msg) is not None  # a peer's body reaches the summarizer only quoted
+            content = peer_wire_text(msg) if is_peer else msg.get("content")
             if isinstance(content, list):
                 content = "\n".join(_summary_part_text(part) for part in content if isinstance(part, (dict, str)))
             content = _redact_compaction_text(content or "")
@@ -3430,7 +3433,7 @@ class ContextCompressor(
                 continue
             if role == "assistant" and msg.get("tool_calls", []):
                 content += "\n[Tool calls:\n" + "\n".join(map(self._render_tool_call_for_summary, msg["tool_calls"])) + "\n]"
-            parts.append(f"[{role.upper()}]: {content}")
+            parts.append(f"[{'PEER' if is_peer else role.upper()}]: {content}")
         return parts
 
     def _serialize_for_summary(self, turns: list[dict[str, Any]]) -> str:
@@ -3463,7 +3466,8 @@ class ContextCompressor(
                     _collect_paths_from_jsonish(parsed, relevant_files)
         for msg in turns_to_summarize:
             role = msg.get("role", "unknown")
-            content = msg.get("content")
+            is_peer = peer_metadata(msg) is not None  # a peer turn is never an owner ask: quoted, labelled PEER
+            content = peer_wire_text(msg) if is_peer else msg.get("content")
             text = _compact_fallback_turn(_typed_user_text(content) if role == "user" and isinstance(content, str) else content)
             _collect_path_mentions(text, relevant_files)
             synthetic_user = role == "user" and self._is_synthetic_compression_user_turn(msg)
@@ -3472,13 +3476,13 @@ class ContextCompressor(
             if tool_names:
                 prefix = "tool calls: " + ", ".join(tool_names[:6])
                 turn_text = f"{prefix}; {turn_text}" if turn_text else prefix
-            turn_label = "INTERNAL CONTEXT" if synthetic_user else str(role).upper()
+            turn_label = "PEER" if is_peer else "INTERNAL CONTEXT" if synthetic_user else str(role).upper()
             if turn_text.strip():
                 last_dropped_turns.append(f"{turn_label}: {turn_text.strip()}")
                 del last_dropped_turns[:-8]
             if len(text) > 600:
                 text = text[:420].rstrip() + " ... " + text[-160:].lstrip()
-            if role == "user" and text and not synthetic_user:
+            if role == "user" and text and not synthetic_user and not is_peer:
                 user_asks.append(text)
             elif role == "assistant":
                 if tool_names:
@@ -3574,17 +3578,15 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         return result
 
     def _augment_summary_lean(self, summary: str, turns_to_summarize: list[dict[str, Any]]) -> str:
-        """Append deterministic lean-mode sections to a summary; no-op in legacy mode."""
+        """Append deterministic lean-mode sections (no-op in legacy mode); the user section replaces every echoed copy."""
         if getattr(self, "tail_mode", "lean") != "lean":
             return summary
-        for heading, build in (
-            (_LEAN_ANCHOR_HEADING, lambda: _redact_compaction_text(_build_anchor_index(turns_to_summarize))),
-            (_LEAN_USER_MESSAGES_HEADING, lambda: _redact_compaction_text(_build_verbatim_user_section(turns_to_summarize))),
-            (_LEAN_RECOVERY_HEADING, lambda: _build_recovery_footer(getattr(self, "_session_id", "") or "", len(turns_to_summarize))),
-        ):
-            if heading not in summary:
-                summary += build()
-        return summary
+        summary, carried = _extract_user_sections(summary)
+        session_id = getattr(self, "_session_id", "") or ""
+        if _LEAN_ANCHOR_HEADING not in summary:
+            summary += _redact_compaction_text(_build_anchor_index(turns_to_summarize))
+        summary += _redact_compaction_text(_build_verbatim_user_section(turns_to_summarize, session_id, carried))
+        return summary + (_build_recovery_footer(session_id, len(turns_to_summarize)) if _LEAN_RECOVERY_HEADING not in summary else "")
 
     @classmethod
     def _bound_summary_input(cls, content: str) -> str:
@@ -4769,20 +4771,18 @@ Write only the summary body. Do not include any preamble or prefix."""
     ) -> list[dict[str, Any]]:
         """Restate an unfinished user task after the compaction handoff.
 
-        ``SUMMARY_PREFIX`` instructs the model to act only on a user message
-        that appears AFTER the summary, and to do nothing when none does.  When
-        the single in-flight instruction lived in the protected head, the
-        assembled transcript orders it before the handoff and the run ends in a
-        ``[SILENT]`` no-op that the scheduler records as success (#100818).
+        ``SUMMARY_PREFIX`` instructs the model to act only on a user message that appears AFTER the summary, and
+        to do nothing when none does.  When the single in-flight instruction lived in the protected head, the
+        assembled transcript orders it before the handoff and the run ends in a ``[SILENT]`` no-op that the
+        scheduler records as success (#100818).
 
-        Re-append a copy of that turn after the surviving tail so the prefix's
-        "latest user message" pointer resolves to it again.  If the transcript
-        already ends on a template-visible user row, appending a second one
-        would break user/assistant alternation, so the restatement is merged
-        onto the handoff carrier instead — after ``_SUMMARY_END_MARKER``, which
-        is the boundary the prefix's rule is written against.
+        Re-append a copy of that turn after the surviving tail so the prefix's "latest user message" pointer
+        resolves to it again.  If the transcript already ends on a template-visible user row, appending a second
+        one would break user/assistant alternation, so the restatement is merged onto the handoff carrier instead
+        — after ``_SUMMARY_END_MARKER``, which is the boundary the prefix's rule is written against.  A canonical
+        peer turn is no owner task to re-animate: its body reaches a model only as its own admitted row.
         """
-        if inflight is None or not compressed:
+        if inflight is None or not compressed or peer_metadata(inflight) is not None:
             return compressed
 
         carrier_idx = -1

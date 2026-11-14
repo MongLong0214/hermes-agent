@@ -303,6 +303,22 @@ def _store_rewrite_on_tail(agent, messages, raw, final) -> None:
     tail["content"] = final
 
 
+def _release_dedup_after_splice(agent, messages, task_id) -> None:
+    """The splice summarized tool results away: a repeat read must serve them again, not an
+    "unchanged" stub pointing at a body that is gone (#32106). File reads and the screenshot start a
+    new generation as ``_reset_read_dedup_caches`` does; a skill_view entry is dropped only when its
+    served text is no longer on the wire, so a body the next request still carries keeps its stub."""
+    with suppress(Exception):
+        from tools.file_tools_read_tracking import reset_file_dedup
+        reset_file_dedup(task_id)
+    if session_id := agent.session_id or "":
+        with suppress(Exception):
+            from tools.computer_use.tool import reset_screenshot_dedup
+            reset_screenshot_dedup(session_id)
+    from tools.skills_tool_dedup import drop_lost_skill_views
+    drop_lost_skill_views(task_id, messages)
+
+
 def _micro_compact_after_turn(agent, messages, final_response, logger, task_id) -> None:
     """Post-turn micro-compaction: absorb the oldest uncompacted exchange into the
     rolling summary before persist, amortizing compression across turns."""
@@ -336,11 +352,7 @@ def _micro_compact_after_turn(agent, messages, final_response, logger, task_id) 
                 _spliced = _compacted is not messages  # no-op and defrag passes return the input
                 messages[:] = _compacted
                 if _spliced:
-                    # The splice summarized tool results away: a repeat read must serve them
-                    # again, not an "unchanged" stub pointing at a body that is gone (#32106).
-                    from agent.conversation_compression import _reset_read_dedup_caches
-
-                    _reset_read_dedup_caches(task_id, session_id=agent.session_id or "")
+                    _release_dedup_after_splice(agent, messages, task_id)
             if _before != len(messages):
                 logger.info("Micro-compaction: %d -> %d messages", _before, len(messages))
     except Exception as _mc_err:

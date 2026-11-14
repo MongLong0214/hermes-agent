@@ -32,6 +32,7 @@ from hermes_state_fts import (_drop_orphan_fts_shadow_tables, base_index_recogni
 from hermes_state_holders import _read_proc_argv
 from hermes_state_search import _delete_meta, _meta_row
 from hermes_state_errors import is_sqlite_lock_error
+from hermes_state_peer_migrations import migrate_legacy_peer_sidecars
 from hermes_state_titles import next_title_in_lineage
 
 # Pre-split logger identity so log filtering/capture is unchanged.
@@ -985,6 +986,7 @@ class SessionSchemaMixin:
         else:
             self._run_data_migrations(cursor, row[0], fts5_available)
 
+        migrate_legacy_peer_sidecars(self, cursor)
         self._ensure_unique_title_index(cursor)
         if fts5_available:
             self._init_fts(cursor)

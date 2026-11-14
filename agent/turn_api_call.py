@@ -19,6 +19,9 @@ from agent.error_classifier import FailoverReason
 from agent.agent_runtime_helpers_placeholders import hidden_interrupt_placeholder_row
 from agent.chat_completion_accepted_failure import is_accepted_stream_failure
 from agent.message_metadata import append_message
+from agent.native_compaction_grace import (
+    NativeCompactionPreflightRefused, start_native_compaction_preflight_request,
+)
 from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED, is_runaway_repetition
 from agent.turn_failure_copy import site_copy, stamp_failure
 
@@ -113,6 +116,8 @@ def perform_api_call(
                 next_api_kwargs, allow_stream=False, drop_replay_item_ids=drops_replay_item_ids(agent.base_url),
                 sanitize_harmony_tokens=agent._is_codex_backend(),
             )
+        if not start_native_compaction_preflight_request(agent, next_api_kwargs):
+            raise NativeCompactionPreflightRefused("native compaction grace has no native wire")
         if _use_streaming:
             return _capture_outcome(agent._interruptible_streaming_api_call(
                 next_api_kwargs, on_first_delta=_stop_spinner

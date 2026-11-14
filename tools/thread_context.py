@@ -73,4 +73,8 @@ def propagate_context_to_thread(target: Callable) -> Callable:
 
         return ctx.run(_inner)
 
+    # Expose the real target through any number of further wrapper layers, as ``functools.wraps``
+    # would: ``inspect.unwrap`` reaches it (a caller finding its own queued work item by identity),
+    # and ``inspect.signature`` reports its signature (dispatch's kwargs narrowing).
+    _runner.__wrapped__ = target
     return _runner

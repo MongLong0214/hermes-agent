@@ -15,7 +15,7 @@ from agent.context_compressor import (
     _newest_checkpoint_carrier, split_user_originated_turn)
 from agent.memory_context import sanitize_context
 from agent.message_metadata import (
-    CANONICAL_ROW, DATA_USE, DB_ROW_SNAPSHOT, lift_data_use, MESSAGE_UID, TOOL_CALL_UID, TOOL_CALL_UIDS,
+    CANONICAL_ROW, DATA_USE, DB_ROW_SNAPSHOT, MESSAGE_UID, TOOL_CALL_UID, TOOL_CALL_UIDS,
     index_tool_call_uids, message_uid_or_none, resolve_tool_call_uid, mint_uid, stamp_message_uid)
 from agent.message_sanitization import _sanitize_surrogates, coalesce_tool_call_id
 from hermes_cli.timefmt import coerce_epoch
@@ -26,6 +26,7 @@ from hermes_state_compaction_display import later_tool_copy_ids, not_a_later_too
 from hermes_state_detached_results import SessionDetachedResultsMixin
 from hermes_state_todo import SessionTodoResultMixin
 from hermes_state_stored_reads import SessionStoredReadsMixin
+from hermes_state_messages_peer import SessionPeerProvenanceMixin, _source_row_id
 from hermes_state_identity import (
     _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json, _uid_list)
 
@@ -121,7 +122,7 @@ def _stale_holder(row, now: float) -> bool:
     return float(row["expires_at"]) <= now or _compression_lock_holder_process_is_dead(row["holder"])
 
 
-class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, SessionStoredReadsMixin):
+class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, SessionStoredReadsMixin, SessionPeerProvenanceMixin):
     """Message append/replace/rewind, reactions, resume conversations, replay dedupe (detached results: the base)."""
 
     def _bump_conversation_generation(self, conn, session_id: str, end_reason: str) -> None:
@@ -422,6 +423,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
                 turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
             msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
+            self._record_admitted_peer_row(conn, msg_id, params)
             self._bump_session_counters(conn, session_id, 1, _tool_calls_count(tool_calls), unit=True)
             return msg_id
         # THE critical write (failure aborts the turn): long patience so a sibling legitimately
@@ -608,15 +610,6 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
             (session_id, role, int(offset)))
         return row[0] if row else None
 
-    def latest_conversation_role(self, session_id: str) -> Optional[str]:
-        """Role of the newest active user/assistant/tool row, or ``None``. ``session_meta`` /
-        ``system`` rows are transcript bookkeeping stripped before the model sees history, so
-        they must not hide an open user tail from the failed-turn boundary check."""
-        row = self._read_one(
-            "SELECT role FROM messages WHERE session_id = ? AND active = 1 "
-            "AND role NOT IN ('session_meta', 'system') ORDER BY id DESC LIMIT 1", (session_id,))
-        return row[0] if row else None
-
     def get_message_role(self, session_id: str, row_id: int) -> Optional[str]:
         """Role of the active message at *row_id* in *session_id*, or ``None``."""
         if not session_id:
@@ -658,15 +651,18 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
             return  # Best-effort: a failed carry falls back to the publish-time stamp, never breaks publish.
 
     def _insert_message_rows(self, conn, session_id: str, messages: list[dict[str, Any]], *,
-                             prune_checkpoints: bool = True) -> tuple[int, int]:
+                             prune_checkpoints: bool = True, importing: bool = False,
+                             reinsertion_sources: Optional[dict[int, tuple]] = None) -> tuple[int, int]:
         """Insert *messages* as fresh active rows in the caller's txn -> ``(inserted, tool_call_count)``.
         Never touches sessions.* counters (callers reconcile differently); reasoning kept for assistant rows.
         A caller that re-archives some rows afterwards passes ``prune_checkpoints=False`` and prunes once they
-        are archived again (:meth:`_prune_shadowed_checkpoints`)."""
+        are archived again (:meth:`_prune_shadowed_checkpoints`). Peer rows: :meth:`_record_admitted_peer_row`."""
+        reinsertion_sources = self._peer_reinsertion_sources(conn, messages, importing, reinsertion_sources)
         now_ts = time.time()
         inserted = tool_calls_total = 0
         batch_tool_index: dict[str, str] = {}
         for msg in messages:
+            source_row_id = _source_row_id(msg)  # read before the fresh id overwrites it below
             role = msg.get("role", "unknown")
             tool_calls = _parse_tool_calls(msg.get("tool_calls"))
             message_timestamp = _coerce_timestamp(msg.get("timestamp"), now_ts)
@@ -675,8 +671,10 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
             # the live dict never disagree. Tool calls get their per-occurrence ids the same way.
             stamp_message_uid(msg)
             self._stamp_tool_call_uids(msg, tool_calls, batch_tool_index)
-            cur = conn.execute(_INSERT_MESSAGE_SQL, self._message_row_params(
-                session_id, role, msg, tool_calls, message_timestamp, keep_reasoning=role == "assistant"))
+            params = self._message_row_params(
+                session_id, role, msg, tool_calls, message_timestamp, keep_reasoning=role == "assistant")
+            cur = conn.execute(_INSERT_MESSAGE_SQL, params)
+            self._record_admitted_peer_row(conn, cur.lastrowid, params, importing=importing, source=reinsertion_sources.get(source_row_id))
             # Keep the caller's live row aligned with the durable identity. Rows created without an explicit
             # timestamp (notably mid-turn steers) may be carried through several compaction generations; if
             # the generated timestamp exists only in SQLite, every copy receives a new identity and renders
@@ -760,6 +758,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         if expected_active_ids is not None and [
                 int(row[0]) for row in conn.execute(_ACTIVE_IDS_SQL, (session_id,))] != expected_active_ids:
             raise RuntimeError("active transcript changed before the rewrite could be persisted")
+        sources = self._reinsertion_sources(conn, messages)  # peer provenance, read before the rows go
         kept = kept_tool_calls = 0
         if archive_dropped:
             # Only the first len(messages)+1 live rows matter: the prefix to match plus the row whose
@@ -773,7 +772,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
                              (session_id, live[kept][0]))
         else:
             conn.execute(f"DELETE FROM messages WHERE session_id = ?{' AND active = 1' if active_only else ''}", (session_id,))
-        inserted, inserted_tool_calls = self._insert_message_rows(conn, session_id, messages[kept:])
+        inserted, inserted_tool_calls = self._insert_message_rows(conn, session_id, messages[kept:], reinsertion_sources=sources)
         conn.execute(f"{_SET_COUNTERS_SQL} WHERE id = ?",
                      (kept + inserted, kept_tool_calls + inserted_tool_calls, session_id))
 
@@ -839,6 +838,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         """Pure-SQL clone of *tail_ids* as fresh live rows (new id/display order, active=1, compacted=0;
         message payload columns stay byte-exact and FTS triggers index the clones), into *session_id* when given."""
         retarget = session_id is not None
+        peer_classes, before = self._peer_clone_sources(conn, tail_ids)
         # A clone is a newly positioned display generation. Copy its indexed
         # identity, but let the insert trigger assign order from rows that are
         # still display-visible (the source may just have become rewind-only).
@@ -849,6 +849,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
             f"SELECT {col_list}, {'?, ' if retarget else ''}1, 0 FROM messages "
             f"WHERE id IN ({_placeholders(tail_ids)}) ORDER BY id",
             [session_id, *tail_ids] if retarget else tail_ids)
+        self._carry_peer_ledgers(conn, tail_ids, peer_classes, before)  # a peer row's record follows its clone
 
     def _archive_named_rows(
         self, conn, session_id: str, compacted_messages: list[dict[str, Any]], covered: list[int], *,
@@ -1596,8 +1597,9 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         # Assistant rows since the last user row not yet indexed: only a result without a stored uid (an older
         # build's) needs the index, so rows this build wrote never pay for it. Indexed in order: same shadowing.
         unindexed_tool_owners: list[dict[str, Any]] = []
+        admitted_peers, imported_peers = self._peer_ledgers_of(rows)
         for row in rows:
-            content = self._loaded_view_content(row["role"], self._decode_content(row["content"]))
+            content, decoded_meta, peer_marked = self._loaded_row_view(row, admitted_peers, imported_peers)
             # Underscore-prefixed like ``_row_id``: transports strip it before the wire; compression's
             # assembly copies strip it so rotated child handoffs still flush (_fresh_compaction_message_copy).
             msg = {"role": row["role"], "content": content, _DB_PERSISTED_MARKER_KEY: True}
@@ -1613,10 +1615,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
             # The durable identity is part of the message, like ``timestamp``: restored on EVERY projection
             # (ACP, gateway, CLI, TUI, compression adoption), never opt-in like ``_row_id``.
             _restore_identity_columns(row, msg)
-            msg.update((col, row[col]) for col in ("api_content", "display_kind") if row[col])
-            if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
-                msg["display_metadata"] = decoded
-                lift_data_use(msg)
+            self._restore_display_fields(row, msg, decoded_meta, peer_marked, admitted_peers, imported_peers)
             if include_summary_markers and row["_compressed_summary"]:
                 msg["_compressed_summary"] = True
             msg.update(

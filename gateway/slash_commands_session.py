@@ -13,6 +13,8 @@ import json
 import logging
 import os
 import shlex
+import time
+import uuid
 from typing import Optional, Union
 
 from agent.i18n import t
@@ -35,9 +37,52 @@ _RESET_CLEANUP_TIMEOUT_S = 30.0
 # chat_type values whose session key is per-user (DM-like), incl. the unknown/blank case.
 _DM_CHAT_TYPES = {"dm", "direct", "private", ""}
 
+# /branch: the parent read waits this long for an in-flight parent turn, then refuses; it retries
+# every _BRANCH_POLL_S on the event loop, holding no executor thread in between.
+_BRANCH_PARENT_WAIT_S = 30.0
+_BRANCH_POLL_S = 1.0
+# A crashed /branch holds the parent's turn lease no longer than this (or until its pid is dead).
+_BRANCH_LEASE_TTL_S = 30.0
+# (thread branch, one message, title on the row) -> reply; an untitled reply never names the title.
+_BRANCH_REPLY_KEYS = {
+    (False, True, True): "gateway.branch.branched_one",
+    (False, False, True): "gateway.branch.branched_many",
+    (False, True, False): "gateway.branch.branched_one_untitled",
+    (False, False, False): "gateway.branch.branched_many_untitled",
+    (True, True, True): "gateway.branch.branched_thread_one",
+    (True, False, True): "gateway.branch.branched_thread_many",
+    (True, True, False): "gateway.branch.branched_thread_one_untitled",
+    (True, False, False): "gateway.branch.branched_thread_many_untitled",
+}
+
 _BRANCH_COPIED_FIELDS = ("content", "tool_calls", "tool_call_id", "finish_reason", "reasoning",
                          "reasoning_content", "reasoning_details", "codex_reasoning_items",
                          "codex_message_items", "timestamp", "data_use")
+
+
+async def _read_parent_transcript_fenced(sync_db, load_transcript, session_id: str) -> Optional[list]:
+    """The parent transcript read under its durable turn lease, so an in-flight turn (another
+    process, another routing key) lands wholly before the branch point; None when the lease is
+    still held after ``_BRANCH_PARENT_WAIT_S``. The wait sleeps on the loop, holding no executor
+    thread. A DB without turn leases is read as before."""
+    acquire = getattr(sync_db, "acquire_session_turn_lease", None)
+    if not callable(acquire):
+        return await load_transcript(session_id)
+    # Unique per call: a re-acquire by the same holder is re-entrant, so a shared one would let
+    # one /branch release another's lease.
+    holder = f"pid={os.getpid()}:turn=branch-read-{uuid.uuid4().hex}:session={session_id}"
+    deadline = time.monotonic() + _BRANCH_PARENT_WAIT_S
+    while not await asyncio.to_thread(
+        acquire, session_id, holder, ttl_seconds=_BRANCH_LEASE_TTL_S, wait_seconds=0,
+    ):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        await asyncio.sleep(min(_BRANCH_POLL_S, remaining))
+    try:
+        return await load_transcript(session_id)
+    finally:
+        await asyncio.to_thread(sync_db.release_session_turn_lease, session_id, holder)
 
 
 def _sattr(obj, name: str) -> str:
@@ -1258,9 +1303,13 @@ class GatewaySessionCommandsMixin:
         session_key = self._session_key_for_source(source)
         current_entry = await self.async_session_store.get_or_create_session(source)
         try:
-            history = await self.async_session_store.load_transcript(current_entry.session_id)
+            history = await _read_parent_transcript_fenced(
+                getattr(self._session_db, "_db", self._session_db),
+                self.async_session_store.load_transcript, current_entry.session_id)
         except TranscriptReadError:
             return history_unreadable()
+        if history is None:
+            return t("gateway.branch.parent_busy")
         if not history:
             return t("gateway.branch.no_conversation")
         new_session_id = f"{_dt.now().strftime('%Y%m%d_%H%M%S')}_{_uuid.uuid4().hex[:6]}"
@@ -1311,8 +1360,7 @@ class GatewaySessionCommandsMixin:
             # rows.
             await self._session_db.append_messages_batch(
                 new_session_id, [_branch_row(msg) for msg in history], chunk_rows=500)
-        with contextlib.suppress(Exception):
-            await self._session_db.set_session_title(new_session_id, branch_title)
+        titled, title_note = await self._title_branch(new_session_id, branch_title)
         if not in_place:
             # Materialize the thread's own entry, then point IT at the clone; ``session_key`` (this
             # chat) is never touched, so the original conversation stays live here.
@@ -1328,15 +1376,25 @@ class GatewaySessionCommandsMixin:
         if in_place:
             await self._rename_telegram_topic_after_switch(dest_source, new_entry, branch_title)
         msg_count = len([m for m in history if m.get("role") == "user"])
+        key = _BRANCH_REPLY_KEYS[(not in_place, msg_count == 1, titled)]
         if in_place:
-            key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
             reply = t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
             if not stay_here and source.platform in BRANCH_THREAD_PLATFORMS:
                 reply += "\n" + t("gateway.branch.thread_fallback")
-            return reply
-        key = "gateway.branch.branched_thread_one" if msg_count == 1 else "gateway.branch.branched_thread_many"
+            return reply + title_note
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id,
-                 thread=format_thread_ref(source.platform, dest_source.thread_id))
+                 thread=format_thread_ref(source.platform, dest_source.thread_id)) + title_note
+
+    async def _title_branch(self, session_id: str, title: str) -> tuple[bool, str]:
+        """Best-effort title for a new branch: ``(titled, note)``. A title another session holds (or
+        one the store refuses) leaves the branch untitled, and ``note`` says why for the reply."""
+        try:
+            return bool(await self._session_db.set_session_title(session_id, title)), ""
+        except ValueError as exc:
+            return False, "\n" + t("gateway.shared.warn_passthrough", error=exc)
+        except Exception:
+            logger.warning("Failed to title branch %s", session_id, exc_info=True)
+            return False, ""
 
     async def _branch_open_thread(self, source: SessionSource, title: str) -> Optional[SessionSource]:
         """Open the sibling thread a plain ``/branch`` clones into; the destination source, or
