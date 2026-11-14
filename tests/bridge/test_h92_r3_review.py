@@ -242,10 +242,7 @@ def _drive_turn(gw, shim, monkeypatch, shape, foreign):
     return outcome
 
 
-@pytest.mark.parametrize("shape", [pytest.param(shape, marks=pytest.mark.xfail(strict=True, reason=(
-    "target agent/context_compressor.py _assemble_compressed folds the summary into a canonical peer row; "
-    "the fork keeps it standalone (885d829eea), not ported yet"))) if shape == "b_compaction_before_opening"
-    else shape for shape in SHAPES])
+@pytest.mark.parametrize("shape", SHAPES)
 def test_completed_same_event_turn_delivers_through_interior_rows(gw, shim, monkeypatch, shape):
     out = _drive_turn(gw, shim, monkeypatch, shape, foreign=False)
     assert out["codes"] == [(200, "text")]
