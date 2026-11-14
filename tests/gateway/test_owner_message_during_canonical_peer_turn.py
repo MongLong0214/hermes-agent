@@ -2556,9 +2556,18 @@ def _answering_with(monkeypatch, attachment, *, text=True, hold=None):
     _persisting_agents(monkeypatch)
 
 
+def _upload(file_path):
+    """What the transport receives for a document: its name and its bytes, read as the adapter reads them.
+    An owner message's attachment is uploaded from a snapshot of the file its check approved, never from
+    its own path, so the path the transport is handed is not the file's."""
+    from pathlib import Path
+    return Path(file_path).name, Path(file_path).read_bytes()
+
+
 def _attachment_sends(monkeypatch, refused, order=None):
-    """Every image batch and document any process's adapter sends, as (kind, what, delivered); a kind in
-    *refused* (a set the test edits) is refused. Each send's kind is also appended to *order*."""
+    """Every image batch and document any process's adapter sends, as (kind, what, delivered): an image
+    batch's (url, alt) list, a document's ``_upload``. A kind in *refused* (a set the test edits) is
+    refused. Each send's kind is also appended to *order*."""
     from gateway.platforms.base import SendResult
     sent = []
 
@@ -2574,7 +2583,7 @@ def _attachment_sends(monkeypatch, refused, order=None):
         return outcome("image", list(images))
 
     async def document(self, *, chat_id, file_path, **_kwargs):
-        return outcome("document", file_path)
+        return outcome("document", _upload(file_path))
     monkeypatch.setattr(RestartTestAdapter, "send_multiple_images", images)
     monkeypatch.setattr(RestartTestAdapter, "send_document", document)
     return sent
@@ -2701,7 +2710,7 @@ def test_a_queued_first_reply_whose_attachment_is_refused_keeps_its_record_until
         hold[1].set()
         await h.settle()
     asyncio.run(exercise())
-    assert [(kind, what, ok) for kind, what, ok in sent] == [("document", str(document), False)]
+    assert [(kind, what, ok) for kind, what, ok in sent] == [("document", ("chart.pdf", b"%PDF-test"), False)]
     assert sum(_TERMINAL in t for _c, t in h.owner_replies()) == 2  # the first reply's text and the follow-up's
     assert _record_texts(ingress) == [_OWNER_TEXT]
     [record_file] = _records(ingress)
@@ -3106,7 +3115,7 @@ def test_store_partial_delivery_interruption_restart_recovery_and_cleanup(ingres
     in_flight = []
 
     async def document_send(self, *, chat_id, file_path, **_kwargs):
-        sent.append(file_path)
+        sent.append(_upload(file_path))
         if self is h.adapter:  # the first process dies while this send is on its way
             order.append("document")
             in_flight.append(True)
@@ -3128,7 +3137,7 @@ def test_store_partial_delivery_interruption_restart_recovery_and_cleanup(ingres
     nxt = _next_process(ingress, send, monkeypatch, crashed=True)
     turns, _inputs, chats, left = _answered(ingress, nxt)
     assert (turns, chats, left, _texts_sent(nxt)) == ([], [], [], [])
-    assert sent == [str(document), str(document)]  # the interrupted send, then the recovery's alone
+    assert sent == [("report.pdf", b"%PDF-test")] * 2  # the interrupted send, then the recovery's alone
     assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "delivered")]
     assert _marker(nxt) is None
 
@@ -3187,7 +3196,7 @@ def test_a_live_reply_whose_attachment_is_gone_keeps_it_owed_as_missing(
     nxt = _next_process(ingress, send, monkeypatch, crashed=True)
     turns, _inputs, chats, left = _answered(ingress, nxt)
     assert (turns, chats, left, _texts_sent(nxt)) == ([], [], [], [])
-    assert sent == [("document", str(document), True)]
+    assert sent == [("document", ("gone.pdf", b"%PDF-test"), True)]
     assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "delivered")]
 
 
@@ -3258,7 +3267,7 @@ def test_an_owed_attachment_is_checked_again_right_before_each_send(
     failing = {"document"}
     sent = _attachment_sends(monkeypatch, failing)
     _h, rid = _owner_turn_in_lane(ingress, send, monkeypatch, "normal", f"MEDIA:{document}")
-    assert sent == [("document", str(document), False)]
+    assert sent == [("document", ("report.pdf", b"%PDF-test"), False)]
     assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "failed")]
     failing.clear()
     if change == "file_changed":
@@ -3277,8 +3286,261 @@ def test_an_owed_attachment_is_checked_again_right_before_each_send(
     assert (turns, chats) == ([], [])
     if change in ("allowed", "symlink_to_allowed"):
         uploaded = document if change == "allowed" else allowed / "target.pdf"
-        assert left == [] and sent[1:] == [("document", str(uploaded), True)] and _texts_sent(nxt) == []
+        assert left == [] and sent[1:] == [("document", (uploaded.name, uploaded.read_bytes()), True)]
+        assert _texts_sent(nxt) == []
         assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "delivered")]
     else:
         assert left == [f"inbound-{rid}.json"] and sent[1:] == []
         assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "blocked")]
+
+
+@pytest.mark.parametrize("state", ["missing", "blocked"])
+@pytest.mark.parametrize("lane", ["normal", "queued", "recovery", "inline_code"])
+def test_a_declared_attachment_of_any_extension_is_owed_until_it_is_sent(
+        ingress, send, monkeypatch, tmp_path, lane, state):
+    """The slice A review, P1-1: an answer declares ``MEDIA:…/report.log``, an extension ``extract_media``
+    takes only once its file validates. The file is not there (``missing``) or the strict policy refuses it
+    (``blocked``) when the reply is stored: by the adapter's final (``normal``; ``inline_code``: the tag
+    written as inline code), the queued first response (``queued``) or a later start reading the stored
+    answer (``recovery``). The declaration is one of the reply's components all the same, recorded missing
+    or blocked: never uploaded, never counted delivered, and the record outlives the delivered text. Once
+    the file is there and allowed, the next start uploads it alone and cleans up. The message is never run
+    again."""
+    _media_policy(monkeypatch, strict=True)
+    document = tmp_path / "report.log"
+    if state == "blocked":
+        document.write_text("the required log")
+    sent = _attachment_sends(monkeypatch, set())
+    tag = f"`MEDIA:{document}`" if lane == "inline_code" else f"MEDIA:{document}"
+    if lane == "recovery":
+        rid = "declared"
+        _stored_turn(ingress, rid, f"{_TERMINAL}\n{tag}")
+        _next_process(ingress, send, monkeypatch, crashed=True)
+    else:
+        _h, rid = _owner_turn_in_lane(ingress, send, monkeypatch, "queued" if lane == "queued" else "normal", tag)
+    assert sent == [] and _records(ingress) == [f"inbound-{rid}.json"]
+    assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", state)]
+    document.write_text("the required log")
+    _media_policy(monkeypatch, strict=True, allow=tmp_path)
+    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    turns, _inputs, chats, left = _answered(ingress, nxt)
+    assert (turns, chats, left, _texts_sent(nxt)) == ([], [], [], [])
+    assert sent == [("document", ("report.log", b"the required log"), True)]
+    assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "delivered")]
+
+
+def _held_transport(monkeypatch, hold_on, *, outcome="delivered"):
+    """The transport's document upload, reading what it is handed as an adapter does (``_upload``, into
+    ``uploads``; ``handed``: the paths it was handed; ``accepted``: whether the media policy accepts each of
+    them, as an adapter that checks its path again does). The upload of the file named *hold_on* stops at
+    the transport's door: ``held`` is set, ``task`` is the task running it, and it goes on once ``resume`` is
+    set. Each upload is then delivered, refused or raises (*outcome*)."""
+    import os
+    from types import SimpleNamespace
+
+    from gateway.platforms.base import SendResult, validate_media_delivery_path
+    t = SimpleNamespace(uploads=[], handed=[], accepted=[], task=None, held=asyncio.Event(),
+                        resume=asyncio.Event())
+
+    async def document(self, *, chat_id, file_path, **_kwargs):
+        t.handed.append(file_path)
+        t.accepted.append(validate_media_delivery_path(file_path) is not None)
+        if t.task is None and os.path.basename(file_path) == hold_on:
+            t.task = asyncio.current_task()
+            t.held.set()
+            await t.resume.wait()
+        t.uploads.append(_upload(file_path))
+        if outcome == "raised":
+            raise ConnectionError("the upload broke off")
+        ok = outcome == "delivered"
+        return SendResult(success=ok, message_id="document-id" if ok else None,
+                          error=None if ok else "document send refused")
+    monkeypatch.setattr(RestartTestAdapter, "send_document", document)
+    return t
+
+
+def _while_held(t, act):
+    """A coroutine function: once the held upload waits at the transport, *act*, then let it go on."""
+    async def run(*_args):
+        await asyncio.wait_for(t.held.wait(), 30)
+        act()
+        t.resume.set()
+    return run
+
+
+@pytest.mark.parametrize("lane", ["normal", "recovery"])
+def test_each_owed_attachment_is_checked_right_before_its_own_send(ingress, send, monkeypatch, tmp_path, lane):
+    """The slice A review, P1-2, as a deterministic counterexample: an answer declares two PDFs the strict
+    policy allows, sent by the adapter's final (``normal``) or by a later start (``recovery``). The first
+    upload is held at the transport; meanwhile the second PDF's path is swapped for a symlink to a file
+    outside the allowlist; then the first upload goes on. The second is checked right before its own send,
+    after the first: it is recorded blocked and its forbidden bytes never reach the transport. The first is
+    delivered, the record stays, and the message is never run again."""
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    first, second, secret = allowed / "first.pdf", allowed / "second.pdf", tmp_path / "secret.pdf"
+    first.write_bytes(b"%PDF-first")
+    second.write_bytes(b"%PDF-second")
+    secret.write_bytes(b"FORBIDDEN")
+    _media_policy(monkeypatch, strict=True, allow=allowed)
+    t = _held_transport(monkeypatch, "first.pdf")
+
+    def swap():
+        second.unlink()
+        second.symlink_to(secret)
+    answer = f"MEDIA:{first}\nMEDIA:{second}"
+    if lane == "normal":
+        h = _Harness(ingress, send, monkeypatch, "queue")
+        _answering_with(monkeypatch, answer)
+
+        async def exercise():
+            await h.warm()
+            await h.adapter.handle_message(h.owner_event())
+            await _while_held(t, swap)()
+            await h.settle()
+        asyncio.run(exercise())
+        [record_file] = _records(ingress)
+        rid, runs = _recovery_id(record_file), [text for actor in h.built for text in actor.calls]
+        assert runs.count(_OWNER_TEXT) == 1
+    else:
+        rid = "swapped"
+        _stored_turn(ingress, rid, f"{_TERMINAL}\n{answer}")
+        nxt = _next_process(ingress, send, monkeypatch, crashed=True, during=_while_held(t, swap))
+        assert _answered(ingress, nxt)[0] == []
+    assert all(b"FORBIDDEN" not in data for _name, data in t.uploads)
+    assert t.uploads == [("first.pdf", b"%PDF-first")]
+    assert _records(ingress) == [f"inbound-{rid}.json"]
+    assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "delivered"),
+                                         ("media:1", "media", "blocked")]
+
+
+@pytest.mark.parametrize("outcome", ["delivered", "refused", "raised", "cancelled"])
+def test_an_owed_attachment_uploads_the_bytes_its_check_approved_and_leaves_no_copy(
+        ingress, send, monkeypatch, tmp_path, outcome):
+    """The check is bound to the bytes sent. A PDF the strict policy allows is checked, and its upload is
+    held at the transport's door, where an adapter opens the path it is handed. Meanwhile the PDF's path is
+    swapped for a symlink to a file outside the allowlist; then the upload goes on. It reads the PDF it was
+    approved for, never the forbidden file: the adapter is handed a snapshot of the checked file, not the
+    file's path, and one that checks the path it is handed again (photon) accepts it under the same strict
+    policy. However the send ends (delivered, refused, raising, or cancelled while held), the snapshot and
+    its directory are gone afterwards, the source is untouched, and the record and the attachment's
+    obligation stay unless the reply was delivered."""
+    import os
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    document, secret = allowed / "report.pdf", tmp_path / "secret.pdf"
+    document.write_bytes(b"%PDF-approved")
+    secret.write_bytes(b"FORBIDDEN")
+    _media_policy(monkeypatch, strict=True, allow=allowed)
+    t = _held_transport(monkeypatch, "report.pdf", outcome="delivered" if outcome == "cancelled" else outcome)
+
+    def swap():
+        document.unlink()
+        document.symlink_to(secret)
+        if outcome == "cancelled":
+            t.task.cancel()
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    _answering_with(monkeypatch, f"MEDIA:{document}")
+
+    async def exercise():
+        await h.warm()
+        await h.adapter.handle_message(h.owner_event())
+        await _while_held(t, swap)()
+        await h.settle()
+    asyncio.run(exercise())
+    assert t.uploads == ([] if outcome == "cancelled" else [("report.pdf", b"%PDF-approved")])
+    [handed] = t.handed
+    assert handed != str(document) and t.accepted == [True] and not os.path.exists(os.path.dirname(handed))
+    assert document.is_symlink() and secret.read_bytes() == b"FORBIDDEN"
+    if outcome == "delivered":
+        assert _records(ingress) == []
+        return
+    [record_file] = _records(ingress)
+    assert _components(ingress, _recovery_id(record_file)) == [
+        ("text", "text", "delivered"), ("media:0", "media", "pending" if outcome == "cancelled" else "failed")]
+
+
+def _hold_open(monkeypatch, path, act):
+    """``os.open`` of *path* (the send opening the file its check approved, ``snapshot_attachment``) runs
+    *act* first, once, in the thread that opens it."""
+    import os
+
+    real_open, done = os.open, []
+
+    def opening(name, flags, *args, **kwargs):
+        if str(name) == path and not done:
+            done.append(True)
+            act()
+        return real_open(name, flags, *args, **kwargs)
+    monkeypatch.setattr(os, "open", opening)
+
+
+def test_an_owed_attachment_whose_directory_is_swapped_as_it_is_opened_is_never_uploaded(
+        ingress, send, monkeypatch, tmp_path):
+    """The window between the check and the open. A PDF the strict policy allows lies in a directory that
+    is swapped, as the checked path is opened, for a symlink to a directory outside the allowlist holding a
+    file of the same name. The open goes through the swapped directory, so the open file is checked again:
+    its path no longer resolves to itself. The attachment is recorded blocked, the record stays, and the
+    forbidden bytes never reach the transport."""
+    allowed, outside = tmp_path / "allowed", tmp_path / "outside"
+    (allowed / "sub").mkdir(parents=True)
+    outside.mkdir()
+    document = allowed / "sub" / "report.pdf"
+    document.write_bytes(b"%PDF-approved")
+    (outside / "report.pdf").write_bytes(b"FORBIDDEN")
+    _media_policy(monkeypatch, strict=True, allow=allowed)
+    t = _held_transport(monkeypatch, None)
+
+    def swap():
+        (allowed / "sub").rename(tmp_path / "moved")
+        (allowed / "sub").symlink_to(outside, target_is_directory=True)
+    _hold_open(monkeypatch, str(document.resolve()), swap)
+    _h, rid = _owner_turn_in_lane(ingress, send, monkeypatch, "normal", f"MEDIA:{document}")
+    assert t.uploads == [] and (tmp_path / "moved" / "report.pdf").read_bytes() == b"%PDF-approved"
+    assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "blocked")]
+
+
+def test_a_send_cancelled_while_its_snapshot_is_made_leaves_no_copy(ingress, send, monkeypatch, tmp_path):
+    """The snapshot is made off the loop. The owner turn is cancelled while its attachment's snapshot is
+    being made: the snapshot finishes in its thread after the send is gone, and it is discarded then. No
+    copy is left, the source stays, and so do the record and the attachment's obligation."""
+    import os
+
+    from gateway.platforms import base
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    document = allowed / "report.pdf"
+    document.write_bytes(b"%PDF-approved")
+    _media_policy(monkeypatch, strict=True, allow=allowed)
+    t = _held_transport(monkeypatch, None)
+    opening, go, made = threading.Event(), threading.Event(), []
+
+    def held():
+        opening.set()
+        assert go.wait(30)
+    _hold_open(monkeypatch, str(document.resolve()), held)
+    snapshot = base.snapshot_attachment
+
+    def observed(*args, **kwargs):
+        verdict, copy = snapshot(*args, **kwargs)
+        made.append(copy)
+        return verdict, copy
+    monkeypatch.setattr(base, "snapshot_attachment", observed)
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    _answering_with(monkeypatch, f"MEDIA:{document}")
+
+    async def exercise():
+        await h.warm()
+        await h.adapter.handle_message(h.owner_event())
+        await h.wait(opening.is_set, "the snapshot to start")
+        h.adapter._session_tasks[h.key].cancel()
+        go.set()
+        await h.settle()
+        await h.wait(lambda: made and not os.path.exists(made[0].directory), "the late snapshot to be discarded")
+    asyncio.run(exercise())
+    assert t.handed == [] and document.read_bytes() == b"%PDF-approved"
+    [record_file] = _records(ingress)
+    assert _components(ingress, _recovery_id(record_file)) == [
+        ("text", "text", "delivered"), ("media:0", "media", "pending")]

@@ -9,7 +9,9 @@ import math
 import os
 import random
 import re
+import shutil
 import socket as _socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1203,6 +1205,81 @@ def attachment_verdict(path: str, session_key: str = "", *,
     return (ATTACHMENT_BLOCKED if _existing_regular_file(str(path)) else ATTACHMENT_MISSING), None
 
 
+@dataclass
+class _AttachmentSnapshot:
+    """The bytes one send of an owed attachment uploads: a copy, in a directory of its own, of the file
+    ``snapshot_attachment`` validated and held open. ``discard`` removes the copy and its directory, never
+    the source."""
+    path: str
+    directory: str
+
+    def discard(self) -> None:
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+
+# Read only, never through a symlink as the last component, never blocking on a FIFO swapped in.
+_SNAPSHOT_OPEN_FLAGS = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0))
+
+
+def _still_names(resolved: str, opened: os.stat_result) -> bool:
+    """True when *resolved* (a path ``attachment_verdict`` resolved) resolves to itself now, no symlink
+    anywhere on it, and names the open file *opened*: what was opened is the file the check approved."""
+    now = _resolve_path(Path(resolved), strict=True)
+    if now is None or str(now) != resolved:
+        return False
+    try:
+        named = os.lstat(resolved)
+    except OSError:
+        return False
+    return stat.S_ISREG(opened.st_mode) and (named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino)
+
+
+def snapshot_attachment(path: str, session_key: str = "", *, label: str = "MEDIA directive path"
+                        ) -> Tuple[str, Optional[_AttachmentSnapshot]]:
+    """``attachment_verdict`` bound to the bytes that are sent, for one send of an owner message's attachment
+    (``_deliver_owed_attachments``). The adapters upload by path and open it again themselves, so holding a
+    validated file descriptor alone would not bind them. Here the path the check resolved is opened,
+    checked again after the open (it still resolves to itself and names the open file), and the open file is
+    copied into a private snapshot, which is what the adapter uploads: a symlink or a file swapped in after
+    the check never reaches the transport. ``(ATTACHMENT_SENDABLE, the snapshot)``, else the verdict and None.
+    Limits: the copy is of the approved file as it is while it is copied (an in-place write to that same file
+    before the copy is sent); a hard link to a protected file under an allowed path passes the path policy.
+    Blocking: run it off the loop."""
+    verdict, safe_path = attachment_verdict(path, session_key, label=label)
+    if safe_path is None:
+        return verdict, None
+    try:
+        fd = os.open(safe_path, _SNAPSHOT_OPEN_FLAGS)
+    except OSError:
+        fd = None
+    try:
+        if fd is None or not _still_names(safe_path, os.fstat(fd)):
+            logger.warning("Skipping %s (changed after it was checked): %s", label, _log_safe_path(str(path)))
+            return (ATTACHMENT_BLOCKED if _existing_regular_file(str(path)) else ATTACHMENT_MISSING), None
+        # In the document cache, one of MEDIA_DELIVERY_SAFE_ROOTS, which the policy allows in every mode: an
+        # adapter that checks the path it is handed again (photon's sidecar upload) accepts the snapshot.
+        os.makedirs(DOCUMENT_CACHE_DIR, exist_ok=True)
+        directory = tempfile.mkdtemp(prefix="hermes-attachment-", dir=DOCUMENT_CACHE_DIR)
+        snapshot = _AttachmentSnapshot(os.path.join(directory, os.path.basename(safe_path)), directory)
+        try:
+            with open(fd, "rb", closefd=False) as source, open(snapshot.path, "xb") as copy:
+                shutil.copyfileobj(source, copy)
+        except BaseException:
+            snapshot.discard()
+            raise
+        return ATTACHMENT_SENDABLE, snapshot
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _discard_late_snapshot(work: "asyncio.Future") -> None:
+    """Done-callback for a snapshot whose send was cancelled while it was being made."""
+    if not work.cancelled() and work.exception() is None and work.result()[1] is not None:
+        work.result()[1].discard()
+
+
 SUPPORTED_DOCUMENT_TYPES = {
     ".pdf": "application/pdf", ".md": "text/markdown", ".txt": "text/plain", ".csv": "text/csv",
     ".log": "text/plain", ".json": "application/json", ".xml": "application/xml",
@@ -1398,12 +1475,13 @@ def _terminal_sentinel_start(text: str) -> int:
     return start if start < end else -1
 
 
-def _mask_media_scan_text(text: str) -> str:
+def _mask_media_scan_text(text: str, *, declarations: bool = False) -> str:
     """Offset-preserving mask of protected spans (code, quotes, JSON string values) and of a
     terminal ``<|eos|>`` sentinel, so a tag glued to it ends on whitespace like any other.
+    ``declarations``: see ``_mask_protected_spans``.
     BasePlatformAdapter is defined later in this module; resolved at call time."""
     A = BasePlatformAdapter
-    masked = A._mask_json_string_media(A._mask_protected_spans(text))
+    masked = A._mask_json_string_media(A._mask_protected_spans(text, declarations=declarations))
     start = _terminal_sentinel_start(text)
     if start >= 0:
         masked = _blank_spans(masked, [(start, len(text.rstrip()))])
@@ -3357,11 +3435,12 @@ class BasePlatformAdapter(ABC):
 
     @staticmethod
     def _reply_media(media_files, session_key: str = "", *, owed: bool) -> List[Tuple[str, bool]]:
-        """The MEDIA: attachments a reply declares (``extract_media``), each checked by ``attachment_verdict``:
-        a sendable one under the host path it resolved to. An owner message's reply (*owed*) keeps every
-        declared attachment, before any existence or policy filtering, an unsendable one under its declared
-        path: the reply requires it, and its send records it missing or blocked (``_deliver_owed_attachments``).
-        Any other reply drops an unsendable one."""
+        """The MEDIA: attachments of a reply, each checked by ``attachment_verdict``: a sendable one under the
+        host path it resolved to. An owner message's reply (*owed*) passes every file it declares
+        (``declared_media``, parsed before any extension, existence or policy filtering) and keeps each one,
+        an unsendable one under its declared path: the reply requires it, and its send records it missing or
+        blocked (``_deliver_owed_attachments``). Any other reply passes ``extract_media``'s and drops an
+        unsendable one."""
         kept = []
         for media_path, is_voice in media_files or []:
             _verdict, safe_path = attachment_verdict(media_path, session_key)
@@ -3383,10 +3462,11 @@ class BasePlatformAdapter(ABC):
         return [p for p in safe_paths if p]
 
     @staticmethod
-    def _mask_protected_spans(content: str) -> str:
+    def _mask_protected_spans(content: str, *, declarations: bool = False) -> str:
         """Blank fenced code, inline code and blockquotes (length-preserving so regex offsets stay
         valid) against MEDIA: false positives; backtick-quoted paths inside MEDIA: tags stay
-        scannable."""
+        scannable. ``declarations`` (``declared_media``): a whole tag in inline code stays scannable
+        whether or not its file validates."""
         spans: list = [m.span() for m in _FENCED_CODE_RE.finditer(content)]
         for m in _INLINE_CODE_RE.finditer(content):
             start = m.start()
@@ -3398,7 +3478,7 @@ class BasePlatformAdapter(ABC):
             inner = m.group(0)[1:-1].strip()
             if inner.upper().startswith("MEDIA:"):
                 candidate = _normalize_media_tag_path(inner[6:])
-                if candidate and validate_media_delivery_path(candidate):
+                if candidate and (declarations or validate_media_delivery_path(candidate)):
                     continue  # Real deliverable tag in inline code — keep it scannable
             spans.append((start, m.end()))
         spans.extend(m.span() for m in re.finditer(r'^>.*$', content, re.MULTILINE))
@@ -3465,6 +3545,33 @@ class BasePlatformAdapter(ABC):
             if spans:
                 cleaned = re.sub(r'\n{3,}', '\n\n', _delete_spans(cleaned, spans)).strip()
         return media, cleaned
+
+    @staticmethod
+    def declared_media(content: str) -> List[Tuple[str, bool]]:
+        """Every ``MEDIA:`` file *content* declares, ``[(path, is_voice), ...]`` in order, whatever its
+        extension and whether or not its file exists or the media policy allows it: what an owner message's
+        reply requires (``_reply_media``). Parsing only: ``extract_media`` decides what is sent unconditionally
+        and what stays in the text, and the allowed extensions are its own. A tag in fenced code, a quote or a
+        JSON string value is an example, not a declaration; a whole tag in inline code is one (#35695). An
+        unknown-extension tag names the path ``extract_media`` would take when one validates (spaces,
+        #24032), else the whitespace-bounded path it names."""
+        has_voice_tag = "[[audio_as_voice]]" in content
+        scan = _mask_media_scan_text(content, declarations=True)
+        named: Dict[int, str] = {}
+        for match in MEDIA_TAG_CLEANUP_RE.finditer(scan):
+            if path := _normalize_media_tag_path(match.group("path")):
+                named[match.start()] = path
+        for match in MEDIA_EXTENSIONLESS_TAG_RE.finditer(scan):
+            path = _normalize_media_tag_path(match.group("path"))
+            if path and match.start() not in named:
+                found = _match_extensionless_path(scan, match) if _path_lacks_deliverable_extension(path) else None
+                named[match.start()] = found[0] if found else path
+        declared: Dict[str, bool] = {}
+        for _start, path in sorted(named.items()):
+            with contextlib.suppress(OSError, RuntimeError, ValueError):  # a crafted ~\x00 path names nothing
+                path = os.path.expanduser(path)
+                declared.setdefault(path, has_voice_tag and os.path.splitext(path)[1].lower() in _AUDIO_EXTS)
+        return list(declared.items())
 
     @staticmethod
     def strip_media_directives_for_display(text: str) -> str:
@@ -4443,46 +4550,63 @@ class BasePlatformAdapter(ABC):
         """Send the attachments of *extracted* that the reply's stored components (*held*) do not
         already show delivered, and record each one's outcome under *obligation_id* as soon as the
         sends end, a cancellation included. It is the one sender of an owner message's attachments (the
-        adapter's final, ``_OwedReply.finish``, ``redeliver_owed_attachments``): right before the sends,
-        each local attachment still owed is checked again (``attachment_verdict``, the policy and the file
-        of now), and what is uploaded is the host path that check resolved. One that is gone or refused
-        is never sent: it is recorded ``missing`` or ``blocked`` (never dropped, never delivered), logged,
-        and the chat is told once. An attachment the stored components do not name (another reply
-        already holds this obligation) is sent but proves nothing. True when every attachment of
-        *extracted* is delivered: the proof with the ledger off."""
+        adapter's final, ``_OwedReply.finish``, ``redeliver_owed_attachments``). Each local attachment is
+        checked right before its own send, after the sends before it (``snapshot_attachment``: the policy
+        and the file of now), and what that send uploads is a snapshot of the very file the check approved,
+        removed once the send ends, however it ends. One that is gone or refused is never sent: it is
+        recorded ``missing`` or ``blocked`` (never dropped, never delivered), logged, and the chat is told
+        once. An attachment the stored components do not name (another reply already holds this
+        obligation) is sent but proves nothing. True when every attachment of *extracted* is delivered: the
+        proof with the ledger off."""
         parts = {p["id"]: p for p in extracted.components() if p["kind"] != "text"}
         tracked = {c["id"]: c for c in held if c.get("id") in parts and _same_component(c, parts[c["id"]])}
         skip = frozenset(cid for cid, c in tracked.items() if c.get("state") == "delivered")
-        with self._media_delivery_scope(event.source):
-            checked = {cid: attachment_verdict(part["path"], session_key, label=(
-                           "MEDIA directive path" if part["kind"] == "media" else "local file path"))
-                       for cid, part in parts.items() if cid not in skip and part["kind"] in ("media", "file")}
-        refused = {cid: verdict for cid, (verdict, safe_path) in checked.items() if safe_path is None}
-        if refused:
-            await self._record_unsendable_attachments(event.source, obligation_id, parts, tracked, refused, metadata)
-        cids = extracted.component_ids()
-        media = [((checked[cid][1], voice), cid) for (_path, voice), cid in zip(extracted.media_files, cids["media"])
-                 if cid in checked and cid not in refused]
-        files = [(checked[cid][1], cid) for _path, cid in zip(extracted.local_files, cids["files"])
-                 if cid in checked and cid not in refused]
-        outgoing = dataclasses.replace(
-            extracted, media_files=[m for m, _cid in media], local_files=[f for f, _cid in files],
-            ids={"images": cids["images"], "media": [cid for _m, cid in media], "files": [cid for _f, cid in files]})
         outcomes: Dict[str, str] = {}
 
         def component_done(ids: list, success: bool) -> None:
             for cid in ids:
                 outcomes[cid] = "delivered" if success else "failed"
+
+        @contextlib.asynccontextmanager
+        async def upload(cid: str):
+            """The file the send of attachment *cid* uploads, None when it is not sent."""
+            verdict, snapshot = await self._snapshot_owed_attachment(event.source, parts[cid], session_key)
+            if snapshot is None:
+                await self._record_unsendable_attachments(
+                    event.source, obligation_id, parts, tracked, {cid: verdict}, metadata)
+                yield None
+                return
+            try:
+                yield snapshot.path
+            finally:
+                snapshot.discard()
         try:
             await self._deliver_attachments(
-                event, outgoing, metadata, anything_sent=anything_sent,
+                event, extracted, metadata, anything_sent=anything_sent,
                 record_delivery=record_delivery or (lambda _result: None), component_done=component_done,
-                skip=skip)
+                skip=skip, upload=upload)
         finally:
             recorded = {cid: state for cid, state in outcomes.items() if cid in tracked}
             if obligation_id and recorded:
                 await asyncio.shield(self._mark_components(obligation_id, recorded))
         return all(cid in skip or outcomes.get(cid) == "delivered" for cid in parts)
+
+    async def _snapshot_owed_attachment(self, source: Any, part: Dict[str, Any], session_key: str
+                                        ) -> Tuple[str, Optional[_AttachmentSnapshot]]:
+        """``snapshot_attachment`` of one stored attachment *part*, off the loop, inside the routed profile's
+        media scope. A send cancelled while its snapshot is made leaves none behind."""
+        scope = self._media_delivery_scope(source)
+        label = "MEDIA directive path" if part["kind"] == "media" else "local file path"
+
+        def prepare() -> Tuple[str, Optional[_AttachmentSnapshot]]:
+            with scope:
+                return snapshot_attachment(part["path"], session_key, label=label)
+        work = asyncio.ensure_future(asyncio.to_thread(prepare))
+        try:
+            return await asyncio.shield(work)
+        except asyncio.CancelledError:
+            work.add_done_callback(_discard_late_snapshot)
+            raise
 
     async def owe_explicit_reply(self, source: Any, session_key: str, answer_ref: Optional[str], text: str,
                                  response: str, *, attachments: bool = True) -> "_OwedReply":
@@ -4492,9 +4616,8 @@ class BasePlatformAdapter(ABC):
         ``attachments`` the reply requires its text only. ``_OwedReply.finish`` sends the rest."""
         media: list = []
         if attachments and response:
-            media, _rest = self.extract_media(response)
             with self._media_delivery_scope(source):
-                media = self._reply_media(media, session_key, owed=True)
+                media = self._reply_media(self.declared_media(response), session_key, owed=True)
         from gateway.delivery_ledger import ReplyNotStored
         extracted = _ExtractedResponse(
             text_content=(text or "").strip(), images=[], media_files=media, local_files=[],
@@ -4640,12 +4763,15 @@ class BasePlatformAdapter(ABC):
         self, event: MessageEvent, media_files: list, local_files: list, *,
         force_document_attachments: bool, human_delay: float, metadata: Dict[str, Any],
         record_delivery: Callable, media_ids: Optional[list] = None, file_ids: Optional[list] = None,
-        component_done: Optional[Callable] = None) -> None:
+        component_done: Optional[Callable] = None, upload: Optional[Callable] = None) -> None:
         """Deliver MEDIA-tag files and detected local files by type: images batched via
         ``send_multiple_images`` unless ``[[as_document]]``; otherwise audio → send_voice (MEDIA
         tags only, never bare local files), video → send_video, else send_document. Every failure is
         reported. Each send feeds ``record_delivery`` so media-only turns report SUCCESS, and
-        ``component_done`` with the component ids it carried (``media_ids`` / ``file_ids``)."""
+        ``component_done`` with the component ids it carried (``media_ids`` / ``file_ids``).
+        ``upload`` (an owner message's reply, ``_deliver_owed_attachments``): each file is sent on its
+        own, and ``upload(component id)``, entered right before its send and left once the send ended,
+        gives the file to send instead, or None when it is not to be sent."""
         from urllib.parse import quote as _quote
 
         def _as_image(path: str) -> bool:
@@ -4654,10 +4780,22 @@ class BasePlatformAdapter(ABC):
         file_ids = list(file_ids) if file_ids is not None else [None] * len(local_files)
         _images = [(p, cid) for (p, is_voice), cid in zip(media_files, media_ids) if not is_voice and _as_image(p)]
         _images += [(p, cid) for p, cid in zip(local_files, file_ids) if _as_image(p)]
-        if _images:
+        if _images and upload is None:
             await self._send_image_batch(
                 event, [(f"file://{_quote(p)}", "") for p, _cid in _images], metadata, human_delay,
                 record_delivery, ids=[cid for _p, cid in _images], component_done=component_done)
+        for _p, cid in _images if upload is not None else ():
+            try:
+                async with upload(cid) as path:
+                    if path is not None:
+                        await self._send_image_batch(
+                            event, [(f"file://{_quote(path)}", "")], metadata, human_delay, record_delivery,
+                            ids=[cid], component_done=component_done)
+            except Exception as err:
+                logger.warning("[%s] Error preparing an image: %s", self.name, err, exc_info=True)
+                failed = SendResult(success=False, error=str(err))
+                record_delivery(failed)
+                _component_outcome(component_done, [cid], failed)
         chat_id = event.source.chat_id
 
         async def _send_one(path: str, *, is_voice: bool, media_tag: bool) -> SendResult:
@@ -4685,7 +4823,13 @@ class BasePlatformAdapter(ABC):
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
             try:
-                result = await _send_one(path, is_voice=is_voice, media_tag=media_tag)
+                if upload is None:
+                    result = await _send_one(path, is_voice=is_voice, media_tag=media_tag)
+                else:
+                    async with upload(cid) as prepared:
+                        if prepared is None:
+                            continue
+                        result = await _send_one(prepared, is_voice=is_voice, media_tag=media_tag)
             except Exception as err:
                 result = SendResult(success=False, error=str(err))
                 if media_tag:
@@ -4875,12 +5019,13 @@ class BasePlatformAdapter(ABC):
     async def _deliver_attachments(self, event: MessageEvent, extracted: "_ExtractedResponse",
                                    metadata: Dict[str, Any], *, anything_sent: bool,
                                    record_delivery: Callable, component_done: Optional[Callable] = None,
-                                   skip: frozenset = frozenset()) -> None:
+                                   skip: frozenset = frozenset(), upload: Optional[Callable] = None) -> None:
         """Send extracted image URLs, MEDIA files and bare local files (human-paced),
         then fail loudly if a non-empty response produced nothing deliverable. Attachment
         results feed ``record_delivery`` so the turn outcome reflects them, and ``component_done``
         (component ids, success) per send when the reply's components are tracked. A component in
-        ``skip`` was already delivered and is not sent again."""
+        ``skip`` was already delivered and is not sent again. ``upload``: see
+        ``_deliver_media_attachments``."""
         human_delay = self._get_human_delay()
         ids = extracted.component_ids() if component_done is not None else None
 
@@ -4897,7 +5042,8 @@ class BasePlatformAdapter(ABC):
             event, [m for m, _c in media], [f for f, _c in files],
             force_document_attachments=extracted.force_document_attachments,
             human_delay=human_delay, metadata=metadata, record_delivery=record_delivery,
-            media_ids=[c for _m, c in media], file_ids=[c for _f, c in files], component_done=component_done)
+            media_ids=[c for _m, c in media], file_ids=[c for _f, c in files], component_done=component_done,
+            upload=upload)
         if not (anything_sent or extracted.images or extracted.local_files or extracted.media_files) \
                 and extracted.pre_extract.strip():
             logger.error("[%s] response_delivery_dropped: non-empty response "
@@ -4927,8 +5073,8 @@ class BasePlatformAdapter(ABC):
         ``blocked`` by its send (``_deliver_owed_attachments``), which keeps the reply owed.
         The caller holds the routed profile's media scope."""
         force_document = "[[as_document]]" in response
-        tagged, rest = cls.extract_media(response)
-        media_files = cls._reply_media(tagged, session_key, owed=True)
+        _tagged, rest = cls.extract_media(response)
+        media_files = cls._reply_media(cls.declared_media(response), session_key, owed=True)
         images, text_content = cls.extract_images(rest)
         text_content = _strip_media_directives(text_content).strip()
         local_files, text_content = cls.extract_local_files(text_content)
@@ -4953,7 +5099,8 @@ class BasePlatformAdapter(ABC):
         # bare-path validator infer the sandbox from the ACTIVE profile (#109024).
         with self._media_delivery_scope(event.source):
             media_files, response = self.extract_media(response)
-            media_files = self._reply_media(media_files, session_key, owed=owed)
+            media_files = self._reply_media(
+                self.declared_media(pre_extract) if owed else media_files, session_key, owed=owed)
             images, text_content = self.extract_images(response)
             # Strip any remaining internal directives from message body (fixes #1561). _strip_media_directives
             # shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag with an unknown extension is intentionally left in
