@@ -1016,13 +1016,34 @@ def inbound_record_replies(record: Dict[str, Any]) -> List[str]:
     return replies
 
 
-def _held_by_inbound_records() -> Optional[List[str]]:
-    """The replies every stored inbound record can still be settled from (``inbound_record_replies``); None
-    when the records cannot be listed. A record whose event cannot be read is never settled, so it holds
-    nothing."""
+def _held_by_inbound_records(conn) -> Optional[List[str]]:
+    """The obligations retention must keep while an inbound record is still on disk, or None when the
+    records cannot be known (retention then keeps everything). A record is settled from its own replies
+    (``inbound_record_replies``) or, when its message was folded into another, from the reply of the message
+    that absorbed it: an id only the transcript names, and the absorbing record may be long gone. So every
+    obligation of a record's session is kept, and every attachment-only reply (components, no row), until the
+    record is gone. A record that cannot be read now is still on disk: it holds its session if its session is
+    known, and holds everything (None) if even that cannot be read, never nothing."""
+    import json as _json
     from gateway import shutdown_flush
+    from hermes_constants import get_process_hermes_home
     try:
         records = shutdown_flush.load_inbound_records()
+        spool = get_process_hermes_home() / "pending_messages"
+        prefix = shutdown_flush._INBOUND_PREFIX  # noqa: SLF001
+        listed = set(spool.glob(f"{prefix}*.json")) if spool.is_dir() else set()
+        loaded = {spool / f"{prefix}{r['recovery_id']}.json" for r in records}
+        sessions = {r["session_key"] for r in records}
+        for path in listed - loaded:
+            # load_inbound_records omits a file it could not read or parse. One that cannot be read right now
+            # (a permission or I/O fault) is a record on disk all the same; one that reads and is not a
+            # record is never settled from, so it holds nothing.
+            try:
+                data = _json.loads(path.read_text(encoding="utf-8"))
+            except ValueError:
+                continue
+            if isinstance(data, dict) and isinstance(data.get("session_key"), str):
+                sessions.add(data["session_key"])
     except Exception:
         logger.warning("Could not read the inbound records; retention keeps every reply this time", exc_info=True)
         return None
@@ -1031,17 +1052,24 @@ def _held_by_inbound_records() -> Optional[List[str]]:
         try:
             held += inbound_record_replies(record)
         except Exception:
-            continue
+            continue  # its event cannot be read; its session is held below
+    if sessions:
+        held += [row[0] for row in conn.execute(
+            "SELECT obligation_id FROM delivery_obligations WHERE session_key IN (SELECT value FROM json_each(?))",
+            (_json.dumps(sorted(sessions)),))]
+        held += [row[0] for row in conn.execute(
+            """SELECT DISTINCT obligation_id FROM delivery_components
+               WHERE obligation_id NOT IN (SELECT obligation_id FROM delivery_obligations)""")]
     return held
 
 
 def _prune_unlocked(conn, now: float) -> None:
     """Retention DELETEs on the caller's open connection — must run inside the caller's transaction."""
     import json as _json
-    # A reply an inbound record still on disk can be settled from is that record's completion evidence: were
-    # it pruned, the next start would find no reply and send the answer in the transcript again. It is kept,
-    # delivered or not, until the record is gone.
-    held = _held_by_inbound_records()
+    # A reply an inbound record still on disk can be settled from (its own, or that of the message it was
+    # folded into) is that record's completion evidence: were it pruned, the next start would find no reply
+    # and send the answer in the transcript again. It is kept, delivered or not, until the record is gone.
+    held = _held_by_inbound_records(conn)
     if held is None:
         return
     unheld = "obligation_id NOT IN (SELECT value FROM json_each(?))"

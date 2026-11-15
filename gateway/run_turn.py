@@ -3117,7 +3117,7 @@ class GatewayTurnMixin:
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
         source: "SessionSource", session_id: str, session_key: str = None,
         run_generation: Optional[int] = None, event_message_id: Optional[str] = None,
-        scheduled_heartbeat: bool = False,
+        scheduled_heartbeat: bool = False, answer_ref: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of running a local AIAgent.
 
@@ -3177,6 +3177,8 @@ class GatewayTurnMixin:
             None if scheduled_heartbeat
             else self._proxy_stream_consumer(source, event_message_id, _thread_metadata, _run_still_current)
         )
+        if _stream_consumer and _owes_tracked_reply(_stream_consumer.adapter, answer_ref):
+            _stream_consumer.show_owner_reply_text()  # the reply to an owner message is shown as its other lanes show it
         stream_task = asyncio.create_task(_stream_consumer.run()) if _stream_consumer else None
 
         _adapter = self._delivery_adapter_for(source)
@@ -4706,6 +4708,7 @@ class GatewayTurnMixin:
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat,
+                answer_ref=_inbound_answer_ref_of(persist_user_display_metadata),
             )
 
         from run_agent import AIAgent

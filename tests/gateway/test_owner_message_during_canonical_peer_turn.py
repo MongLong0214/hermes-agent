@@ -3212,6 +3212,107 @@ def test_the_ledger_keeps_a_delivered_reply_while_its_record_is_still_on_disk(in
     assert _components(ingress, answer) == []
 
 
+def _folded_and_answered(ingress):
+    """Two stored messages merged into one head, whose turn answered both: the user row names both records
+    and the answer is in the transcript. Returns nothing; the records ``fold1`` and ``fold2`` are on disk."""
+    from types import SimpleNamespace
+
+    from agent.session_persistence import _db_flush_row
+    from gateway import shutdown_flush
+    from gateway.platforms.base import merge_pending_message_event
+    from gateway.run_turn import _inbound_row_metadata
+
+    db, sid, key = ingress.runner.session_store._db, ingress.entry.session_id, ingress.entry.session_key
+    events = []
+    for index, text in enumerate((_OWNER_TEXT, "owner: and the logs"), start=1):
+        event = MessageEvent(text=text, message_type=MessageType.TEXT, source=ingress.source, message_id=f"m{index}")
+        shutdown_flush.store_inbound_record(event, session_key=key, transport_profile=None,
+                                            recovery_id=f"fold{index}", order=(1, index))
+        event._inbound_record_id = f"fold{index}"
+        events.append(event)
+    pending = {}
+    merge_pending_message_event(pending, key, events[0])
+    merge_pending_message_event(pending, key, events[1], merge_text=True)
+    head = pending[key]
+    flusher = SimpleNamespace(_persist_user_message_override=None, _persist_user_message_timestamp=None)
+    db.append_messages_batch(sid, [
+        _db_flush_row(flusher, {"role": "user", "content": head.text, "platform_message_id": "m1",
+                                "display_metadata": _inbound_row_metadata(head)}, True),
+        {"role": "assistant", "content": f"{_TERMINAL} / both", "finish_reason": "stop"}])
+
+
+def _retention_after(days):
+    import time
+
+    from gateway import delivery_ledger as ledger
+    with ledger._DB_LOCK, ledger._transaction() as conn:
+        ledger._prune_unlocked(conn, time.time() + days * 24 * 60 * 60)
+
+
+def test_the_ledger_keeps_the_reply_that_settles_a_record_through_another_messages_answer(
+        ingress, send, monkeypatch):
+    """Review (retention, folded messages): two messages are merged and their shared answer is delivered
+    under the head's identity. Deleting the head's record works, deleting the absorbed record fails, and the
+    fault outlasts retention. The absorbed record is settled from the head's reply, so retention keeps it:
+    the next start finds the answer delivered and sends it again to no one."""
+    from pathlib import Path
+
+    _folded_and_answered(ingress)
+    unlink = Path.unlink
+
+    def refused(path, *args, **kwargs):
+        if path.name == "inbound-fold2.json":
+            raise OSError("spool temporarily unavailable")
+        return unlink(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "unlink", refused)
+    turns, _inputs, chats, left = _answered(ingress, _next_process(ingress, send, monkeypatch))
+    assert (turns, chats) == ([], ["chat"])
+    assert left == ["inbound-fold2.json"]
+    monkeypatch.setattr(Path, "unlink", unlink)
+    _retention_after(8)
+    nxt = _next_process(ingress, send, monkeypatch)
+    turns, _inputs, chats, left = _answered(ingress, nxt)
+    assert (turns, chats, _texts_sent(nxt), left) == ([], [], [], [])
+
+
+def test_an_unreadable_record_still_holds_the_ledger_evidence_it_settles_from(ingress, send, monkeypatch):
+    """Review (retention, read faults): a record that cannot be read while retention runs is on disk all the
+    same. Retention must not read it as absent and delete the delivery evidence it settles from, or the next
+    start, once the record reads again, would deliver the answer a second time."""
+    from pathlib import Path
+
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    _persisting_agents(monkeypatch)
+    unlink = Path.unlink
+
+    def refused(path, *args, **kwargs):
+        if path.name.startswith("inbound-"):
+            raise OSError("spool temporarily unavailable")
+        return unlink(path, *args, **kwargs)
+
+    async def exercise():
+        await h.warm()
+        monkeypatch.setattr(Path, "unlink", refused)
+        await h.adapter.handle_message(h.owner_event())
+        await h.settle()
+    asyncio.run(exercise())
+    monkeypatch.setattr(Path, "unlink", unlink)
+    [record] = _records(ingress)
+    assert [text for _chat, text in h.owner_replies() if _TERMINAL in text]
+    read_text = Path.read_text
+
+    def unreadable(path, *args, **kwargs):
+        if path.name.startswith("inbound-"):
+            raise PermissionError("record not readable right now")
+        return read_text(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    _retention_after(8)
+    monkeypatch.setattr(Path, "read_text", read_text)
+    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    turns, _inputs, _chats, left = _answered(ingress, nxt)
+    assert (turns, left, _texts_sent(nxt)) == ([], [], [])
+
+
 def test_store_partial_delivery_interruption_restart_recovery_and_cleanup(ingress, send, monkeypatch, tmp_path):
     """End-to-end acceptance. An owner message's answer is text and a PDF. Its components are stored
     before the first send; the text is delivered; while the PDF is on its way the process is killed. The

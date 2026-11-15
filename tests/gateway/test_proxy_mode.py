@@ -551,3 +551,64 @@ class TestStreamingResilience:
 
 
 
+
+
+class TestProxyOwnerReplyParser:
+    """The proxy-mode stream consumer shows an owner message's reply with the parser its other lanes use."""
+
+    @staticmethod
+    async def _streamed_texts(monkeypatch, display_metadata):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+
+        shown = []
+
+        class _Adapter(BasePlatformAdapter):
+            SUPPORTS_MESSAGE_EDITING = True
+
+            async def connect(self, **kwargs):
+                return True
+
+            async def disconnect(self):
+                pass
+
+            async def get_chat_info(self, chat_id):
+                return {"name": "fixture", "type": "dm"}
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                shown.append(content)
+                return SendResult(success=True, message_id="m1")
+
+            async def edit_message(self, chat_id, message_id, content, **kwargs):
+                shown.append(content)
+                return SendResult(success=True, message_id=message_id)
+
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        monkeypatch.delenv("GATEWAY_PROXY_KEY", raising=False)
+        runner = _make_runner()
+        runner.config.streaming = StreamingConfig(enabled=True)
+        source = _make_source()
+        adapter = _Adapter(PlatformConfig(enabled=True), Platform.MATRIX)
+        runner._delivery_adapter_for = lambda _source: adapter
+        runner._run_still_current_fn = lambda *a, **k: (lambda: True)
+        reply = "Report ready. MEDIA:/tmp/out/report with spaces.log is attached."
+        import json
+        resp = _FakeSSEResponse(status=200, sse_chunks=[
+            "data: " + json.dumps({"choices": [{"delta": {"content": reply}}]}) + "\n\n", "data: [DONE]\n\n"])
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(_FakeSession(resp)):
+                with patch("aiohttp.ClientTimeout"):
+                    await runner._run_agent_inner(
+                        message="hi", context_prompt="", history=[], source=source, session_id="s1",
+                        persist_user_display_metadata=display_metadata)
+        return shown
+
+    @pytest.mark.asyncio
+    async def test_an_owner_reply_is_shown_without_its_media_declaration(self, monkeypatch):
+        shown = await self._streamed_texts(monkeypatch, {"inbound_recovery_id": "r1"})
+        assert shown and not any("MEDIA:" in text or "report with spaces" in text for text in shown)
+
+    @pytest.mark.asyncio
+    async def test_any_other_reply_keeps_the_old_display(self, monkeypatch):
+        shown = await self._streamed_texts(monkeypatch, None)
+        assert any("MEDIA:/tmp/out/report with spaces.log" in text for text in shown)
