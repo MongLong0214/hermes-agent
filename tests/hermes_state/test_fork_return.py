@@ -228,7 +228,7 @@ def fork_1030_store(path: Path) -> dict:
 
 
 def run_input(db, session_id: str, request_id: str, text: str, *, transcript: bool, outcome="completed",
-              payload=None, cancel=False, stored=None, platform_message_id=None) -> int:
+              payload=None, cancel=False, stored=None, platform_message_id=None, principal="messaging:1") -> int:
     """One input through this build's real admission APIs: admitted, then cancelled before it runs, or claimed
     and settled with *outcome* (its turn's user message written first when *transcript*: *stored* as its content
     when the turn records more than the text, with the platform's message id when it has one). Returns the epoch."""
@@ -236,7 +236,7 @@ def run_input(db, session_id: str, request_id: str, text: str, *, transcript: bo
                                       claim_session_input, settle_session_input)
 
     epoch = begin_runtime_epoch(db, instance_id="candidate-1")
-    admission = admit_session_input(db, epoch=epoch, principal_id="messaging:1", session_id=session_id,
+    admission = admit_session_input(db, epoch=epoch, principal_id=principal, session_id=session_id,
                                     request_id=request_id, payload=payload or {"text": text})
     if cancel:
         assert cancel_session_input(db, epoch=epoch, admission_id=admission["admission_id"])["outcome"] == "cancelled"
@@ -259,7 +259,7 @@ def candidate_writes(path: Path) -> None:
         assert db._conn.execute("SELECT version FROM schema_version").fetchone()[0] == 1033
         db.append_message("tg1", role="user", content="telegram after the upgrade qv82")
         db.append_message("tg1", role="assistant", content="answered by 1033")
-        db.create_session("s2", source="local")
+        db.create_session("s2", source="tui")  # created_source = source: the fork lists it under tui too
         db.end_session("s1", "authority_revoked")
         db.end_session("s3", "user_exit")
         db.reopen_session("s3")
@@ -270,7 +270,7 @@ def candidate_writes(path: Path) -> None:
             conn.execute("INSERT INTO worker_executions VALUES ('x1', 'tg1', 'child', ?, 1, 'terminal', 'd', 1)", (epoch,))
             conn.execute("INSERT INTO worker_receipts VALUES ('x1', 1, 'p', '{}')")
             conn.execute("UPDATE conversation_generations SET generation = generation + 1 WHERE session_key = ?", (TG_KEY,))
-            conn.execute("UPDATE sessions SET created_source = 'tui', auto_archived = 1, archived = 1 WHERE id = 's2'")
+            conn.execute("UPDATE sessions SET auto_archived = 1, archived = 1 WHERE id = 's2'")
         db._execute_write(finish)
     finally:
         db.close()
@@ -782,7 +782,7 @@ def test_an_unreadable_source_is_never_reported_unchanged(stores, tmp_path, monk
         return read(path)
 
     monkeypatch.setattr(fork_return, "_source_state", unreadable_after_the_first_read)
-    with pytest.raises(PermissionError):
+    with pytest.raises(fork_return.ForkReturnRefused, match="could not be read again to verify it"):
         _export(source, output, report_path=tmp_path / "report.json")
     report = json.loads((tmp_path / "report.json").read_text())
     assert report["source_unchanged"] is False and report["source_check"].startswith("unverifiable")
@@ -836,7 +836,7 @@ def test_inputs_each_matched_to_their_own_message_return(stores):
     assert report["published"] and report["tables"]["session_admissions"]["inputs"]["matched_to_messages"] == 3
 
 
-def native_payload(monkeypatch, tmp_path, text: str, message_id) -> dict:
+def native_payload(monkeypatch, tmp_path, text: str, message_id, **event_fields) -> dict:
     """A native admission payload from the gateway's own builder (``snapshot_native``) for an A2A peer's message."""
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.platforms.event import MessageEvent, MessageType
@@ -852,7 +852,7 @@ def native_payload(monkeypatch, tmp_path, text: str, message_id) -> dict:
     source = adapter.build_source(chat_id="ctx-1", chat_name="a2a:peer", chat_type="dm", user_id="peer",
                                   user_name="peer")
     payload = snapshot_native(runner, MessageEvent(text=text, message_type=MessageType.TEXT, message_id=message_id,
-                                                   source=source))
+                                                   source=source, **event_fields))
     assert set(payload) == {"text", "native_text_v1"} and payload["native_text_v1"]["event"]["message_id"] == message_id
     return payload
 
@@ -925,10 +925,10 @@ def _with_unknown_envelope_key(payload: dict, key: str) -> dict:
      r"no rule carries to the fork: \w+ \(local_operator_v1\): payload \['local_operator_v1', 'text'\] has no rule"),
     (lambda db, native: run_input(db, "s3", "r9", "hi", transcript=True,
                                   payload=_with_unknown_envelope_key(native("hi", "m-7"), "native_text_v1")),
-     r"\(native_text_v1\): native_text_v1 carries \['later'\]"),
+     r"\(native_text_v1\): no rule for native_text_v1.later"),
     (lambda db, native: run_input(db, "s3", "r9", "q", transcript=True,
                                   payload=_with_unknown_envelope_key(api_payload("q"), "api_turn_v1")),
-     r"\(api_turn_v1\): api_turn_v1 carries \['later'\]"),
+     r"\(api_turn_v1\): no rule for api_turn_v1.later"),
     (lambda db, native: run_input(db, "s3", "r9", "parts", transcript=True,
                                   payload={"text": [{"type": "text", "text": "parts"}], "api_turn_v1": {
                                       "history": None, "settings": {}}}),
@@ -972,3 +972,316 @@ def test_a_removed_tables_data_without_a_rule_refuses(stores, sql, match):
     finally:
         conn.close()
     _assert_refused(source, output, match)
+
+
+# ── Every leaf of a finished payload: found in the kept rows, held nowhere but its admission, or refused ──
+
+def _api_turn(db, request_id: str, text: str, history, **kwargs) -> None:
+    """An API turn as session_api_turn admits it, then settlement's own compaction (a Responses row keeps its
+    history: its terminal replay rebuilds the previous_response_id snapshot from it)."""
+    from gateway.session_api_media import compact_settled_api_payloads
+
+    run_input(db, "s3", request_id, text, principal="api", payload=api_payload(text, history=history), **kwargs)
+    compact_settled_api_payloads(db)
+
+
+def _history(*entries) -> list:
+    return [{"role": role, "content": content} for role, content in entries]
+
+
+_FIRST = (lambda db: _api_turn(db, "responses:r8", "first question", None, transcript=True))
+_KEPT_CONVERSATION = _history(("user", "first question"), ("assistant", "answered: first question"))
+
+
+def test_a_responses_turns_prior_input_no_kept_row_holds_refuses(stores):
+    """The client sent prior turns in api_turn_v1.history that this store holds nowhere else; the turn's own text
+    is a kept row. Matching the text alone would drop the history while reporting no loss."""
+    source, _, output = stores
+    _runtime_write(source, lambda db: _api_turn(db, "responses:r9", "and now?", _history(
+        ("user", "unique prior input zq9"), ("assistant", "an answer given elsewhere zq9")), transcript=True))
+    assert "unique prior input zq9" in _rows(source, "SELECT payload_json FROM session_admissions "
+                                                     "WHERE request_id = 'responses:r9'")[0][0]
+    report = _assert_refused(source, output, r"lossless return impossible: 1 session_admissions inputs .*"
+                                             r"api_turn_v1.history\[0\] \(user\) is no kept message of its sessions")
+    assert report["tables"]["session_admissions"]["inputs"]["by_kind"]["api_turn_v1"]["lossless_return_impossible"] == 1
+
+
+def test_a_history_that_is_the_kept_conversation_before_it_returns(stores):
+    source, _, output = stores
+    _runtime_write(source, lambda db: (_FIRST(db), _api_turn(db, "responses:r9", "and now?", _KEPT_CONVERSATION,
+                                                             transcript=True)))
+    report = _export(source, output)
+    assert report["published"] and report["tables"]["session_admissions"]["inputs"]["by_kind"]["api_turn_v1"] == {
+        "matched": 2, "lossless_return_impossible": 0, "no_rule": 0}
+
+
+@pytest.mark.parametrize("history, match", [
+    (_KEPT_CONVERSATION[::-1], r"api_turn_v1.history\[1\] \(user\) is no kept message of its sessions before"),
+    (_history(("user", "said after it")), r"api_turn_v1.history\[0\] \(user\) is no kept message of its sessions"),
+], ids=["kept rows in another order", "a kept row written after its input"])
+def test_a_history_out_of_its_order_refuses(stores, history, match):
+    source, _, output = stores
+    _runtime_write(source, lambda db: (_FIRST(db), _api_turn(db, "responses:r9", "and now?", history, transcript=True),
+                                       db.append_message("s3", role="user", content="said after it")))
+    _assert_refused(source, output, match)
+
+
+def _nested(payload: dict, *path_and_value) -> dict:
+    *path, key, value = path_and_value
+    node = payload
+    for name in path:
+        node = node[name]
+    node[key] = value
+    return payload
+
+
+_HELD_ONLY_BY_ITS_ADMISSION = {
+    "native media": (lambda native: _nested(native("hi", "m-7"), "native_text_v1", "media",
+                                            [{"path": "native-inputs/ab", "sha256": "ab"}]),
+                     r"native_text_v1.media only its admission holds"),
+    "native platform metadata": (lambda native: _nested(native("hi", "m-7"), "native_text_v1", "event", "metadata",
+                                                        {"whatsapp_native_type": "locationMessage"}),
+                                 r"native_text_v1.event.metadata only its admission holds"),
+    "api media": (lambda native: _nested(api_payload("hi"), "api_turn_v1", "media", [{"sha256": "ab"}]),
+                  r"api_turn_v1.media only its admission holds"),
+}
+
+
+@pytest.mark.parametrize("case", list(_HELD_ONLY_BY_ITS_ADMISSION))
+def test_data_only_its_admission_holds_refuses(stores, monkeypatch, tmp_path, case):
+    source, _, output = stores
+    make, match = _HELD_ONLY_BY_ITS_ADMISSION[case]
+    _runtime_write(source, lambda db: run_input(
+        db, "s3", "r9", "hi", transcript=True, platform_message_id="m-7",
+        payload=make(lambda text, mid: native_payload(monkeypatch, tmp_path, text, mid))))
+    _assert_refused(source, output, r"lossless return impossible: 1 session_admissions inputs .*" + match)
+
+
+_QUOTED = '[Replying to: "the quoted line"]\n\nhi there'
+
+
+@pytest.mark.parametrize("stored, returns", [(_QUOTED, True), ("hi there", False)],
+                         ids=["inside its row", "in no kept row"])
+def test_quoted_context_must_be_inside_its_row(stores, monkeypatch, tmp_path, stored, returns):
+    source, _, output = stores
+    _runtime_write(source, lambda db: run_input(
+        db, "s3", "r9", "hi there", transcript=True, stored=stored, platform_message_id="m-7",
+        payload=native_payload(monkeypatch, tmp_path, "hi there", "m-7", reply_to_message_id="m-5",
+                               reply_to_text="the quoted line")))
+    if returns:
+        assert _export(source, output)["published"]
+    else:
+        _assert_refused(source, output, r"no kept user message of its sessions is its input with its quoted context")
+
+
+@pytest.mark.parametrize("make, match", [
+    (lambda native: _nested(native("hi", "m-7"), "native_text_v1", "event", "later", 1),
+     r"no rule for native_text_v1.event.later"),
+    (lambda native: _nested(native("hi", "m-7"), "native_text_v1", "source", "later", "x"),
+     r"no rule for native_text_v1.source.later"),
+    (lambda native: _nested(api_payload("hi"), "api_turn_v1", "settings", "later", 1),
+     r"no rule for api_turn_v1.settings.later"),
+    (lambda native: _nested(native("hi", "m-7"), "native_text_v1", "event", "message_id", {"id": "m-7"}),
+     r"native_text_v1.event.message_id is not the shape its rule reads"),
+    (lambda native: _nested(native("hi", "m-7"), "native_text_v1", "event", "reply_to_text", 5),
+     r"native_text_v1.event.reply_to_text is not the shape its rule reads"),
+    (lambda native: _nested(native("hi", "m-7"), "native_text_v1", "source", "a2a peer"),
+     r"native_text_v1.source is not the shape its rule reads"),
+    (lambda native: _nested(api_payload("hi"), "api_turn_v1", "resume_unanswered", "yes"),
+     r"api_turn_v1.resume_unanswered is not the shape its rule reads"),
+    (lambda native: _nested(api_payload("hi"), "api_turn_v1", "history", "hi"),
+     r"api_turn_v1.history is not the shape its rule reads"),
+    (lambda native: _nested(api_payload("hi"), "api_turn_v1", "history",
+                            [{"role": "user", "content": "hi", "name": "x"}]),
+     r"api_turn_v1.history is not the shape its rule reads"),
+    (lambda native: _nested(api_payload("hi"), "api_turn_v1", "history",
+                            [{"role": "user", "content": [{"type": "text"}]}]),
+     r"api_turn_v1.history is not the shape its rule reads"),
+], ids=["an unknown event field", "an unknown source field", "an unknown api setting", "a message id object",
+        "quoted context not text", "a source not an object", "a resume flag not true", "a history not a list",
+        "a history entry with more than role and content", "a multimodal history entry"])
+def test_a_nested_leaf_no_rule_carries_refuses(stores, monkeypatch, tmp_path, make, match):
+    source, _, output = stores
+    _runtime_write(source, lambda db: run_input(
+        db, "s3", "r9", "hi", transcript=True, platform_message_id="m-7",
+        payload=make(lambda text, mid: native_payload(monkeypatch, tmp_path, text, mid))))
+    report = _assert_refused(source, output, r"session_admissions rows no rule carries to the fork: .*" + match)
+    assert report["tables"]["session_admissions"]["inputs"]["no_rule"] == 1
+
+
+# ── created_source: the fork finds a session by its source alone ──
+
+@pytest.mark.parametrize("source_label, created", [("local", "tui"), ("local", "unknown"), ("cli", "")])
+def test_a_creation_label_other_than_its_source_refuses(stores, source_label, created):
+    """This build lists a ``local`` session under the surface that created it; the fork lists by source alone, so
+    the session would leave that listing."""
+    source, _, output = stores
+    _runtime_write(source, lambda db: (db.create_session("s4", source=source_label),
+                                       db.append_message("s4", role="user", content="made in the tui"),
+                                       db._execute_write(lambda conn: conn.execute(
+                                           "UPDATE sessions SET created_source = ? WHERE id = 's4'", (created,)))))
+    report = _assert_refused(
+        source, output, rf"lossless return impossible: sessions.created_source differs from source; the fork finds a "
+                        rf"session by its source alone: 1 rows: id='s4', source='{source_label}', "
+                        rf"created_source='{created}'")
+    assert report["columns"]["sessions.created_source"]["condition_broken_rows"] == 1
+
+
+def test_a_creation_label_equal_to_its_source_or_unset_returns(stores):
+    source, _, output = stores
+    labels = dict(_rows(source, "SELECT id, created_source FROM sessions"))
+    assert labels["s2"] == "tui" and labels["s1"] is None  # this build's own session, and a fork-era one
+    report = _export(source, output)
+    assert report["published"] and report["columns"]["sessions.created_source"]["condition_broken_rows"] == 0
+
+
+# ── The verify/publish boundary: a change found at any point is a failure, and its output is taken back ──
+
+def _after_publication(monkeypatch, output: Path, act) -> None:
+    """Run *act* once, when the export removes its scratch with the output already published: the steps between
+    publication and the export's end."""
+    remove, fired = fork_return._remove_scratch, []
+
+    def removing(directory):
+        left = remove(directory)
+        if output.exists() and not fired:
+            fired.append(act())
+        return left
+
+    monkeypatch.setattr(fork_return, "_remove_scratch", removing)
+
+
+def _append_to(source: Path, text: str) -> bool:
+    db = SessionDB(db_path=source)
+    try:
+        db.append_message("s1", role="user", content=text)
+    finally:
+        db.close()
+    return True
+
+
+def _fail(source, output, report_path, code: int = 2) -> dict:
+    assert fork_return.main([str(source), str(output), "--report", str(report_path)]) == code
+    report = json.loads(report_path.read_text())
+    assert report["succeeded"] is False
+    return report
+
+
+def test_a_source_written_after_publication_fails_and_takes_its_output_back(stores, monkeypatch, tmp_path):
+    source, _, output = stores
+    output.parent.mkdir()
+    _after_publication(monkeypatch, output, lambda: _append_to(source, "committed during the export q77"))
+    report = _fail(source, output, tmp_path / "report.json")
+    assert not output.exists() and report["published"] is False and report["source_unchanged"] is False
+    assert report["retraction"].startswith("retracted") and "the source changed while it was read" in report["refused"]
+    assert _rows(source, "SELECT count(*) FROM messages WHERE content = 'committed during the export q77'") == [(1,)]
+    assert not list(output.parent.iterdir())
+
+
+def test_a_source_written_before_publication_publishes_nothing(stores, monkeypatch, tmp_path):
+    """A change during the staging copy's removal, the last step before the source is read again for publication."""
+    source, _, output = stores
+    crashed = _wal_bearing_copy(source, tmp_path / "crashed")
+    work = tmp_path / "work"
+    work.mkdir()
+    output.parent.mkdir()
+    remove, fired = fork_return._remove_scratch, []
+
+    def removing(directory):
+        left = remove(directory)
+        if directory.parent == work and not fired:
+            fired.append(_append_to(crashed, "committed while staging q78"))
+        return left
+
+    monkeypatch.setattr(fork_return, "_remove_scratch", removing)
+    assert fork_return.main([str(crashed), str(output), "--work-dir", str(work),
+                             "--report", str(tmp_path / "report.json")]) == 2
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert fired and not output.exists() and report["published"] is False and "retraction" not in report
+    assert report["refused"] == ["the source changed while it was read"] and not list(output.parent.iterdir())
+
+
+def test_an_output_replaced_after_publication_is_not_a_success_and_is_left_alone(stores, monkeypatch, tmp_path):
+    source, _, output = stores
+    output.parent.mkdir()
+
+    def replace():
+        output.unlink()
+        output.write_bytes(b"another process's file")
+        return True
+
+    _after_publication(monkeypatch, output, replace)
+    report = _fail(source, output, tmp_path / "report.json")
+    assert output.read_bytes() == b"another process's file" and report["published"] is False
+    assert any("was replaced or removed by another process" in r for r in report["refused"])
+
+
+def test_a_retraction_never_moves_a_file_it_did_not_create(stores, monkeypatch, tmp_path):
+    """The source changed after publication, and before the output is taken back another process replaced it."""
+    source, _, output = stores
+    output.parent.mkdir()
+    _after_publication(monkeypatch, output, lambda: _append_to(source, "committed during the export q79"))
+    retract, rename = fork_return._retract, os.rename
+
+    def replaced_first(out, identity, report):
+        out.unlink()
+        out.write_bytes(b"another process's file")
+        monkeypatch.setattr(os, "rename", lambda *a: pytest.fail(f"moved a file this run did not create: {a}"))
+        try:
+            return retract(out, identity, report)
+        finally:
+            monkeypatch.setattr(os, "rename", rename)
+
+    monkeypatch.setattr(fork_return, "_retract", replaced_first)
+    report = _fail(source, output, tmp_path / "report.json")
+    assert output.read_bytes() == b"another process's file" and report["published"] is False
+    assert "left untouched" in report["retraction"] and "residual" not in report
+
+
+def test_a_file_swapped_in_while_retracting_is_put_back(stores, monkeypatch, tmp_path):
+    """Replaced between the retraction's check and its move: what was moved is not this run's, so it goes back."""
+    source, _, output = stores
+    output.parent.mkdir()
+    _after_publication(monkeypatch, output, lambda: _append_to(source, "committed during the export q80"))
+    rename = os.rename
+
+    def swapped_then_moved(src, dst):
+        if Path(src) == output:
+            output.unlink()
+            output.write_bytes(b"another process's file")
+        return rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", swapped_then_moved)
+    report = _fail(source, output, tmp_path / "report.json")
+    assert output.read_bytes() == b"another process's file" and report["published"] is False
+    assert "another process's file; it was left in place" in report["retraction"]
+    assert sorted(p.name for p in output.parent.iterdir()) == ["state.db"]
+
+
+def test_an_output_that_cannot_be_taken_back_is_named_and_never_a_success(stores, monkeypatch, tmp_path):
+    source, _, output = stores
+    output.parent.mkdir()
+
+    def write_then_block_moves():
+        _append_to(source, "committed during the export q81")
+
+        def refused(*_args):
+            raise PermissionError("Operation not permitted")
+
+        monkeypatch.setattr(os, "rename", refused)
+        return True
+
+    _after_publication(monkeypatch, output, write_then_block_moves)
+    report = _fail(source, output, tmp_path / "report.json", code=3)
+    assert output.exists() and report["published"] is True and report["residual"]["path"] == str(output)
+    assert "not a verified return of the source" in report["residual"]["state"]
+    assert sorted(p.name for p in output.parent.iterdir()) == ["state.db"]
+
+
+def test_a_report_that_cannot_be_written_takes_the_output_back(stores, monkeypatch, tmp_path):
+    source, _, output = stores
+    output.parent.mkdir()
+    report_path = tmp_path / "report.json"
+    _after_publication(monkeypatch, output, lambda: report_path.write_bytes(b"another process's report"))
+    assert fork_return.main([str(source), str(output), "--report", str(report_path)]) == 2
+    assert not output.exists() and report_path.read_bytes() == b"another process's report"

@@ -12,7 +12,10 @@
 #    fork binary writes fork-era sessions, messages, a conversation boundary and an expired turn lease.
 # 2. this checkout: migrates it to 1033 and writes what this build writes (candidate_writes in that test
 #    module: a turn, a revoked and a reopened authority, a reclaimed lease, a run admission, a worker).
-# 3. this checkout: python -m hermes_state_fork_return SOURCE OUTPUT --report REPORT.
+# 3. this checkout: python -m hermes_state_fork_return SOURCE OUTPUT --report REPORT. Then lookups: every
+#    session label the store holds (source, created_source) and every surface name, looked up by this checkout's
+#    CLI reader on a copy of SOURCE and by the fork binary on a copy of OUTPUT (listings with and without archived
+#    rows, search, count, each session's own row): the same sessions must come back for every label.
 # 4. fork binary, on a copy of OUTPUT in a fresh HOME: open, read, write a turn, reopen a revoked session,
 #    try the superseded lease holder, cross a conversation boundary; then a new process (restart) reads it
 #    all back, and the fork's `hermes sessions list` reads it.
@@ -214,6 +217,50 @@ check("integrity_check", raw("PRAGMA integrity_check") == [("ok",)])
 sys.exit(1 if failed else 0)
 PY
 
+cat >"$W/steps/lookups.py" <<'PY'
+"""lookups.py MODE DB OUT [LABELS]: the sessions each label finds. MODE=candidate reads through this checkout's CLI
+reader (a ``local`` row is listed under the surface that created it) and writes the labels it used; MODE=fork reads
+with the fork binary's SessionDB, as the fork's CLI does, for the labels the candidate step wrote."""
+import json, sqlite3, sys
+from pathlib import Path
+from hermes_state import SessionDB
+MODE, DB, OUT = sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3])
+if MODE == "candidate":
+    from gateway.session_policy import SURFACES
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    held = {v for (v,) in conn.execute("SELECT source FROM sessions UNION SELECT created_source FROM sessions")}
+    conn.close()
+    labels = sorted((held | set(SURFACES) | set(SURFACES.values()) | {"local"}) - {None})
+else:
+    labels = json.loads(Path(sys.argv[4]).read_text())["labels"]
+db = SessionDB(db_path=DB)
+try:
+    reader = db
+    if MODE == "candidate":
+        from hermes_cli.gateway_session_store import SurfaceLabelReader
+        reader = SurfaceLabelReader(db)
+
+    def ids(rows):
+        return sorted(r["id"] for r in rows)
+
+    wide = dict(limit=100000, include_children=True, include_hidden=True)
+    found = {label: {
+        "list": ids(reader.list_sessions_rich(source=label, **wide)),
+        "list_with_archived": ids(reader.list_sessions_rich(source=label, include_archived=True, **wide)),
+        "search": ids(reader.search_sessions(source=label, limit=100000)),
+        "count": reader.session_count(source=label),
+    } for label in labels}
+    every = sorted({i for f in found.values() for i in f["list_with_archived"]})
+    rows = {}
+    for i in every:
+        row = db.get_session(i)
+        rows[i] = row and {k: row.get(k) for k in ("id", "source", "session_key", "parent_session_id")}
+finally:
+    db.close()
+OUT.write_text(json.dumps({"labels": labels, "found": found, "rows": rows}, sort_keys=True))
+print(f"  {MODE}: {len(labels)} labels, {len(every)} sessions found")
+PY
+
 cat >"$W/steps/fork_cli.py" <<'PY'
 import sys
 sys.argv = ["hermes", "sessions", "list"]
@@ -253,10 +300,41 @@ print("  report:", json.dumps({k: r.get(k) for k in ("published", "loss_detected
 print("  removed tables:", json.dumps({k: [v["disposition"], v["rows"]] for k, v in r["tables"].items()
       if v["disposition"] != "preserved"}))
 print("  admission inputs:", json.dumps(r["tables"]["session_admissions"].get("inputs")))
-assert r["published"] and not r["loss_detected"] and r["source_unchanged"] is True, "report"
+print("  creation labels:", json.dumps(r["columns"]["sessions.created_source"]))
+assert r["published"] and r["succeeded"] and not r["loss_detected"] and r["source_unchanged"] is True, "report"
+assert r["columns"]["sessions.created_source"]["condition_broken_rows"] == 0, "created_source"
 PY
 [ "$(sha "$SRC")" = "$SRC_SHA" ] && echo "  source bytes unchanged: $SRC_SHA" || { echo "  FAIL source changed"; exit 1; }
 run "$W/cand-home" "$CANDIDATE_PYTHON" "$REPO" "$W/steps/compare_shape.py" "$W/fork-era.db" "$W/out/state.db"
+
+step "3b. lookups: this build on the source, the fork binary on the output, for every label"
+cp "$SRC" "$W/lookup-source.db"
+cp "$W/out/state.db" "$W/lookup-output.db"
+run "$W/cand-home" "$CANDIDATE_PYTHON" "$REPO" "$W/steps/lookups.py" candidate "$W/lookup-source.db" \
+  "$W/lookups-candidate.json"
+run "$W/return-home" "$FORK_PYTHON" "$FORK_TREE" "$W/steps/lookups.py" fork "$W/lookup-output.db" \
+  "$W/lookups-fork.json" "$W/lookups-candidate.json"
+python3 - "$W/lookups-candidate.json" "$W/lookups-fork.json" "$SRC" <<'PY'
+import json, sqlite3, sys
+cand, fork = (json.load(open(p)) for p in sys.argv[1:3])
+conn = sqlite3.connect(f"file:{sys.argv[3]}?mode=ro", uri=True)
+print("  source labels:", " ".join(f"{i}={s}/{c}" for i, s, c in conn.execute(
+    "SELECT id, source, coalesce(created_source, 'NULL') FROM sessions ORDER BY id")))
+conn.close()
+bad = [(label, kind, cand["found"][label][kind], fork["found"][label][kind]) for label in cand["labels"]
+       for kind in cand["found"][label] if cand["found"][label][kind] != fork["found"][label][kind]]
+bad += [("row", i, cand["rows"].get(i), fork["rows"].get(i)) for i in sorted(set(cand["rows"]) | set(fork["rows"]))
+        if cand["rows"].get(i) != fork["rows"].get(i)]
+for label in cand["labels"]:
+    if cand["found"][label]["list_with_archived"]:
+        print(f"  {label}: {cand['found'][label]} (fork: {fork['found'][label]})")
+for b in bad:
+    print("  FAIL lookup differs:", json.dumps(b))
+kinds = len(next(iter(cand["found"].values())))
+print(f"  {len(cand['labels'])} labels x {kinds} lookups, {len(cand['rows'])} session rows: "
+      + ("same" if not bad else f"{len(bad)} differ"))
+sys.exit(1 if bad else 0)
+PY
 
 step "4. fork binary on a copy of the output: open, read, write"
 RET_DB=$W/return-home/.hermes/state.db
