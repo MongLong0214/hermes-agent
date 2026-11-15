@@ -1236,22 +1236,41 @@ class _AttachmentSnapshot:
                            "reclaims it once it is stale", self.directory, exc)
 
 
-# Read only, never through a symlink as the last component, never blocking on a FIFO swapped in.
+# Read only, never through a symlink, never blocking on a FIFO swapped in: the file, and each directory
+# on its path (``_open_checked_path``).
 _SNAPSHOT_OPEN_FLAGS = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
                         | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0))
+_WALK_DIRECTORY_FLAGS = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+                         | getattr(os, "O_CLOEXEC", 0))
+_CAN_WALK_CHECKED_PATH = (os.open in os.supports_dir_fd and hasattr(os, "O_NOFOLLOW")
+                          and hasattr(os, "O_DIRECTORY"))
 
 
-def _still_names(resolved: str, opened: os.stat_result) -> bool:
-    """True when *resolved* (a path ``attachment_verdict`` resolved) resolves to itself now, no symlink
-    anywhere on it, and names the open regular file *opened*: *resolved* is the open file's resolved path."""
-    now = _resolve_path(Path(resolved), strict=True)
-    if now is None or str(now) != resolved:
-        return False
+def _open_checked_path(resolved: str) -> Optional[int]:
+    """A descriptor of what *resolved* (a path ``attachment_verdict`` resolved: absolute, no symlink on it)
+    names, opened from the filesystem root one component at a time, each inside the directory opened
+    before it (``dir_fd``) and never through a symlink (``O_NOFOLLOW``): the path the policy judged and
+    the file opened are one binding, so a directory on it swapped for a symlink fails the open, whenever
+    it is swapped. None when a component is a symlink now, is gone or cannot be opened, and on a platform
+    without ``dir_fd`` / ``O_NOFOLLOW`` / ``O_DIRECTORY`` opens: the attachment is refused there."""
+    path = Path(resolved)
+    if not (_CAN_WALK_CHECKED_PATH and path.is_absolute()) or any(
+            part in ("", ".", "..") for part in path.parts[1:]):
+        return None
     try:
-        named = os.lstat(resolved)
+        directory = os.open(path.anchor, _WALK_DIRECTORY_FLAGS)
     except OSError:
-        return False
-    return stat.S_ISREG(opened.st_mode) and (named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino)
+        return None
+    try:
+        for part in path.parts[1:-1]:
+            inner = os.open(part, _WALK_DIRECTORY_FLAGS, dir_fd=directory)
+            os.close(directory)
+            directory = inner
+        return os.open(path.name, _SNAPSHOT_OPEN_FLAGS, dir_fd=directory)
+    except OSError:
+        return None
+    finally:
+        os.close(directory)
 
 
 def snapshot_attachment(path: str, session_key: str = "", *, label: str = "MEDIA directive path"
@@ -1259,24 +1278,22 @@ def snapshot_attachment(path: str, session_key: str = "", *, label: str = "MEDIA
     """``attachment_verdict`` bound to the bytes that are sent, for one send of an owner message's attachment
     (``_deliver_owed_attachments``). The adapters upload by path and open it again themselves, so holding a
     validated file descriptor alone would not bind them. Here the path the check resolved is opened once,
-    and the policy decides again on the open file itself: the path must still resolve to itself and name it
-    (``_still_names``), and the policy reads that path and the open file's own mtime. The open file is then
-    copied into a private snapshot, which is what the adapter uploads, and the path is never opened again: a
-    symlink or another file swapped in under the path before the open is judged as itself, and refused when
-    the policy refuses it. ``(ATTACHMENT_SENDABLE, the snapshot)``, else the verdict and None.
+    walked one directory at a time and never through a symlink (``_open_checked_path``), so the open file is
+    the one at that path; the policy then decides again on it: a regular file, judged by that path and its
+    own mtime. The open file is then copied into a private snapshot, which is what the adapter uploads, and
+    the path is never opened again: a symlink or another file swapped in under the path or any directory on
+    it before the open is judged as itself, and refused when the policy refuses it.
+    ``(ATTACHMENT_SENDABLE, the snapshot)``, else the verdict and None.
     Limits: the copy is of the approved file as it is while it is copied (an in-place write to that same file
-    before the copy is sent); a hard link to a protected file under an allowed path passes the path policy.
-    Blocking: run it off the loop."""
+    before the copy is sent); a hard link to a protected file, or a file or real directory moved in, under an
+    allowed path passes the path policy. Blocking: run it off the loop."""
     verdict, safe_path = attachment_verdict(path, session_key, label=label)
     if safe_path is None:
         return verdict, None
-    try:
-        fd = os.open(safe_path, _SNAPSHOT_OPEN_FLAGS)
-    except OSError:
-        fd = None
+    fd = _open_checked_path(safe_path)
     try:
         opened = None if fd is None else os.fstat(fd)
-        if opened is None or not (_still_names(safe_path, opened)
+        if opened is None or not (stat.S_ISREG(opened.st_mode)
                                   and _delivery_policy_allows(Path(safe_path), opened.st_mtime)):
             logger.warning("Skipping %s (changed after it was checked): %s", label, _log_safe_path(str(path)))
             return (ATTACHMENT_BLOCKED if _existing_regular_file(str(path)) else ATTACHMENT_MISSING), None
@@ -1459,7 +1476,8 @@ def _media_declarations(content: str) -> List[Tuple[int, int, str, bool]]:
     and ``_owed_text`` deletes the spans, so what the reply owes and what its chat shows are one parse.
     Outside a quoted path and a code span, the next ``MEDIA:`` or the end of its line ends a declaration;
     within that, the tag grammar of ``declared_media`` ends its path. A bare path that grammar ends before
-    more than closing punctuation is ambiguous, its declaration the rest of that stretch."""
+    more than closing punctuation, whatever its extension, is ambiguous, its declaration the rest of that
+    stretch."""
     scan = _mask_media_scan_text(content, declarations=True)
     codes = [m.span() for m in _INLINE_CODE_RE.finditer(scan) if m.group(0)[1:-1].lstrip()[:6].upper() == "MEDIA:"]
     found: List[Tuple[int, int, str, bool]] = []
@@ -1485,7 +1503,7 @@ def _media_declarations(content: str) -> List[Tuple[int, int, str, bool]]:
         if not path:
             continue  # no path, or a relative one: no declaration
         rest = scan[match.end("path"):limit]
-        if match.re is MEDIA_EXTENSIONLESS_TAG_RE and not quoted and rest.strip(_MEDIA_TAG_CLOSERS):
+        if not quoted and rest.strip(_MEDIA_TAG_CLOSERS):
             end = match.end("path") + len(rest.rstrip())
             found.append((start, end, _normalize_media_tag_path(content[match.start("path"):end]), True))
         else:
@@ -3670,12 +3688,14 @@ class BasePlatformAdapter(ABC):
         a code span, the next ``MEDIA:`` ends a declaration, as its line's end does. A quoted path ends at its
         closing quote; a whole tag in inline code (#35695) at the code span's closing backtick, spaces
         included; a bare path with a deliverable extension at that extension (``MEDIA_TAG_CLEANUP_RE``, spaces
-        allowed). Any other bare path ends where ``MEDIA_EXTENSIONLESS_TAG_RE`` ends it; when its line goes on
-        after it (before the next ``MEDIA:``) with more than closing punctuation, the tag could as well name a
-        longer path with spaces (#24032), so it is *ambiguous*: declared under the rest of its line, and
-        refused by its send (``_snapshot_owed_attachment``). A tag in fenced code, a quote or a JSON string
+        allowed). Any other bare path ends where ``MEDIA_EXTENSIONLESS_TAG_RE`` ends it. When the line of a
+        bare path goes on after it (before the next ``MEDIA:``) with more than closing punctuation, the tag
+        could as well name a longer path with spaces (#24032; ``MEDIA:/x/report.pdf secret.log``), so it is
+        *ambiguous*: declared under the rest of its line, and refused by its send
+        (``_snapshot_owed_attachment``). A tag in fenced code, a quote or a JSON string
         value is an example, a relative path names nothing: neither is a declaration. The reply's text is the
-        same parse's (``_owed_text``); ``extract_media`` still decides what other replies send and show."""
+        same parse's (``_owed_text``), as is every streamed and queued text (``strip_media_directives_for_display``,
+        gateway/run.py); ``extract_media`` still decides what other replies send, and what their final shows."""
         has_voice_tag = "[[audio_as_voice]]" in content
         declared: Dict[str, Tuple[bool, bool]] = {}
         for _start, _end, path, ambiguous in _media_declarations(content):
@@ -3699,12 +3719,13 @@ class BasePlatformAdapter(ABC):
 
     @staticmethod
     def strip_media_directives_for_display(text: str) -> str:
-        """Strip MEDIA: directives from streamed/display text. Known-extension tags are
-        removed unconditionally (as ``MEDIA_TAG_CLEANUP_RE``); extension-less tags only when
-        ``validate_media_delivery_path`` accepts the path, so undeliverable paths stay visible."""
-        if not _has_media_directives(text):
+        """Strip MEDIA: directives from streamed/display text: the text an owner message's reply shows
+        (``_owed_text``), from the one parse its attachments come from (``_media_declarations``), so the
+        streamed lane shows what the adapter's final, the queued first response and a later start show.
+        Every declaration's span goes, whether or not its file is there or the policy allows it."""
+        if not text or not _has_media_directives(text):
             return text
-        return re.sub(r'\n{3,}', '\n\n', _strip_media_tag_directives(text)).rstrip()
+        return re.sub(r'\n{3,}', '\n\n', BasePlatformAdapter._owed_text(text)).rstrip()
 
     @staticmethod
     def extract_local_files(content: str) -> Tuple[List[str], str]:

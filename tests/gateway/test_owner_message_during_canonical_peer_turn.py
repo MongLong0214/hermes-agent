@@ -3461,15 +3461,32 @@ def test_an_owed_attachment_uploads_the_bytes_its_check_approved_and_leaves_no_c
         ("text", "text", "delivered"), ("media:0", "media", "pending" if outcome == "cancelled" else "failed")]
 
 
-def _hold_open(monkeypatch, path, act):
-    """``os.open`` of *path* (the send opening the file its check approved, ``snapshot_attachment``) runs
-    *act* first, once, in the thread that opens it."""
+def _while_snapshotting(monkeypatch):
+    """A thread-local that is ``on`` while ``snapshot_attachment`` (a send's open of the file its check
+    approved) runs in that thread."""
+    from gateway.platforms import base
+
+    snapshot, local = base.snapshot_attachment, threading.local()
+
+    def snapshotting(*args, **kwargs):
+        local.on = True
+        try:
+            return snapshot(*args, **kwargs)
+        finally:
+            local.on = False
+    monkeypatch.setattr(base, "snapshot_attachment", snapshotting)
+    return local
+
+
+def _hold_open(monkeypatch, act):
+    """The send opening the file its check approved (``snapshot_attachment``) runs *act* first, once, in
+    the thread that opens it: at its first ``os.open``, of the file or of a directory on its path."""
     import os
 
-    real_open, done = os.open, []
+    real_open, done, sending = os.open, [], _while_snapshotting(monkeypatch)
 
     def opening(name, flags, *args, **kwargs):
-        if str(name) == path and not done:
+        if getattr(sending, "on", False) and not done:
             done.append(True)
             act()
         return real_open(name, flags, *args, **kwargs)
@@ -3480,9 +3497,9 @@ def test_an_owed_attachment_whose_directory_is_swapped_as_it_is_opened_is_never_
         ingress, send, monkeypatch, tmp_path):
     """The window between the check and the open. A PDF the strict policy allows lies in a directory that
     is swapped, as the checked path is opened, for a symlink to a directory outside the allowlist holding a
-    file of the same name. The open goes through the swapped directory, so the open file is checked again:
-    its path no longer resolves to itself. The attachment is recorded blocked, the record stays, and the
-    forbidden bytes never reach the transport."""
+    file of the same name. The open walks the checked path one directory at a time, never through a
+    symlink, so it stops at the swapped directory. The attachment is recorded blocked, the record stays,
+    and the forbidden bytes never reach the transport."""
     allowed, outside = tmp_path / "allowed", tmp_path / "outside"
     (allowed / "sub").mkdir(parents=True)
     outside.mkdir()
@@ -3495,7 +3512,7 @@ def test_an_owed_attachment_whose_directory_is_swapped_as_it_is_opened_is_never_
     def swap():
         (allowed / "sub").rename(tmp_path / "moved")
         (allowed / "sub").symlink_to(outside, target_is_directory=True)
-    _hold_open(monkeypatch, str(document.resolve()), swap)
+    _hold_open(monkeypatch, swap)
     _h, rid = _owner_turn_in_lane(ingress, send, monkeypatch, "normal", f"MEDIA:{document}")
     assert t.uploads == [] and (tmp_path / "moved" / "report.pdf").read_bytes() == b"%PDF-approved"
     assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "blocked")]
@@ -3517,7 +3534,7 @@ def test_a_file_renamed_over_the_checked_path_as_it_is_opened_is_judged_as_itsel
     os.utime(old, (time.time() - 3600, time.time() - 3600))
     _media_policy(monkeypatch, strict=True, trust_recent=True)
     t = _held_transport(monkeypatch, None)
-    _hold_open(monkeypatch, str(document.resolve()), lambda: os.replace(old, document))
+    _hold_open(monkeypatch, lambda: os.replace(old, document))
     h = _Harness(ingress, send, monkeypatch, "queue")
     _answering_with(monkeypatch, f"MEDIA:{document}")
 
@@ -3527,6 +3544,69 @@ def test_a_file_renamed_over_the_checked_path_as_it_is_opened_is_judged_as_itsel
         await h.settle()
     asyncio.run(exercise())
     assert t.uploads == [] and document.read_bytes() == b"FORBIDDEN OLD FILE"
+    [record_file] = _records(ingress)
+    assert _components(ingress, _recovery_id(record_file)) == [
+        ("text", "text", "delivered"), ("media:0", "media", "blocked")]
+
+
+def test_a_directory_swapped_back_for_each_check_of_the_opened_path_never_lets_its_file_through(
+        ingress, send, monkeypatch, tmp_path):
+    """The slice A4 review, P1: the directory of a PDF the strict policy allows is a symlink to a directory
+    outside the allowlist holding a file of the same name while the send opens anything, a directory again
+    while a path is resolved, and the symlink again after, so every check of the path alone passes. The
+    file opened is reached from the root one directory at a time, never through a symlink: it is refused.
+    The attachment is recorded blocked and the forbidden bytes never reach the transport."""
+    import os
+
+    from gateway.platforms import base
+
+    allowed, outside, moved = tmp_path / "allowed", tmp_path / "outside", tmp_path / "moved"
+    sub = allowed / "sub"
+    sub.mkdir(parents=True)
+    outside.mkdir()
+    document = sub / "report.pdf"
+    document.write_bytes(b"%PDF-approved")
+    (outside / "report.pdf").write_bytes(b"FORBIDDEN OUTSIDE ALLOWLIST")
+    _media_policy(monkeypatch, strict=True, allow=allowed)
+    t = _held_transport(monkeypatch, None)
+
+    def linked(on):
+        if on and not sub.is_symlink():
+            sub.rename(moved)
+            sub.symlink_to(outside, target_is_directory=True)
+        elif not on and sub.is_symlink():
+            sub.unlink()
+            moved.rename(sub)
+    real_open, real_resolve, opened = os.open, base._resolve_path, []
+    sending = _while_snapshotting(monkeypatch)
+
+    def opening(name, flags, *args, **kwargs):
+        if not getattr(sending, "on", False):
+            return real_open(name, flags, *args, **kwargs)
+        linked(True)
+        try:
+            return real_open(name, flags, *args, **kwargs)
+        finally:
+            opened.append(name)
+            linked(False)
+
+    def resolving(path, **kwargs):
+        resolved = real_resolve(path, **kwargs)
+        if getattr(sending, "on", False) and opened:
+            linked(True)
+        return resolved
+    monkeypatch.setattr(os, "open", opening)
+    monkeypatch.setattr(base, "_resolve_path", resolving)
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    _answering_with(monkeypatch, f"MEDIA:{document}")
+
+    async def exercise():
+        await h.warm()
+        await h.adapter.handle_message(h.owner_event())
+        await h.settle()
+    asyncio.run(exercise())
+    linked(False)
+    assert opened and t.uploads == [] and document.read_bytes() == b"%PDF-approved"
     [record_file] = _records(ingress)
     assert _components(ingress, _recovery_id(record_file)) == [
         ("text", "text", "delivered"), ("media:0", "media", "blocked")]
@@ -3552,7 +3632,7 @@ def test_a_send_cancelled_while_its_snapshot_is_made_leaves_no_copy(ingress, sen
     def held():
         opening.set()
         assert go.wait(30)
-    _hold_open(monkeypatch, str(document.resolve()), held)
+    _hold_open(monkeypatch, held)
     snapshot, discard = base.snapshot_attachment, base._AttachmentSnapshot.discard
 
     def observed(*args, **kwargs):
@@ -3586,24 +3666,27 @@ def test_a_send_cancelled_while_its_snapshot_is_made_leaves_no_copy(ingress, sen
 
 _GRAMMAR = [
     # (reply, declared paths, which of them are ambiguous); {d} is a directory holding report, report with,
-    # report with spaces.log, Caddyfile and run.log, or nothing: the answer is the same either way.
+    # report with spaces.log, report.pdf, Caddyfile and run.log, or nothing: the answer is the same either way.
     ("`MEDIA:{d}/report with spaces.log`", ["{d}/report with spaces.log"], [False]),
     ("`MEDIA:{d}/report with spaces.log` and {d}/chart.png", ["{d}/report with spaces.log"], [False]),
     ('MEDIA:"{d}/report with spaces.log"', ["{d}/report with spaces.log"], [False]),
     ("MEDIA:{d}/report with spaces.log", ["{d}/report with spaces.log"], [True]),
     ("MEDIA:{d}/Caddyfile, then the rest", ["{d}/Caddyfile, then the rest"], [True]),
     ("MEDIA:{d}/Caddyfile, MEDIA:{d}/run.log.\nThe rest", ["{d}/Caddyfile", "{d}/run.log"], [False, False]),
-    ("MEDIA:{d}/my report.pdf (2 MB)", ["{d}/my report.pdf"], [False]),
+    ("MEDIA:{d}/my report.pdf (2 MB)", ["{d}/my report.pdf (2 MB"], [True]),
     ("`MEDIA:report with spaces.log`", [], []),
     # The slice A3 review, P1: outside quotes and code, the next MEDIA: ends a declaration.
     ("MEDIA:{d}/first.log MEDIA:{d}/second.pdf", ["{d}/first.log", "{d}/second.pdf"], [False, False]),
     ("MEDIA:{d}/a.pdf MEDIA:{d}/run.log MEDIA:{d}/c.png", ["{d}/a.pdf", "{d}/run.log", "{d}/c.png"],
      [False, False, False]),
     ("MEDIA:{d}/my notes.log MEDIA:{d}/my report.pdf", ["{d}/my notes.log", "{d}/my report.pdf"], [True, False]),
-    ("Logs: MEDIA:{d}/run.log, chart MEDIA:{d}/chart.png done", ["{d}/run.log, chart", "{d}/chart.png"],
-     [True, False]),
+    ("Logs: MEDIA:{d}/run.log, chart MEDIA:{d}/chart.png done", ["{d}/run.log, chart", "{d}/chart.png done"],
+     [True, True]),
     ('MEDIA:"{d}/a MEDIA:b.log" MEDIA:{d}/c.pdf', ["{d}/a MEDIA:b.log", "{d}/c.pdf"], [False, False]),
     ("`MEDIA:{d}/a MEDIA:{d}/b.log` MEDIA:{d}/c.pdf", ["{d}/a MEDIA:{d}/b.log", "{d}/c.pdf"], [False, False]),
+    # The slice A4 review, P1: a deliverable extension does not end a bare path whose line goes on.
+    ("MEDIA:{d}/report.pdf secret.log", ["{d}/report.pdf secret.log"], [True]),
+    ("See MEDIA:{d}/report.pdf.\nThe rest", ["{d}/report.pdf"], [False]),
 ]
 
 
@@ -3613,20 +3696,27 @@ def test_a_declaration_is_parsed_by_the_tag_grammar_alone(tmp_path, on_disk, rep
     """The slice A2 review, P1: where a declared path ends is decided by the tag grammar, never by which
     files exist, their extensions or the policy. A quoted path ends at its closing quote and a whole tag in
     inline code at the code span's closing backtick, spaces included. A bare path with a deliverable
-    extension ends at that extension. Any other bare path ends where the tag does; when its line goes on
-    after that (before the next ``MEDIA:``) with more than closing punctuation, the tag could also name a
-    longer path with spaces, so it is ambiguous: declared under the rest of its line, and refused by its
-    send. A relative path is no declaration."""
+    extension ends at that extension, any other where the tag does; when its line goes on after that
+    (before the next ``MEDIA:``) with more than closing punctuation, the tag could also name a longer path
+    with spaces, so it is ambiguous: declared under the rest of its line, and refused by its send. A
+    relative path is no declaration. The slice A4 review, P2: the text every lane shows (the streamed
+    display, the queued first response) is the same parse's."""
     from gateway.platforms.base import BasePlatformAdapter
+    from gateway.run import _strip_response_attachments_for_direct_send
 
     d = tmp_path / "d"
     if on_disk == "every_prefix":
         d.mkdir()
-        for name in ("report", "report with", "report with spaces.log", "Caddyfile", "Caddyfile,", "run.log"):
+        for name in ("report", "report with", "report with spaces.log", "report.pdf", "Caddyfile", "Caddyfile,",
+                     "run.log"):
             (d / name).write_bytes(b"x")
-    declared = BasePlatformAdapter.declared_media(reply.format(d=d))
+    text = reply.format(d=d)
+    declared = BasePlatformAdapter.declared_media(text)
     assert [path for path, _voice, *_rest in declared] == [p.format(d=d) for p in paths]
     assert [bool(rest and rest[0]) for _path, _voice, *rest in declared] == ambiguous
+    shown = BasePlatformAdapter._owed_text(text)
+    assert BasePlatformAdapter.strip_media_directives_for_display(text) == shown
+    assert _strip_response_attachments_for_direct_send(text, BasePlatformAdapter) == shown
 
 
 @pytest.mark.parametrize("state", ["missing", "blocked"])
@@ -3640,7 +3730,8 @@ def test_a_spaced_inline_declaration_is_owed_whole_and_a_file_at_its_prefix_is_n
     (``blocked``). It is owed under its whole path all the same. Then an unrelated file ``…/report``
     appears, which the policy allows: it is never sent. A missing report stays missing and the record
     stays; once the report itself is there and allowed, a start uploads it alone and cleans up. The message
-    is never run again."""
+    is never run again. The slice A4 review, P2: in every lane the chat is shown the text of the same parse,
+    without the tag."""
     from gateway import delivery_ledger
 
     document, prefix = tmp_path / "report with spaces.log", tmp_path / "report"
@@ -3654,11 +3745,13 @@ def test_a_spaced_inline_declaration_is_owed_whole_and_a_file_at_its_prefix_is_n
     if lane == "recovery":
         rid = "spaced"
         _stored_turn(ingress, rid, f"{_TERMINAL}\n{tag}")
-        _next_process(ingress, send, monkeypatch, crashed=True)
+        h = _next_process(ingress, send, monkeypatch, crashed=True)
     else:
-        _h, rid = _owner_turn_in_lane(ingress, send, monkeypatch, lane, tag)
+        h, rid = _owner_turn_in_lane(ingress, send, monkeypatch, lane, tag)
     [_text, held] = delivery_ledger.obligation_components(_inbound_obligation(ingress, rid))
     assert (held["path"], held["state"], sent) == (str(document), state, [])
+    texts = _texts_sent(h)
+    assert any(_TERMINAL in text for text in texts) and not [text for text in texts if "MEDIA:" in text]
     prefix.write_bytes(b"UNRELATED PREFIX FILE")
     _media_policy(monkeypatch, strict=True, allow=tmp_path)
     nxt = _next_process(ingress, send, monkeypatch, crashed=True)
@@ -3696,15 +3789,19 @@ def test_a_spaced_inline_declaration_whose_file_is_there_uploads_that_file(
     assert _records(ingress) == []
 
 
-def test_a_bare_declaration_whose_line_goes_on_is_refused_as_ambiguous(ingress, send, monkeypatch, tmp_path):
+@pytest.mark.parametrize("name, at_prefix", [("report with spaces.log", "report"),
+                                             ("report.pdf secret.log", "report.pdf")])
+def test_a_bare_declaration_whose_line_goes_on_is_refused_as_ambiguous(
+        ingress, send, monkeypatch, tmp_path, name, at_prefix):
     """``MEDIA:…/report with spaces.log`` written bare: a bare path without a deliverable extension ends at
     whitespace, and its line goes on, so the tag names ``…/report`` or a longer path with spaces, and no
-    file decides which. Both files are there and allowed. The declaration is refused: recorded blocked under
-    the rest of its line, the chat is told, nothing is uploaded (neither file), and the record stays, at
-    this start and the next. The message is never run again."""
+    file decides which. The slice A4 review, P1: so does ``MEDIA:…/report.pdf secret.log``, though its
+    prefix has a deliverable extension. Both files are there and allowed. The declaration is refused:
+    recorded blocked under the rest of its line, the chat is told, nothing is uploaded (neither file), and
+    the record stays, at this start and the next. The message is never run again."""
     from gateway import delivery_ledger
 
-    document, prefix = tmp_path / "report with spaces.log", tmp_path / "report"
+    document, prefix = tmp_path / name, tmp_path / at_prefix
     document.write_bytes(b"the required report")
     prefix.write_bytes(b"UNRELATED PREFIX FILE")
     _media_policy(monkeypatch, strict=True, allow=tmp_path)
@@ -3712,7 +3809,7 @@ def test_a_bare_declaration_whose_line_goes_on_is_refused_as_ambiguous(ingress, 
     h, rid = _owner_turn_in_lane(ingress, send, monkeypatch, "normal", f"MEDIA:{document}")
     [_text, held] = delivery_ledger.obligation_components(_inbound_obligation(ingress, rid))
     assert (held["path"], held["state"], held.get("ambiguous")) == (str(document), "blocked", True)
-    assert [text for text in _texts_sent(h) if "report with spaces.log" in text and _TERMINAL not in text]
+    assert [text for text in _texts_sent(h) if name in text and _TERMINAL not in text]
     nxt = _next_process(ingress, send, monkeypatch, crashed=True)
     assert sent == [] and _answered(ingress, nxt)[0] == [] and _records(ingress) == [f"inbound-{rid}.json"]
     assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "blocked")]
