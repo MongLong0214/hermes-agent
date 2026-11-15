@@ -32,6 +32,11 @@ def _add_system_flag(parser: argparse.ArgumentParser) -> None:
     _flag(parser, "--system", help="Target the Linux system-level gateway service")
 
 
+def _cmd_gateway_deliveries(args) -> None:
+    from hermes_cli.gateway_deliveries import cmd_gateway_deliveries
+    cmd_gateway_deliveries(args)
+
+
 def build_gateway_parser(
     subparsers, *, cmd_gateway: Callable, cmd_proxy: Callable, cmd_gateway_enroll: Callable
 ) -> None:
@@ -118,6 +123,20 @@ def build_gateway_parser(
     gateway_subparsers.add_parser("list", help="List all profiles and their gateway status")
 
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
+
+    gateway_deliveries = gateway_subparsers.add_parser(
+        "deliveries", help="Show or resume owner-message replies parked after their bounded retries",
+        description="A part of a stored owner message's reply (its text or an attachment) that the bounded "
+            "retries of later gateway starts could not deliver is parked: no restart tries it again, and the "
+            "message stays stored. `list` (the default) shows them; `resume` gives them another bounded set "
+            "of tries, made by the next gateway start.")
+    deliveries_subparsers = gateway_deliveries.add_subparsers(dest="deliveries_command")
+    for name, help_text in (("list", "Show the parked replies"),
+                            ("resume", "Give the parked replies another bounded set of tries")):
+        deliveries_action = deliveries_subparsers.add_parser(name, help=help_text)
+        deliveries_action.add_argument("--inbound", default=None, metavar="ID",
+            help="Only the replies of the stored owner message with this id (as `list` shows it)")
+    gateway_deliveries.set_defaults(func=_cmd_gateway_deliveries)
 
     gateway_migrate_legacy = gateway_subparsers.add_parser(
         "migrate-legacy", help="Remove legacy hermes.service units from pre-rename installs",

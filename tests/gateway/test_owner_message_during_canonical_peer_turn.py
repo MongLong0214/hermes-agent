@@ -2988,26 +2988,41 @@ def test_a_reply_whose_components_cannot_be_stored_sends_nothing_until_they_are(
     assert _marker(nxt) is None
 
 
-def test_a_stored_answer_whose_attachment_is_gone_keeps_it_owed_as_missing(ingress, send, monkeypatch, tmp_path):
+@pytest.mark.parametrize("back", ["next_start", "after_the_bound"])
+def test_a_stored_answer_whose_attachment_is_gone_keeps_it_owed_as_missing(
+        ingress, send, monkeypatch, tmp_path, caplog, back):
     """s1c review P1-3: a completed answer, text and a PDF, was stored before any of its components
     were, then the PDF is deleted. The next start owes both: the text is delivered, the PDF stays one of
     the reply's components, recorded missing (never dropped, never counted delivered), and the record
-    stays. Once the file is back, the start after that sends the PDF alone and cleans up. The message is
-    never run again."""
+    stays. Once the file is back, the start after that sends the PDF alone and cleans up. The tries are
+    bounded like a text's reactivation: after MAX_REACTIVATIONS starts found it gone, it is parked, and a
+    restart sends nothing even with the file back; the PDF stays missing, the record stays, and an ERROR
+    says so. The message is never run again."""
+    import logging
+
+    from gateway import delivery_ledger
+
     document = tmp_path / "report.pdf"
     document.write_bytes(b"%PDF-test")
     _stored_turn(ingress, "missing", f"{_TERMINAL}\nMEDIA:{document}")
     document.unlink()
     sent = _attachment_sends(monkeypatch, set())
-    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
-    turns, _inputs, chats, left = _answered(ingress, nxt)
-    assert (turns, chats, left, sent) == ([], ["chat"], ["inbound-missing.json"], [])
-    assert _components(ingress, "missing") == [("text", "text", "delivered"), ("media:0", "media", "missing")]
+    for start in range(1 if back == "next_start" else delivery_ledger.MAX_REACTIVATIONS):
+        nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+        turns, _inputs, chats, left = _answered(ingress, nxt)
+        assert (turns, chats, left, sent) == ([], ["chat"] if start == 0 else [], ["inbound-missing.json"], [])
+        assert _components(ingress, "missing") == [("text", "text", "delivered"), ("media:0", "media", "missing")]
     document.write_bytes(b"%PDF-test")
-    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    with caplog.at_level(logging.ERROR):
+        nxt = _next_process(ingress, send, monkeypatch, crashed=True)
     turns, _inputs, chats, left = _answered(ingress, nxt)
-    assert (turns, chats, left) == ([], [], [])
-    assert [(kind, ok) for kind, _what, ok in sent] == [("document", True)]
+    if back == "next_start":
+        assert (turns, chats, left) == ([], [], [])
+        assert [(kind, ok) for kind, _what, ok in sent] == [("document", True)]
+    else:
+        assert (turns, chats, left, sent) == ([], [], ["inbound-missing.json"], [])
+        assert ("media:0", "media", "missing") in _components(ingress, "missing")
+        assert any("parked" in r.getMessage() for r in caplog.records)
 
 
 def test_a_stored_answer_that_is_only_an_attachment_is_delivered_and_never_run_again(
@@ -3027,15 +3042,15 @@ def test_a_stored_answer_that_is_only_an_attachment_is_delivered_and_never_run_a
     assert _components(ingress, "onlyfile") == [("media:0", "media", "delivered")]
 
 
-@pytest.mark.parametrize("cause", ["stale", "attempts", "send_forbidden"])
+@pytest.mark.parametrize("cause", ["stale", "attempts", "send_forbidden", "bound_spent"])
 def test_a_reply_whose_retry_budget_is_spent_is_reactivated_a_bounded_number_of_times(
         ingress, send, monkeypatch, cause):
     """s1c review P1-5: the stored answer's text row spent its retry budget undelivered (the 24-hour
     cutoff, or the attempts cap) while the record still owes it, and the transport works again. The next
     start reactivates it for one more send, reads it back delivered and cleans up. Reactivation is
-    selective: a row its chat refused for good (send-forbidden) is never revived, not even after
-    retention ran over its old row; it and the record stay, and neither of two starts sends anything or
-    runs the message again."""
+    bounded and selective: a row its chat refused for good (send-forbidden), or one already reactivated
+    MAX_REACTIVATIONS times (parked), is never revived by a restart, not even after retention ran over its
+    old row; it and the record stay, and neither of two starts sends anything or runs the message again."""
     import time
 
     from gateway import delivery_ledger as ledger
@@ -3055,6 +3070,9 @@ def test_a_reply_whose_retry_budget_is_spent_is_reactivated_a_bounded_number_of_
             ("failed" if revived else "abandoned", 0 if stale else ledger.MAX_ATTEMPTS, time.time() - age,
              time.time() - age, "Forbidden: bot was blocked by the user" if cause == "send_forbidden" else "Bad Gateway",
              oid))
+        if cause == "bound_spent":
+            conn.execute("UPDATE delivery_obligations SET reactivations=? WHERE obligation_id=?",
+                         (ledger.MAX_REACTIVATIONS, oid))
         conn.commit()
     for start in range(2):
         nxt = _next_process(ingress, send, monkeypatch, crashed=True)
@@ -3067,14 +3085,29 @@ def test_a_reply_whose_retry_budget_is_spent_is_reactivated_a_bounded_number_of_
     assert _components(ingress, "expired") == [("text", "text", "delivered" if revived else "pending")]
 
 
+def _deliveries(capsys, *argv):
+    """What ``hermes gateway deliveries <argv>`` prints, run through the real parser."""
+    import argparse
+
+    from hermes_cli.subcommands.gateway import build_gateway_parser
+    parser = argparse.ArgumentParser(prog="hermes")
+    build_gateway_parser(parser.add_subparsers(dest="command"), cmd_gateway=None, cmd_proxy=None,
+                         cmd_gateway_enroll=None)
+    args = parser.parse_args(["gateway", "deliveries", *argv])
+    capsys.readouterr()
+    args.func(args)
+    return capsys.readouterr().out
+
+
 @pytest.mark.parametrize("fault", ["attachment_gone", "transport_down"])
-def test_a_reply_still_owed_past_its_retry_bound_is_delivered_once_its_fault_clears(
-        ingress, send, monkeypatch, tmp_path, fault):
-    """s1d review P1 (retry bounds): a stored answer stays owed through more starts than its retry bound
-    allows, because its PDF is gone or because the transport refuses its text. Each of those starts tries
-    it at most once (a missing file is never uploaded, the text is sent at most once) and the record
-    stays. A spent bound is not the end: once the file is back, or the transport works again, the next
-    start delivers what is owed and cleans up, and the message is never run again."""
+def test_a_reply_parked_past_its_retry_bound_is_delivered_after_an_explicit_resume(
+        ingress, send, monkeypatch, tmp_path, capsys, fault):
+    """s1d review P1 (retry bounds): a stored answer stays owed through its whole retry bound, because its
+    PDF is gone or because the transport refuses its text; each of those starts tries it at most once, and
+    the record stays. Then the part is parked: with the file back, or the transport working again, a
+    restart alone still tries nothing. `hermes gateway deliveries list` shows it under its stored message;
+    `hermes gateway deliveries resume --inbound <id>` gives it another bounded cycle, and the next start
+    delivers what is owed and cleans up. The message is never run again."""
     import time
 
     from gateway import delivery_ledger as ledger
@@ -3116,13 +3149,20 @@ def test_a_reply_still_owed_past_its_retry_bound_is_delivered_once_its_fault_cle
         nxt = _next_process(ingress, send, monkeypatch, crashed=True)
         return nxt, len(answers) - before
 
-    for _start in range(ledger.MAX_REACTIVATIONS + 1):
+    for _start in range(ledger.MAX_REACTIVATIONS):
         nxt, sent = next_start()
         turns, _inputs, _chats, left = _answered(ingress, nxt)
         assert (turns, left, uploads) == ([], ["inbound-bounded.json"], [])
         assert sent <= 1
     document.write_bytes(b"%PDF-test")
     down.clear()
+    nxt, sent = next_start()
+    turns, _inputs, _chats, left = _answered(ingress, nxt)
+    assert (turns, left, uploads, sent) == ([], ["inbound-bounded.json"], [], 0)
+    assert [part["id"] for part in ledger.parked_parts()] == ["media:0" if gone else "text"]
+    assert any(line.startswith("bounded ") for line in _deliveries(capsys, "list").splitlines())
+    assert "Resumed 1 " in _deliveries(capsys, "resume", "--inbound", "bounded")
+    assert ledger.parked_parts() == []
     nxt, sent = next_start()
     turns, _inputs, _chats, left = _answered(ingress, nxt)
     assert (turns, left) == ([], [])

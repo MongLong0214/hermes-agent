@@ -228,7 +228,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
                               "delivered_message_ids TEXT")
     if "reactivations" not in columns:
         # How often a later start gave an owner message's reply another send after its retry budget was
-        # spent (reactivate_expired); past MAX_REACTIVATIONS such a reply is resumable.
+        # spent (reactivate_expired); bounded by MAX_REACTIVATIONS, reset by resume_parked.
         add_column_if_missing(conn, "delivery_obligations", "reactivations",
                               "reactivations INTEGER NOT NULL DEFAULT 0")
     # The components an owner message's reply requires (record_components): its text, whose delivery is
@@ -407,11 +407,11 @@ BLOCKED = "blocked"      # the media policy refuses a required attachment: never
 EXPIRED = "expired"      # the text's retry budget is spent (abandoned, attempts cap, stale) undelivered
 OPEN = "open"            # only a reply of a run a restart cut short: the transcript decides what is owed
 UNTRACKED = "untracked"  # a text row without components (written before components were): never complete
-# How many later starts give an expired reply's text one more send (reactivate_expired), and each
-# undelivered attachment of a reply one more try (claim_attachment_redelivery), before it is *resumable*:
-# its tries are spent but it is never abandoned while its record owes it. Each later start (the sign its
-# cause, a file gone, a policy refusal or a transport fault, may have cleared) still gives a resumable
-# reply one try, reported as a resumption, and no start gives it more than one.
+# How many later starts may each give an expired reply's text one more send (reactivate_expired), and each
+# undelivered attachment of a reply one more try (claim_attachment_redelivery). Past it the part is *parked*
+# (``parked_parts``): no restart tries it again, it still blocks completion, and its record stays, until an
+# operator resumes it (``resume_parked``, ``hermes gateway deliveries resume``), which gives it another
+# MAX_REACTIVATIONS starts.
 MAX_REACTIVATIONS = 3
 
 
@@ -456,24 +456,70 @@ class ReplyNotStored(RuntimeError):
 
 
 def claim_attachment_redelivery(obligation_id: str) -> "tuple[List[Dict[str, Any]], List[Dict[str, Any]]]":
-    """A later start's one try at each attachment the reply under *obligation_id* still owes (pending,
-    refused, ``missing`` or ``blocked``), counted here before the try. The send checks each one again
-    (platforms/base.py, redeliver_owed_attachments), so a file still gone or still refused is never
-    uploaded. Returns ``(claimed, resumed)``: every owed attachment, and those among them that
-    ``MAX_REACTIVATIONS`` earlier starts already tried (resumable: tried again, never abandoned). Raises
-    when the ledger cannot be written."""
+    """A later start's try at the attachments the reply under *obligation_id* still owes (pending, refused
+    or ``missing``): each gets at most ``MAX_REACTIVATIONS`` such tries, the same bound as an expired
+    text's reactivation, counted here before the try. Returns ``(claimed, parked)``: the components to try
+    now, and those whose tries are spent; a parked one keeps its state (it still blocks completion, and
+    the record stays) and is not tried again until it is resumed (``resume_parked``). Raises when the
+    ledger cannot be written."""
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT component_id, redeliveries FROM delivery_components
                WHERE obligation_id=? AND kind != 'text' AND state != ?""",
             (obligation_id, COMPONENT_DELIVERED)).fetchall()
-        conn.execute("""UPDATE delivery_components SET redeliveries=redeliveries+1
-                        WHERE obligation_id=? AND kind != 'text' AND state != ?""",
-                     (obligation_id, COMPONENT_DELIVERED))
+        claimed = {cid for cid, tries in rows if int(tries or 0) < MAX_REACTIVATIONS}
+        for cid in claimed:
+            conn.execute("""UPDATE delivery_components SET redeliveries=redeliveries+1
+                            WHERE obligation_id=? AND component_id=?""", (obligation_id, cid))
         owed = {cid for cid, _tries in rows}
-        resumed = {cid for cid, tries in rows if int(tries or 0) >= MAX_REACTIVATIONS}
         parts = _components_unlocked(conn, obligation_id)
-    return [p for p in parts if p["id"] in owed], [p for p in parts if p["id"] in resumed]
+    return ([p for p in parts if p["id"] in claimed], [p for p in parts if p["id"] in owed - claimed])
+
+
+def parked_parts(obligation_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """The parts of owner-message replies whose bounded retries are spent undelivered (of *obligation_ids*,
+    or all): a text row reactivated ``MAX_REACTIVATIONS`` times (never one whose chat refused it for good),
+    and an attachment tried by as many later starts. Each is ``{obligation_id, id, kind, state, tries}``
+    plus the attachment's path or URL. Raises when the ledger cannot be read."""
+    import json as _json
+    scope = "" if obligation_ids is None else "AND obligation_id IN (SELECT value FROM json_each(?))"
+    args = () if obligation_ids is None else (_json.dumps(list(obligation_ids)),)
+    with _DB_LOCK, _transaction() as conn:
+        texts = conn.execute(
+            f"""SELECT obligation_id, state, reactivations, last_error FROM delivery_obligations
+                WHERE state != 'delivered' AND acp_update_id IS NULL AND reactivations >= ? {scope}
+                ORDER BY obligation_id""", (MAX_REACTIVATIONS, *args)).fetchall()
+        files = conn.execute(
+            f"""SELECT obligation_id, component_id, kind, payload, state, redeliveries FROM delivery_components
+                WHERE kind != 'text' AND state != ? AND redeliveries >= ? {scope}
+                ORDER BY obligation_id, rowid""", (COMPONENT_DELIVERED, MAX_REACTIVATIONS, *args)).fetchall()
+    parked = [{"obligation_id": oid, "id": "text", "kind": "text", "state": state, "tries": tries}
+              for oid, state, tries, error in texts if not classify_dead_error(str(error or ""))]
+    for oid, cid, kind, payload, state, tries in files:
+        target = _json.loads(payload)
+        parked.append({"obligation_id": oid, "id": cid, "kind": kind, "state": state, "tries": tries,
+                       "path": target.get("path") or target.get("url")})
+    return parked
+
+
+def resume_parked(obligation_ids: Optional[List[str]] = None) -> int:
+    """An operator's resume of the parked parts (``parked_parts``) of *obligation_ids*, or of all: each
+    gets one more bounded cycle, ``MAX_REACTIVATIONS`` later starts, as when it was first owed. Nothing
+    is sent here; the next start (or a reconnect's re-admission) tries them. Returns how many parts were
+    resumed. Raises when the ledger cannot be written."""
+    import json as _json
+    scope = "" if obligation_ids is None else "AND obligation_id IN (SELECT value FROM json_each(?))"
+    args = () if obligation_ids is None else (_json.dumps(list(obligation_ids)),)
+    with _DB_LOCK, _transaction() as conn:
+        texts = conn.execute(
+            f"""UPDATE delivery_obligations SET reactivations=0
+                WHERE state != 'delivered' AND acp_update_id IS NULL AND reactivations >= ? {scope}""",
+            (MAX_REACTIVATIONS, *args)).rowcount
+        files = conn.execute(
+            f"""UPDATE delivery_components SET redeliveries=0
+                WHERE kind != 'text' AND state != ? AND redeliveries >= ? {scope}""",
+            (COMPONENT_DELIVERED, MAX_REACTIVATIONS, *args)).rowcount
+    return texts + files
 
 
 def obligation_components(obligation_id: str) -> List[Dict[str, Any]]:
@@ -567,15 +613,14 @@ def confirm_answer(obligation_id: str) -> None:
 
 
 def reactivate_expired(obligation_id: str, *, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
-    """Reactivation of an owner message's reply whose text spent its retry budget undelivered
+    """Bounded reactivation of an owner message's reply whose text spent its retry budget undelivered
     (``EXPIRED``): called by a later start, the signal that the fault may have cleared, while the message's
     record still owes the reply. The row is claimed for exactly one send by this process (``attempting``,
     attempts + 1, the duplicate marker, its owner stamped, so this process never claims it again) and its
-    ``reactivations`` count goes up; the caller sends it like a boot claim. A row reactivated
-    ``MAX_REACTIVATIONS`` times already is resumable: claimed the same way, reported as a resumption.
-    Never for a row that is not expired, belongs to a managed /acp answer, is held by a live process, or
-    whose target refused it for good (a dead chat: send-forbidden): those stay as they are, with the
-    record. Returns the claimed row, or None."""
+    ``reactivations`` count goes up; the caller sends it like a boot claim. Never for a row that is not
+    expired, belongs to a managed /acp answer, is held by a live process, whose target refused it for good
+    (a dead chat: send-forbidden), or that was reactivated ``MAX_REACTIVATIONS`` times already (parked
+    until ``resume_parked``): those stay as they are, with the record. Returns the claimed row, or None."""
     now = time.time() if now is None else now
     pid, started = _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
@@ -588,7 +633,7 @@ def reactivate_expired(obligation_id: str, *, now: Optional[float] = None) -> Op
             return None
         (session_key, platform, chat_id, thread_id, content, state, attempts, _created, owner_pid, owner_started,
          profile, last_error, reactivations) = row
-        if (classify_dead_error(str(last_error or ""))
+        if (int(reactivations or 0) >= MAX_REACTIVATIONS or classify_dead_error(str(last_error or ""))
                 or (state != "abandoned" and _owner_alive(owner_pid, owner_started))):
             return None
         cursor = conn.execute(
@@ -600,10 +645,8 @@ def reactivate_expired(obligation_id: str, *, now: Optional[float] = None) -> Op
             (now, pid, started, obligation_id, state, attempts))
         if not cursor.rowcount:
             return None
-    tries = int(reactivations or 0) + 1
-    logger.warning("delivery obligation %s to %s:%s spent its retry budget undelivered; %s for one more send "
-                   "(start %d, bound %d)", obligation_id, platform, chat_id,
-                   "resumed" if tries > MAX_REACTIVATIONS else "reactivated", tries, MAX_REACTIVATIONS)
+    logger.warning("delivery obligation %s to %s:%s spent its retry budget undelivered; reactivated for one more "
+                   "send (%d of %d)", obligation_id, platform, chat_id, int(reactivations or 0) + 1, MAX_REACTIVATIONS)
     return _claimed_row(obligation_id, session_key, platform, chat_id, thread_id, content, attempts,
                         profile or "default", needs_marker=True, last_error=last_error)
 
@@ -960,11 +1003,23 @@ _NOT_OWED = """NOT EXISTS (SELECT 1 FROM delivery_components c
                         WHERE c.obligation_id = delivery_obligations.obligation_id AND c.state != 'delivered')"""
 
 
-def _held_by_inbound_records() -> Optional[List[str]]:
-    """The replies a stored inbound record (gateway/shutdown_flush.py) can still be settled from at a start
+def inbound_record_replies(record: Dict[str, Any]) -> List[str]:
+    """The replies a stored inbound record (gateway/shutdown_flush.py) can be settled from at a start
     (gateway/run_startup.py, _owe_stored_answer): the answer and the notice of every run the record admitted,
-    to its destination. None when the records cannot be listed. A record whose event cannot be read is never
-    settled, so it holds nothing."""
+    to its destination. Raises when the record's event cannot be read."""
+    from gateway import shutdown_flush
+    source = shutdown_flush.inbound_event_from_record(record).source
+    replies: List[str] = []
+    for run in range(shutdown_flush.inbound_record_run(record) + 1):
+        reply = InboundObligation.to(record["session_key"], inbound_answer_ref(record["recovery_id"], run), source)
+        replies += [reply.reply_id(REPLY_ANSWER), reply.reply_id(REPLY_NOTICE)]
+    return replies
+
+
+def _held_by_inbound_records() -> Optional[List[str]]:
+    """The replies every stored inbound record can still be settled from (``inbound_record_replies``); None
+    when the records cannot be listed. A record whose event cannot be read is never settled, so it holds
+    nothing."""
     from gateway import shutdown_flush
     try:
         records = shutdown_flush.load_inbound_records()
@@ -974,12 +1029,9 @@ def _held_by_inbound_records() -> Optional[List[str]]:
     held: List[str] = []
     for record in records:
         try:
-            source = shutdown_flush.inbound_event_from_record(record).source
+            held += inbound_record_replies(record)
         except Exception:
             continue
-        for run in range(shutdown_flush.inbound_record_run(record) + 1):
-            reply = InboundObligation.to(record["session_key"], inbound_answer_ref(record["recovery_id"], run), source)
-            held += [reply.reply_id(REPLY_ANSWER), reply.reply_id(REPLY_NOTICE)]
     return held
 
 
