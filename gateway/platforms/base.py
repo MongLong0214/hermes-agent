@@ -671,14 +671,24 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
         cache_fn=cache_image_from_bytes, log_label="Media")
 
 
+# The private directory one send of an owner message's attachment copies its file into (snapshot_attachment).
+_SNAPSHOT_DIR_PREFIX = "hermes-attachment-"
+
+
 def _cleanup_cache_dir(cache_dir: Path, max_age_hours: int) -> int:
-    """Delete files in *cache_dir* older than *max_age_hours*; return the count removed."""
+    """Delete files in *cache_dir* older than *max_age_hours*, and attachment snapshot directories
+    (``snapshot_attachment``) as old: one its send could not remove, or one a process killed mid-send left.
+    No other directory is touched. Returns the count removed."""
     cutoff = time.time() - (max_age_hours * 3600)
     removed = 0
     for f in cache_dir.iterdir():
         if f.is_file() and f.stat().st_mtime < cutoff:
             with contextlib.suppress(OSError):
                 f.unlink()
+                removed += 1
+        elif f.name.startswith(_SNAPSHOT_DIR_PREFIX) and f.is_dir() and f.stat().st_mtime < cutoff:
+            with contextlib.suppress(OSError):  # rmtree refuses a symlink
+                shutil.rmtree(f)
                 removed += 1
     return removed
 
@@ -1209,12 +1219,17 @@ def attachment_verdict(path: str, session_key: str = "", *,
 class _AttachmentSnapshot:
     """The bytes one send of an owed attachment uploads: a copy, in a directory of its own, of the file
     ``snapshot_attachment`` validated and held open. ``discard`` removes the copy and its directory, never
-    the source."""
+    the source; a removal that fails is logged, and the document cache cleanup reclaims the directory once
+    it is stale (``_cleanup_cache_dir``)."""
     path: str
     directory: str
 
     def discard(self) -> None:
-        shutil.rmtree(self.directory, ignore_errors=True)
+        try:
+            shutil.rmtree(self.directory)
+        except OSError as exc:
+            logger.warning("Could not remove the attachment snapshot %s: %s; the document cache cleanup "
+                           "reclaims it once it is stale", self.directory, exc)
 
 
 # Read only, never through a symlink as the last component, never blocking on a FIFO swapped in.
@@ -1260,7 +1275,7 @@ def snapshot_attachment(path: str, session_key: str = "", *, label: str = "MEDIA
         # In the document cache, one of MEDIA_DELIVERY_SAFE_ROOTS, which the policy allows in every mode: an
         # adapter that checks the path it is handed again (photon's sidecar upload) accepts the snapshot.
         os.makedirs(DOCUMENT_CACHE_DIR, exist_ok=True)
-        directory = tempfile.mkdtemp(prefix="hermes-attachment-", dir=DOCUMENT_CACHE_DIR)
+        directory = tempfile.mkdtemp(prefix=_SNAPSHOT_DIR_PREFIX, dir=DOCUMENT_CACHE_DIR)
         snapshot = _AttachmentSnapshot(os.path.join(directory, os.path.basename(safe_path)), directory)
         try:
             with open(fd, "rb", closefd=False) as source, open(snapshot.path, "xb") as copy:
@@ -1274,10 +1289,34 @@ def snapshot_attachment(path: str, session_key: str = "", *, label: str = "MEDIA
             os.close(fd)
 
 
-def _discard_late_snapshot(work: "asyncio.Future") -> None:
-    """Done-callback for a snapshot whose send was cancelled while it was being made."""
-    if not work.cancelled() and work.exception() is None and work.result()[1] is not None:
-        work.result()[1].discard()
+class _SnapshotHandoff:
+    """The one snapshot ``_snapshot_owed_attachment`` has made off the loop, between the worker thread that
+    makes it and the send that waits for it. The worker hands it over; a send whose wait ends without it
+    (cancelled) abandons it. Whichever of the two comes second removes it, under one lock, so neither the
+    fate of the asyncio future nor the event loop's shutdown decides: a copy the worker writes after its
+    send was cancelled is removed by the worker, and one made before is removed by the send."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._abandoned = False
+        self._made: Optional[_AttachmentSnapshot] = None
+
+    def hand_over(self, made: Tuple[str, Optional[_AttachmentSnapshot]]) -> Tuple[str, Optional[_AttachmentSnapshot]]:
+        """In the worker, with what ``snapshot_attachment`` returned."""
+        with self._lock:
+            late = self._abandoned
+            if not late:
+                self._made = made[1]
+        if late and made[1] is not None:
+            made[1].discard()
+        return made
+
+    def abandon(self) -> None:
+        """In the send, once its wait for the worker ended without the snapshot."""
+        with self._lock:
+            self._abandoned, made, self._made = True, self._made, None
+        if made is not None:
+            made.discard()
 
 
 SUPPORTED_DOCUMENT_TYPES = {
@@ -1398,6 +1437,11 @@ MEDIA_EXTENSIONLESS_TAG_RE = re.compile(
     r'''(?=[`"'\s,;:)\]}''' + _MEDIA_CJK_TERMINATORS + r''']|MEDIA:|$)'''
     r'''[`"'*_]{0,3}\s*''',
     re.IGNORECASE)
+
+# declared_media: the anchors every MEDIA: path starts with, and what may follow a bare path on its line
+# (whitespace, closing quotes, emphasis and punctuation) without the tag naming more than that path.
+_MEDIA_PATH_ANCHOR_RE = re.compile(r'(?:~/|/|[A-Za-z]:[/\\])')
+_MEDIA_TAG_CLOSERS = " \t\r\f\v`\"'*_,.;:!?)]}" + _MEDIA_CJK_TERMINATORS
 
 
 def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tuple[str, int]]:
@@ -1686,7 +1730,9 @@ def _append_text(existing: Optional[str], new: Optional[str]) -> str:
 class _ExtractedResponse:
     """Deliverable parts of a handler response (see ``_extract_response_content``). ``ids``: the
     component id of each image, MEDIA file and local file (parallel lists), when they are not the
-    default by position (a later start sending only what a reply still owes)."""
+    default by position (a later start sending only what a reply still owes). ``ambiguous``: the
+    positions in ``media_files`` of the declarations ``declared_media`` found ambiguous; each is stored
+    with its component and refused by its send."""
     text_content: str
     images: list
     media_files: list
@@ -1694,6 +1740,7 @@ class _ExtractedResponse:
     force_document_attachments: bool
     pre_extract: str
     ids: Optional[Dict[str, list]] = None
+    ambiguous: frozenset = frozenset()
 
     def component_ids(self) -> Dict[str, list]:
         if self.ids is not None:
@@ -1711,8 +1758,9 @@ class _ExtractedResponse:
         parts += [{"id": cid, "kind": "image", "url": url, "alt": alt}
                   for (url, alt), cid in zip(self.images, ids["images"])]
         parts += [{"id": cid, "kind": "media", "path": path, "voice": bool(voice),
-                   "as_document": self.force_document_attachments}
-                  for (path, voice), cid in zip(self.media_files, ids["media"])]
+                   "as_document": self.force_document_attachments,
+                   **({"ambiguous": True} if index in self.ambiguous else {})}
+                  for index, ((path, voice), cid) in enumerate(zip(self.media_files, ids["media"]))]
         parts += [{"id": cid, "kind": "file", "path": path, "as_document": self.force_document_attachments}
                   for path, cid in zip(self.local_files, ids["files"])]
         return parts
@@ -1728,7 +1776,8 @@ class _ExtractedResponse:
                    local_files=[p["path"] for p in files],
                    force_document_attachments=any(p.get("as_document") for p in media + files), pre_extract="",
                    ids={"images": [p["id"] for p in images], "media": [p["id"] for p in media],
-                        "files": [p["id"] for p in files]})
+                        "files": [p["id"] for p in files]},
+                   ambiguous=frozenset(index for index, p in enumerate(media) if p.get("ambiguous")))
 
 
 def _same_component(held: Dict[str, Any], part: Dict[str, Any]) -> bool:
@@ -3436,17 +3485,32 @@ class BasePlatformAdapter(ABC):
     @staticmethod
     def _reply_media(media_files, session_key: str = "", *, owed: bool) -> List[Tuple[str, bool]]:
         """The MEDIA: attachments of a reply, each checked by ``attachment_verdict``: a sendable one under the
-        host path it resolved to. An owner message's reply (*owed*) passes every file it declares
-        (``declared_media``, parsed before any extension, existence or policy filtering) and keeps each one,
-        an unsendable one under its declared path: the reply requires it, and its send records it missing or
-        blocked (``_deliver_owed_attachments``). Any other reply passes ``extract_media``'s and drops an
-        unsendable one."""
+        host path it resolved to. An owner message's reply (*owed*, ``_owed_media``) keeps each file it
+        declares, an unsendable one under its declared path: the reply requires it, and its send records it
+        missing or blocked (``_deliver_owed_attachments``). Any other reply passes ``extract_media``'s and
+        drops an unsendable one."""
         kept = []
         for media_path, is_voice in media_files or []:
             _verdict, safe_path = attachment_verdict(media_path, session_key)
             if safe_path or owed:
                 kept.append((safe_path or str(media_path), bool(is_voice)))
         return kept
+
+    @classmethod
+    def _owed_media(cls, content: str, session_key: str = "") -> Tuple[List[Tuple[str, bool]], frozenset]:
+        """The MEDIA: attachments an owner message's reply *content* requires: every declaration
+        (``declared_media``, parsed before any extension, existence or policy filtering), each checked by
+        ``_reply_media``, and the positions among them of the ambiguous ones, kept under their declared text
+        and never checked: their send refuses them (``_ExtractedResponse.ambiguous``)."""
+        media: List[Tuple[str, bool]] = []
+        ambiguous = set()
+        for path, voice, unbounded in cls.declared_media(content):
+            if unbounded:
+                ambiguous.add(len(media))
+                media.append((path, voice))
+            else:
+                media += cls._reply_media([(path, voice)], session_key, owed=True)
+        return media, frozenset(ambiguous)
 
     @staticmethod
     def _reply_local_files(file_paths, session_key: str = "") -> List[str]:
@@ -3547,31 +3611,51 @@ class BasePlatformAdapter(ABC):
         return media, cleaned
 
     @staticmethod
-    def declared_media(content: str) -> List[Tuple[str, bool]]:
-        """Every ``MEDIA:`` file *content* declares, ``[(path, is_voice), ...]`` in order, whatever its
-        extension and whether or not its file exists or the media policy allows it: what an owner message's
-        reply requires (``_reply_media``). Parsing only: ``extract_media`` decides what is sent unconditionally
-        and what stays in the text, and the allowed extensions are its own. A tag in fenced code, a quote or a
-        JSON string value is an example, not a declaration; a whole tag in inline code is one (#35695). An
-        unknown-extension tag names the path ``extract_media`` would take when one validates (spaces,
-        #24032), else the whitespace-bounded path it names."""
+    def declared_media(content: str) -> List[Tuple[str, bool, bool]]:
+        """Every ``MEDIA:`` file *content* declares, ``[(path, is_voice, ambiguous), ...]`` in order: what an
+        owner message's reply requires (``_owed_media``). Where a path ends is decided by the tag grammar
+        alone, never by whether a file exists, its extension is deliverable or the media policy allows it, so
+        no other path ever stands in for the declared one. A quoted path ends at its closing quote; a whole tag
+        in inline code (#35695) at the code span's closing backtick, spaces included; a bare path with a
+        deliverable extension at that extension (``MEDIA_TAG_CLEANUP_RE``, spaces allowed). Any other bare
+        path ends where ``MEDIA_EXTENSIONLESS_TAG_RE`` ends it; when its line goes on after it (before the next
+        ``MEDIA:``) with more than closing punctuation, the tag could as well name a longer path with spaces
+        (#24032), so it is *ambiguous*: declared under the rest of its line, and refused by its send
+        (``_snapshot_owed_attachment``). A tag in fenced code, a quote or a JSON string value is an example, a
+        relative path names nothing: neither is a declaration. ``extract_media`` still decides what other
+        replies send and what text stays, and the allowed extensions are its own."""
         has_voice_tag = "[[audio_as_voice]]" in content
         scan = _mask_media_scan_text(content, declarations=True)
-        named: Dict[int, str] = {}
+        named: Dict[int, Tuple[str, bool]] = {}
+        whole_tags = []
+        for code in _INLINE_CODE_RE.finditer(scan):
+            inner = code.group(0)[1:-1].lstrip()
+            if inner[:6].upper() == "MEDIA:":
+                whole_tags.append(code.span())
+                path = _normalize_media_tag_path(inner[6:])
+                if _MEDIA_PATH_ANCHOR_RE.match(path):
+                    named[code.start()] = (path, False)
+        scan = _blank_spans(scan, whole_tags)  # bounded by their code spans, never by the patterns below
         for match in MEDIA_TAG_CLEANUP_RE.finditer(scan):
             if path := _normalize_media_tag_path(match.group("path")):
-                named[match.start()] = path
+                named[match.start()] = (path, False)
         for match in MEDIA_EXTENSIONLESS_TAG_RE.finditer(scan):
             path = _normalize_media_tag_path(match.group("path"))
             if path and match.start() not in named:
-                found = _match_extensionless_path(scan, match) if _path_lacks_deliverable_extension(path) else None
-                named[match.start()] = found[0] if found else path
-        declared: Dict[str, bool] = {}
-        for _start, path in sorted(named.items()):
+                line = scan[match.end("path"):].split("\n", 1)[0]
+                rest = re.split(r"MEDIA:", line, maxsplit=1, flags=re.IGNORECASE)[0]
+                if rest.strip(_MEDIA_TAG_CLOSERS):
+                    end = match.end("path") + len(rest)
+                    named[match.start()] = (_normalize_media_tag_path(content[match.start("path"):end]), True)
+                else:
+                    named[match.start()] = (path, False)
+        declared: Dict[str, Tuple[bool, bool]] = {}
+        for _start, (path, ambiguous) in sorted(named.items()):
             with contextlib.suppress(OSError, RuntimeError, ValueError):  # a crafted ~\x00 path names nothing
                 path = os.path.expanduser(path)
-                declared.setdefault(path, has_voice_tag and os.path.splitext(path)[1].lower() in _AUDIO_EXTS)
-        return list(declared.items())
+                voice = has_voice_tag and os.path.splitext(path)[1].lower() in _AUDIO_EXTS
+                declared.setdefault(path, (voice, ambiguous))
+        return [(path, voice, ambiguous) for path, (voice, ambiguous) in declared.items()]
 
     @staticmethod
     def strip_media_directives_for_display(text: str) -> str:
@@ -4594,18 +4678,24 @@ class BasePlatformAdapter(ABC):
     async def _snapshot_owed_attachment(self, source: Any, part: Dict[str, Any], session_key: str
                                         ) -> Tuple[str, Optional[_AttachmentSnapshot]]:
         """``snapshot_attachment`` of one stored attachment *part*, off the loop, inside the routed profile's
-        media scope. A send cancelled while its snapshot is made leaves none behind."""
+        media scope. A declaration ``declared_media`` found ambiguous is refused (``blocked``) without a look
+        at any file. A send cancelled while its snapshot is made is cancelled, never sent, and leaves no
+        snapshot behind, however late its worker writes it (``_SnapshotHandoff``)."""
+        if part.get("ambiguous"):
+            logger.warning("[%s] Refusing an ambiguous MEDIA: tag (its line goes on after the path): %s",
+                           self.name, _log_safe_path(str(part["path"])))
+            return ATTACHMENT_BLOCKED, None
         scope = self._media_delivery_scope(source)
         label = "MEDIA directive path" if part["kind"] == "media" else "local file path"
+        handoff = _SnapshotHandoff()
 
         def prepare() -> Tuple[str, Optional[_AttachmentSnapshot]]:
             with scope:
-                return snapshot_attachment(part["path"], session_key, label=label)
-        work = asyncio.ensure_future(asyncio.to_thread(prepare))
+                return handoff.hand_over(snapshot_attachment(part["path"], session_key, label=label))
         try:
-            return await asyncio.shield(work)
-        except asyncio.CancelledError:
-            work.add_done_callback(_discard_late_snapshot)
+            return await asyncio.to_thread(prepare)
+        except BaseException:
+            handoff.abandon()
             raise
 
     async def owe_explicit_reply(self, source: Any, session_key: str, answer_ref: Optional[str], text: str,
@@ -4615,13 +4705,15 @@ class BasePlatformAdapter(ABC):
         (``_record_reply_components``). *text* is the reply's text as it reaches the chat; without
         ``attachments`` the reply requires its text only. ``_OwedReply.finish`` sends the rest."""
         media: list = []
+        ambiguous: frozenset = frozenset()
         if attachments and response:
             with self._media_delivery_scope(source):
-                media = self._reply_media(self.declared_media(response), session_key, owed=True)
+                media, ambiguous = self._owed_media(response, session_key)
         from gateway.delivery_ledger import ReplyNotStored
         extracted = _ExtractedResponse(
             text_content=(text or "").strip(), images=[], media_files=media, local_files=[],
-            force_document_attachments="[[as_document]]" in (response or ""), pre_extract=response or "")
+            force_document_attachments="[[as_document]]" in (response or ""), pre_extract=response or "",
+            ambiguous=ambiguous)
         try:
             obligation_id, held = await self._record_reply_components(source, session_key, answer_ref, extracted)
         except ReplyNotStored:
@@ -4653,7 +4745,8 @@ class BasePlatformAdapter(ABC):
             path = str(parts[cid]["path"])
             logger.error("[%s] An attachment of an owner message's reply (obligation %s) is not sent: %s %s; the "
                          "reply is not delivered and its record stays", self.name, obligation_id,
-                         "gone from" if verdict == ATTACHMENT_MISSING else "refused by the media delivery policy:",
+                         "gone from" if verdict == ATTACHMENT_MISSING
+                         else "refused by the media delivery policy (or as an ambiguous MEDIA: tag):",
                          _log_safe_path(path))
             if cid in changed or cid not in tracked:
                 await self._notify_media_delivery_failure(
@@ -5074,7 +5167,7 @@ class BasePlatformAdapter(ABC):
         The caller holds the routed profile's media scope."""
         force_document = "[[as_document]]" in response
         _tagged, rest = cls.extract_media(response)
-        media_files = cls._reply_media(cls.declared_media(response), session_key, owed=True)
+        media_files, ambiguous = cls._owed_media(response, session_key)
         images, text_content = cls.extract_images(rest)
         text_content = _strip_media_directives(text_content).strip()
         local_files, text_content = cls.extract_local_files(text_content)
@@ -5083,7 +5176,7 @@ class BasePlatformAdapter(ABC):
             text_content = _strip_media_directives(response).strip()
         return _ExtractedResponse(
             text_content=text_content, images=images, media_files=media_files, local_files=local_files,
-            force_document_attachments=force_document, pre_extract=response)
+            force_document_attachments=force_document, pre_extract=response, ambiguous=ambiguous)
 
     async def _extract_response_content(self, response: str, event: MessageEvent, session_key: str,
                                         *, is_ephemeral_response: bool, owed: bool = False) -> "_ExtractedResponse":
@@ -5099,8 +5192,8 @@ class BasePlatformAdapter(ABC):
         # bare-path validator infer the sandbox from the ACTIVE profile (#109024).
         with self._media_delivery_scope(event.source):
             media_files, response = self.extract_media(response)
-            media_files = self._reply_media(
-                self.declared_media(pre_extract) if owed else media_files, session_key, owed=owed)
+            media_files, ambiguous = (self._owed_media(pre_extract, session_key) if owed
+                                      else (self._reply_media(media_files, session_key, owed=False), frozenset()))
             images, text_content = self.extract_images(response)
             # Strip any remaining internal directives from message body (fixes #1561). _strip_media_directives
             # shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag with an unknown extension is intentionally left in
@@ -5135,7 +5228,8 @@ class BasePlatformAdapter(ABC):
                 text_content = _recovered
         return _ExtractedResponse(
             text_content=text_content, images=images, media_files=media_files,
-            local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)
+            local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract,
+            ambiguous=ambiguous)
 
     async def _fire_post_delivery_callback(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """Run the one-shot post-delivery callback (bounded, errors swallowed). The generation is

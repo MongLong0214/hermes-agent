@@ -3504,7 +3504,8 @@ def test_an_owed_attachment_whose_directory_is_swapped_as_it_is_opened_is_never_
 def test_a_send_cancelled_while_its_snapshot_is_made_leaves_no_copy(ingress, send, monkeypatch, tmp_path):
     """The snapshot is made off the loop. The owner turn is cancelled while its attachment's snapshot is
     being made: the snapshot finishes in its thread after the send is gone, and it is discarded then. No
-    copy is left, the source stays, and so do the record and the attachment's obligation."""
+    copy is left, nothing reaches the transport, the source stays, and so do the record and the
+    attachment's obligation. The cancellation and the late snapshot are ordered by events, not sleeps."""
     import os
 
     from gateway.platforms import base
@@ -3515,12 +3516,246 @@ def test_a_send_cancelled_while_its_snapshot_is_made_leaves_no_copy(ingress, sen
     document.write_bytes(b"%PDF-approved")
     _media_policy(monkeypatch, strict=True, allow=allowed)
     t = _held_transport(monkeypatch, None)
-    opening, go, made = threading.Event(), threading.Event(), []
+    opening, go, discarded, made = threading.Event(), threading.Event(), threading.Event(), []
 
     def held():
         opening.set()
         assert go.wait(30)
     _hold_open(monkeypatch, str(document.resolve()), held)
+    snapshot, discard = base.snapshot_attachment, base._AttachmentSnapshot.discard
+
+    def observed(*args, **kwargs):
+        verdict, copy = snapshot(*args, **kwargs)
+        made.append(copy)
+        return verdict, copy
+
+    def discarding(self):
+        discard(self)
+        discarded.set()
+    monkeypatch.setattr(base, "snapshot_attachment", observed)
+    monkeypatch.setattr(base._AttachmentSnapshot, "discard", discarding)
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    _answering_with(monkeypatch, f"MEDIA:{document}")
+
+    async def exercise():
+        await h.warm()
+        await h.adapter.handle_message(h.owner_event())
+        assert await asyncio.to_thread(opening.wait, 30), "the snapshot never started"
+        h.adapter._session_tasks[h.key].cancel()
+        go.set()
+        await h.settle()
+        assert await asyncio.to_thread(discarded.wait, 30), "the late snapshot was never discarded"
+    asyncio.run(exercise())
+    assert made and not os.path.exists(made[0].directory)
+    assert t.handed == [] and document.read_bytes() == b"%PDF-approved"
+    [record_file] = _records(ingress)
+    assert _components(ingress, _recovery_id(record_file)) == [
+        ("text", "text", "delivered"), ("media:0", "media", "pending")]
+
+
+_GRAMMAR = [
+    # (reply, declared paths, which of them are ambiguous); {d} is a directory holding report, report with,
+    # report with spaces.log, Caddyfile and run.log, or nothing: the answer is the same either way.
+    ("`MEDIA:{d}/report with spaces.log`", ["{d}/report with spaces.log"], [False]),
+    ("`MEDIA:{d}/report with spaces.log` and {d}/chart.png", ["{d}/report with spaces.log"], [False]),
+    ('MEDIA:"{d}/report with spaces.log"', ["{d}/report with spaces.log"], [False]),
+    ("MEDIA:{d}/report with spaces.log", ["{d}/report with spaces.log"], [True]),
+    ("MEDIA:{d}/Caddyfile, then the rest", ["{d}/Caddyfile, then the rest"], [True]),
+    ("MEDIA:{d}/Caddyfile, MEDIA:{d}/run.log.\nThe rest", ["{d}/Caddyfile", "{d}/run.log"], [False, False]),
+    ("MEDIA:{d}/my report.pdf (2 MB)", ["{d}/my report.pdf"], [False]),
+    ("`MEDIA:report with spaces.log`", [], []),
+]
+
+
+@pytest.mark.parametrize("on_disk", ["nothing", "every_prefix"])
+@pytest.mark.parametrize("reply, paths, ambiguous", _GRAMMAR)
+def test_a_declaration_is_parsed_by_the_tag_grammar_alone(tmp_path, on_disk, reply, paths, ambiguous):
+    """The slice A2 review, P1: where a declared path ends is decided by the tag grammar, never by which
+    files exist, their extensions or the policy. A quoted path ends at its closing quote and a whole tag in
+    inline code at the code span's closing backtick, spaces included. A bare path with a deliverable
+    extension ends at that extension. Any other bare path ends where the tag does; when its line goes on
+    after that (before the next ``MEDIA:``) with more than closing punctuation, the tag could also name a
+    longer path with spaces, so it is ambiguous: declared under the rest of its line, and refused by its
+    send. A relative path is no declaration."""
+    from gateway.platforms.base import BasePlatformAdapter
+
+    d = tmp_path / "d"
+    if on_disk == "every_prefix":
+        d.mkdir()
+        for name in ("report", "report with", "report with spaces.log", "Caddyfile", "Caddyfile,", "run.log"):
+            (d / name).write_bytes(b"x")
+    declared = BasePlatformAdapter.declared_media(reply.format(d=d))
+    assert [path for path, _voice, *_rest in declared] == [p.format(d=d) for p in paths]
+    assert [bool(rest and rest[0]) for _path, _voice, *rest in declared] == ambiguous
+
+
+@pytest.mark.parametrize("state", ["missing", "blocked"])
+@pytest.mark.parametrize("lane", ["normal", "queued", "recovery"])
+def test_a_spaced_inline_declaration_is_owed_whole_and_a_file_at_its_prefix_is_never_sent(
+        ingress, send, monkeypatch, tmp_path, lane, state):
+    """The slice A2 review, P1, as the fixed counterexample: an answer declares ``MEDIA:…/report with
+    spaces.log`` as inline code (an extension ``extract_media`` takes only once it validates), stored by the
+    adapter's final, the queued first response or a later start. When the reply is stored the report is not
+    there (``missing``; nor is a file at its prefix ``…/report``) or the strict policy refuses it
+    (``blocked``). It is owed under its whole path all the same. Then an unrelated file ``…/report``
+    appears, which the policy allows: it is never sent. A missing report stays missing and the record
+    stays; once the report itself is there and allowed, a start uploads it alone and cleans up. The message
+    is never run again."""
+    from gateway import delivery_ledger
+
+    document, prefix = tmp_path / "report with spaces.log", tmp_path / "report"
+    if state == "blocked":
+        document.write_bytes(b"the required report")
+        _media_policy(monkeypatch, strict=True)
+    else:
+        _media_policy(monkeypatch, strict=True, allow=tmp_path)
+    sent = _attachment_sends(monkeypatch, set())
+    tag = f"`MEDIA:{document}`"
+    if lane == "recovery":
+        rid = "spaced"
+        _stored_turn(ingress, rid, f"{_TERMINAL}\n{tag}")
+        _next_process(ingress, send, monkeypatch, crashed=True)
+    else:
+        _h, rid = _owner_turn_in_lane(ingress, send, monkeypatch, lane, tag)
+    [_text, held] = delivery_ledger.obligation_components(_inbound_obligation(ingress, rid))
+    assert (held["path"], held["state"], sent) == (str(document), state, [])
+    prefix.write_bytes(b"UNRELATED PREFIX FILE")
+    _media_policy(monkeypatch, strict=True, allow=tmp_path)
+    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    if state == "missing":
+        assert sent == [] and _records(ingress) == [f"inbound-{rid}.json"]
+        assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "missing")]
+        document.write_bytes(b"the required report")
+        nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    assert sent == [("document", ("report with spaces.log", b"the required report"), True)]
+    turns, _inputs, chats, left = _answered(ingress, nxt)
+    assert (turns, chats, left, _texts_sent(nxt)) == ([], [], [], [])
+
+
+@pytest.mark.parametrize("prefix", ["absent", "present"])
+def test_a_spaced_inline_declaration_whose_file_is_there_uploads_that_file(
+        ingress, send, monkeypatch, tmp_path, prefix):
+    """The normal case: the report ``MEDIA:…/report with spaces.log`` declares as inline code is there and
+    allowed, and so (``present``) is an unrelated file at its prefix ``…/report``. The adapter's final
+    uploads the report, never the prefix file, and the message's record goes."""
+    document = tmp_path / "report with spaces.log"
+    document.write_bytes(b"the required report")
+    if prefix == "present":
+        (tmp_path / "report").write_bytes(b"UNRELATED PREFIX FILE")
+    _media_policy(monkeypatch, strict=True, allow=tmp_path)
+    sent = _attachment_sends(monkeypatch, set())
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    _answering_with(monkeypatch, f"`MEDIA:{document}`")
+
+    async def exercise():
+        await h.warm()
+        await h.adapter.handle_message(h.owner_event())
+        await h.settle()
+    asyncio.run(exercise())
+    assert sent == [("document", ("report with spaces.log", b"the required report"), True)]
+    assert _records(ingress) == []
+
+
+def test_a_bare_declaration_whose_line_goes_on_is_refused_as_ambiguous(ingress, send, monkeypatch, tmp_path):
+    """``MEDIA:…/report with spaces.log`` written bare: a bare path without a deliverable extension ends at
+    whitespace, and its line goes on, so the tag names ``…/report`` or a longer path with spaces, and no
+    file decides which. Both files are there and allowed. The declaration is refused: recorded blocked under
+    the rest of its line, the chat is told, nothing is uploaded (neither file), and the record stays, at
+    this start and the next. The message is never run again."""
+    from gateway import delivery_ledger
+
+    document, prefix = tmp_path / "report with spaces.log", tmp_path / "report"
+    document.write_bytes(b"the required report")
+    prefix.write_bytes(b"UNRELATED PREFIX FILE")
+    _media_policy(monkeypatch, strict=True, allow=tmp_path)
+    sent = _attachment_sends(monkeypatch, set())
+    h, rid = _owner_turn_in_lane(ingress, send, monkeypatch, "normal", f"MEDIA:{document}")
+    [_text, held] = delivery_ledger.obligation_components(_inbound_obligation(ingress, rid))
+    assert (held["path"], held["state"], held.get("ambiguous")) == (str(document), "blocked", True)
+    assert [text for text in _texts_sent(h) if "report with spaces.log" in text and _TERMINAL not in text]
+    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    assert sent == [] and _answered(ingress, nxt)[0] == [] and _records(ingress) == [f"inbound-{rid}.json"]
+    assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "blocked")]
+
+
+def _snapshot_cache(monkeypatch, tmp_path):
+    """A PDF the strict policy allows, the document cache (where snapshots are made) under *tmp_path*, and
+    another run's snapshot already in it. Returns (the PDF, the cache, the other run's snapshot file)."""
+    from gateway.platforms import base
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    document = allowed / "report.pdf"
+    document.write_bytes(b"%PDF-approved")
+    cache = tmp_path / "documents"
+    monkeypatch.setattr(base, "DOCUMENT_CACHE_DIR", cache)
+    other = cache / "hermes-attachment-another-run" / "report.pdf"
+    other.parent.mkdir(parents=True)
+    other.write_bytes(b"another run's snapshot")
+    _media_policy(monkeypatch, strict=True, allow=allowed)
+    return document, cache, other
+
+
+def test_a_snapshot_whose_send_is_cancelled_while_it_is_made_is_removed_by_its_late_worker(monkeypatch, tmp_path):
+    """The slice A2 review, P2: the send of an owed attachment is cancelled while its snapshot is being
+    copied off the loop. The cancellation reaches the send (it is not turned into a send). The worker goes
+    on and writes the copy late: only once the event loop has cancelled what was left and is joining the
+    executor's threads, as ``asyncio.run`` does at shutdown. That copy is removed all the same. The source
+    and another run's snapshot stay. No sleep: the copy is held on an event the loop's executor shutdown
+    sets."""
+    import concurrent.futures
+    import os
+
+    from gateway.platforms import base
+
+    document, cache, other = _snapshot_cache(monkeypatch, tmp_path)
+    copying, release, written = threading.Event(), threading.Event(), []
+    copyfileobj = base.shutil.copyfileobj
+
+    def held(source, target, *args, **kwargs):
+        copying.set()
+        assert release.wait(30)
+        copyfileobj(source, target, *args, **kwargs)
+        written.append(target.name)
+
+    class ShutdownReleases(concurrent.futures.ThreadPoolExecutor):
+        def shutdown(self, *args, **kwargs):
+            release.set()
+            return super().shutdown(*args, **kwargs)
+    monkeypatch.setattr(base.shutil, "copyfileobj", held)
+    adapter = RestartTestAdapter()
+    outcome = []
+
+    async def run():
+        asyncio.get_running_loop().set_default_executor(ShutdownReleases(max_workers=4))
+        send = asyncio.ensure_future(adapter._snapshot_owed_attachment(
+            None, {"kind": "media", "path": str(document)}, ""))
+        await asyncio.to_thread(copying.wait, 30)
+        send.cancel()
+        try:
+            outcome.append(await send)
+        except asyncio.CancelledError:
+            outcome.append("cancelled")
+    asyncio.run(run())
+    [late] = written
+    assert outcome == ["cancelled"] and release.is_set()
+    assert not os.path.exists(late) and not os.path.exists(os.path.dirname(late))
+    assert sorted(p.name for p in cache.iterdir()) == ["hermes-attachment-another-run"]
+    assert document.read_bytes() == b"%PDF-approved" and other.read_bytes() == b"another run's snapshot"
+
+
+def test_a_snapshot_made_for_a_send_cancelled_before_it_was_handed_over_is_removed(monkeypatch, tmp_path):
+    """The snapshot is made, but the send is cancelled after its worker ended and before the send took the
+    snapshot: the executor's future of that worker cancels the send as it completes, ahead of the loop's own
+    callback. The cancellation reaches the send, and the snapshot it never took is removed. The source and
+    another run's snapshot stay."""
+    import concurrent.futures
+
+    from gateway.platforms import base
+
+    document, cache, other = _snapshot_cache(monkeypatch, tmp_path)
+    adapter = RestartTestAdapter()
+    made, outcome, send = [], [], []
     snapshot = base.snapshot_attachment
 
     def observed(*args, **kwargs):
@@ -3528,19 +3763,67 @@ def test_a_send_cancelled_while_its_snapshot_is_made_leaves_no_copy(ingress, sen
         made.append(copy)
         return verdict, copy
     monkeypatch.setattr(base, "snapshot_attachment", observed)
-    h = _Harness(ingress, send, monkeypatch, "queue")
-    _answering_with(monkeypatch, f"MEDIA:{document}")
 
-    async def exercise():
-        await h.warm()
-        await h.adapter.handle_message(h.owner_event())
-        await h.wait(opening.is_set, "the snapshot to start")
-        h.adapter._session_tasks[h.key].cancel()
-        go.set()
-        await h.settle()
-        await h.wait(lambda: made and not os.path.exists(made[0].directory), "the late snapshot to be discarded")
-    asyncio.run(exercise())
-    assert t.handed == [] and document.read_bytes() == b"%PDF-approved"
-    [record_file] = _records(ingress)
-    assert _components(ingress, _recovery_id(record_file)) == [
-        ("text", "text", "delivered"), ("media:0", "media", "pending")]
+    class CancelsAsItEnds(concurrent.futures.ThreadPoolExecutor):
+        def submit(self, fn, *args, **kwargs):
+            go = threading.Event()
+
+            def gated():
+                assert go.wait(30)
+                return fn(*args, **kwargs)
+            future = super().submit(gated)
+            loop = asyncio.get_running_loop()
+            future.add_done_callback(lambda _f: loop.call_soon_threadsafe(send[0].cancel))
+            go.set()
+            return future
+
+    async def run():
+        asyncio.get_running_loop().set_default_executor(CancelsAsItEnds(max_workers=1))
+        send.append(asyncio.ensure_future(adapter._snapshot_owed_attachment(
+            None, {"kind": "media", "path": str(document)}, "")))
+        try:
+            outcome.append(await send[0])
+        except asyncio.CancelledError:
+            outcome.append("cancelled")
+    asyncio.run(run())
+    [copy] = made
+    assert outcome == ["cancelled"] and copy is not None
+    assert sorted(p.name for p in cache.iterdir()) == ["hermes-attachment-another-run"]
+    assert document.read_bytes() == b"%PDF-approved" and other.read_bytes() == b"another run's snapshot"
+
+
+def test_a_snapshot_that_cannot_be_removed_is_logged_and_reclaimed_by_the_document_cache_cleanup(
+        monkeypatch, tmp_path, caplog):
+    """A snapshot whose removal fails is logged with its directory and the error, and it is not hidden:
+    the document cache cleanup (hourly, 24 hours old) reclaims it once it is stale. That cleanup removes
+    only stale snapshot directories and stale files: never the source, another run's recent snapshot, or
+    any other directory."""
+    import logging
+    import os
+    import time
+
+    from gateway.platforms import base
+
+    document, cache, other = _snapshot_cache(monkeypatch, tmp_path)
+    verdict, copy = base.snapshot_attachment(str(document))
+    assert verdict == base.ATTACHMENT_SENDABLE
+    rmtree = base.shutil.rmtree
+
+    def refused(path, ignore_errors=False, *args, **kwargs):
+        if not ignore_errors:  # as rmtree fails: silent only when told to ignore errors
+            raise PermissionError(13, "Permission denied", str(path))
+    monkeypatch.setattr(base.shutil, "rmtree", refused)
+    with caplog.at_level(logging.WARNING, logger=base.logger.name):
+        copy.discard()
+    monkeypatch.setattr(base.shutil, "rmtree", rmtree)
+    assert os.path.exists(copy.path)
+    [record] = [r for r in caplog.records if copy.directory in r.getMessage()]
+    assert "Permission denied" in record.getMessage()
+    keep = cache / "kept-directory"
+    keep.mkdir()
+    stale = time.time() - 25 * 3600
+    for path in (copy.directory, keep):
+        os.utime(path, (stale, stale))
+    assert base.cleanup_document_cache(max_age_hours=24) == 1
+    assert not os.path.exists(copy.directory) and keep.is_dir()
+    assert document.read_bytes() == b"%PDF-approved" and other.read_bytes() == b"another run's snapshot"
