@@ -228,7 +228,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
                               "delivered_message_ids TEXT")
     if "reactivations" not in columns:
         # How often a later start gave an owner message's reply another send after its retry budget was
-        # spent (reactivate_expired); bounded by MAX_REACTIVATIONS.
+        # spent (reactivate_expired); past MAX_REACTIVATIONS such a reply is resumable.
         add_column_if_missing(conn, "delivery_obligations", "reactivations",
                               "reactivations INTEGER NOT NULL DEFAULT 0")
     # The components an owner message's reply requires (record_components): its text, whose delivery is
@@ -407,8 +407,11 @@ BLOCKED = "blocked"      # the media policy refuses a required attachment: never
 EXPIRED = "expired"      # the text's retry budget is spent (abandoned, attempts cap, stale) undelivered
 OPEN = "open"            # only a reply of a run a restart cut short: the transcript decides what is owed
 UNTRACKED = "untracked"  # a text row without components (written before components were): never complete
-# How many later starts may each give an expired reply's text one more send (reactivate_expired), and each
-# undelivered attachment of a reply one more try (claim_attachment_redelivery).
+# How many later starts give an expired reply's text one more send (reactivate_expired), and each
+# undelivered attachment of a reply one more try (claim_attachment_redelivery), before it is *resumable*:
+# its tries are spent but it is never abandoned while its record owes it. Each later start (the sign its
+# cause, a file gone, a policy refusal or a transport fault, may have cleared) still gives a resumable
+# reply one try, reported as a resumption, and no start gives it more than one.
 MAX_REACTIVATIONS = 3
 
 
@@ -453,23 +456,24 @@ class ReplyNotStored(RuntimeError):
 
 
 def claim_attachment_redelivery(obligation_id: str) -> "tuple[List[Dict[str, Any]], List[Dict[str, Any]]]":
-    """A later start's try at the attachments the reply under *obligation_id* still owes (pending, refused
-    or ``missing``): each gets at most ``MAX_REACTIVATIONS`` such tries, the same bound as an expired
-    text's reactivation, counted here before the try. Returns ``(claimed, spent)``: the components to try
-    now, and those whose tries are spent; a spent one keeps its state (it still blocks completion, and
-    the record stays) and is not tried again. Raises when the ledger cannot be written."""
+    """A later start's one try at each attachment the reply under *obligation_id* still owes (pending,
+    refused, ``missing`` or ``blocked``), counted here before the try. The send checks each one again
+    (platforms/base.py, redeliver_owed_attachments), so a file still gone or still refused is never
+    uploaded. Returns ``(claimed, resumed)``: every owed attachment, and those among them that
+    ``MAX_REACTIVATIONS`` earlier starts already tried (resumable: tried again, never abandoned). Raises
+    when the ledger cannot be written."""
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT component_id, redeliveries FROM delivery_components
                WHERE obligation_id=? AND kind != 'text' AND state != ?""",
             (obligation_id, COMPONENT_DELIVERED)).fetchall()
-        claimed = {cid for cid, tries in rows if int(tries or 0) < MAX_REACTIVATIONS}
-        for cid in claimed:
-            conn.execute("""UPDATE delivery_components SET redeliveries=redeliveries+1
-                            WHERE obligation_id=? AND component_id=?""", (obligation_id, cid))
+        conn.execute("""UPDATE delivery_components SET redeliveries=redeliveries+1
+                        WHERE obligation_id=? AND kind != 'text' AND state != ?""",
+                     (obligation_id, COMPONENT_DELIVERED))
         owed = {cid for cid, _tries in rows}
+        resumed = {cid for cid, tries in rows if int(tries or 0) >= MAX_REACTIVATIONS}
         parts = _components_unlocked(conn, obligation_id)
-    return ([p for p in parts if p["id"] in claimed], [p for p in parts if p["id"] in owed - claimed])
+    return [p for p in parts if p["id"] in owed], [p for p in parts if p["id"] in resumed]
 
 
 def obligation_components(obligation_id: str) -> List[Dict[str, Any]]:
@@ -563,14 +567,15 @@ def confirm_answer(obligation_id: str) -> None:
 
 
 def reactivate_expired(obligation_id: str, *, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
-    """Bounded reactivation of an owner message's reply whose text spent its retry budget undelivered
+    """Reactivation of an owner message's reply whose text spent its retry budget undelivered
     (``EXPIRED``): called by a later start, the signal that the fault may have cleared, while the message's
     record still owes the reply. The row is claimed for exactly one send by this process (``attempting``,
-    attempts + 1, the duplicate marker) and its ``reactivations`` count goes up; the caller sends it like a
-    boot claim. Never for a row that is not expired, belongs to a managed /acp answer, is held by a live
-    process, whose target refused it for good (a dead chat: send-forbidden), or that was reactivated
-    ``MAX_REACTIVATIONS`` times already: those stay as they are, with the record. Returns the claimed row,
-    or None."""
+    attempts + 1, the duplicate marker, its owner stamped, so this process never claims it again) and its
+    ``reactivations`` count goes up; the caller sends it like a boot claim. A row reactivated
+    ``MAX_REACTIVATIONS`` times already is resumable: claimed the same way, reported as a resumption.
+    Never for a row that is not expired, belongs to a managed /acp answer, is held by a live process, or
+    whose target refused it for good (a dead chat: send-forbidden): those stay as they are, with the
+    record. Returns the claimed row, or None."""
     now = time.time() if now is None else now
     pid, started = _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
@@ -583,7 +588,7 @@ def reactivate_expired(obligation_id: str, *, now: Optional[float] = None) -> Op
             return None
         (session_key, platform, chat_id, thread_id, content, state, attempts, _created, owner_pid, owner_started,
          profile, last_error, reactivations) = row
-        if (int(reactivations or 0) >= MAX_REACTIVATIONS or classify_dead_error(str(last_error or ""))
+        if (classify_dead_error(str(last_error or ""))
                 or (state != "abandoned" and _owner_alive(owner_pid, owner_started))):
             return None
         cursor = conn.execute(
@@ -595,8 +600,10 @@ def reactivate_expired(obligation_id: str, *, now: Optional[float] = None) -> Op
             (now, pid, started, obligation_id, state, attempts))
         if not cursor.rowcount:
             return None
-    logger.warning("delivery obligation %s to %s:%s spent its retry budget undelivered; reactivated for one more "
-                   "send (%d of %d)", obligation_id, platform, chat_id, int(reactivations or 0) + 1, MAX_REACTIVATIONS)
+    tries = int(reactivations or 0) + 1
+    logger.warning("delivery obligation %s to %s:%s spent its retry budget undelivered; %s for one more send "
+                   "(start %d, bound %d)", obligation_id, platform, chat_id,
+                   "resumed" if tries > MAX_REACTIVATIONS else "reactivated", tries, MAX_REACTIVATIONS)
     return _claimed_row(obligation_id, session_key, platform, chat_id, thread_id, content, attempts,
                         profile or "default", needs_marker=True, last_error=last_error)
 
@@ -953,8 +960,40 @@ _NOT_OWED = """NOT EXISTS (SELECT 1 FROM delivery_components c
                         WHERE c.obligation_id = delivery_obligations.obligation_id AND c.state != 'delivered')"""
 
 
+def _held_by_inbound_records() -> Optional[List[str]]:
+    """The replies a stored inbound record (gateway/shutdown_flush.py) can still be settled from at a start
+    (gateway/run_startup.py, _owe_stored_answer): the answer and the notice of every run the record admitted,
+    to its destination. None when the records cannot be listed. A record whose event cannot be read is never
+    settled, so it holds nothing."""
+    from gateway import shutdown_flush
+    try:
+        records = shutdown_flush.load_inbound_records()
+    except Exception:
+        logger.warning("Could not read the inbound records; retention keeps every reply this time", exc_info=True)
+        return None
+    held: List[str] = []
+    for record in records:
+        try:
+            source = shutdown_flush.inbound_event_from_record(record).source
+        except Exception:
+            continue
+        for run in range(shutdown_flush.inbound_record_run(record) + 1):
+            reply = InboundObligation.to(record["session_key"], inbound_answer_ref(record["recovery_id"], run), source)
+            held += [reply.reply_id(REPLY_ANSWER), reply.reply_id(REPLY_NOTICE)]
+    return held
+
+
 def _prune_unlocked(conn, now: float) -> None:
     """Retention DELETEs on the caller's open connection — must run inside the caller's transaction."""
+    import json as _json
+    # A reply an inbound record still on disk can be settled from is that record's completion evidence: were
+    # it pruned, the next start would find no reply and send the answer in the transcript again. It is kept,
+    # delivered or not, until the record is gone.
+    held = _held_by_inbound_records()
+    if held is None:
+        return
+    unheld = "obligation_id NOT IN (SELECT value FROM json_each(?))"
+    held_ids = _json.dumps(held)
     # An /acp answer row is the evidence its receipt settles from (and the startup sweep reads before
     # declaring a death before answer), so it outlives the ordinary retention and the row cap. The row of a
     # reply whose components are still owed is kept too (abandoned or not): it is that reply's retry state
@@ -962,25 +1001,26 @@ def _prune_unlocked(conn, now: float) -> None:
     conn.execute(
         f"""DELETE FROM delivery_obligations
            WHERE state IN ('delivered', 'abandoned') AND updated_at < ?
-             AND (acp_update_id IS NULL OR updated_at < ?) AND {_NOT_OWED}""",
-        (now - _RETENTION_SECONDS, now - _ACP_RETENTION_SECONDS))
+             AND (acp_update_id IS NULL OR updated_at < ?) AND {_NOT_OWED} AND {unheld}""",
+        (now - _RETENTION_SECONDS, now - _ACP_RETENTION_SECONDS, held_ids))
     # A reply's components go together, once every one has been delivered for the retention period; one
     # still owed keeps them all.
     conn.execute(
-        """DELETE FROM delivery_components WHERE obligation_id IN (
-             SELECT obligation_id FROM delivery_components GROUP BY obligation_id
-             HAVING MIN(state = 'delivered') = 1 AND MAX(updated_at) < ?)""", (now - _RETENTION_SECONDS,))
+        f"""DELETE FROM delivery_components WHERE obligation_id IN (
+             SELECT obligation_id FROM delivery_components WHERE {unheld} GROUP BY obligation_id
+             HAVING MIN(state = 'delivered') = 1 AND MAX(updated_at) < ?)""", (held_ids, now - _RETENTION_SECONDS))
     total = conn.execute("SELECT COUNT(*) FROM delivery_obligations WHERE acp_update_id IS NULL").fetchone()[0]
     if total > _MAX_ROWS:
         conn.execute(
             f"""DELETE FROM delivery_obligations WHERE obligation_id IN (
-                 SELECT obligation_id FROM delivery_obligations WHERE acp_update_id IS NULL AND {_NOT_OWED}
+                 SELECT obligation_id FROM delivery_obligations
+                 WHERE acp_update_id IS NULL AND {_NOT_OWED} AND {unheld}
                  ORDER BY CASE state
                             WHEN 'delivered' THEN 0
                             WHEN 'abandoned' THEN 1
                             ELSE 2
                           END, updated_at ASC
-                 LIMIT ?)""", (total - _MAX_ROWS,))
+                 LIMIT ?)""", (held_ids, total - _MAX_ROWS))
 
 
 def ledger_enabled(config: Optional[Dict[str, Any]] = None) -> bool:

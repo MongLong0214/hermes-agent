@@ -860,7 +860,7 @@ class GatewayStartupMixin:
         (``_owe_stored_answer``): "settled" when its answer owes nothing, or its reply's completion
         (delivery_ledger.inbound_completion) reads COMPLETE (then only the record and marker are cleaned
         up); "owed" when that reply is still incomplete: the ledger is redelivered (the text), a text whose
-        retry budget is spent gets its bounded reactivation (``_reactivate_expired_reply``), the
+        retry budget is spent gets one more send (``_reactivate_expired_reply``), the
         attachments not yet delivered are sent on *adapter* (never one already delivered), and the record
         stays until the decision reads COMPLETE; "unanswered" when nothing in the ledger names this run's
         reply and the transcript holds no completed answer (it runs again); "unknown" when a lookup or a
@@ -895,25 +895,26 @@ class GatewayStartupMixin:
 
     async def _reactivate_expired_reply(self, obligation: Any) -> None:
         """The stored reply's text spent its retry budget undelivered (``EXPIRED``): this start, a sign
-        the fault may have cleared, gives it one more send (delivery_ledger.reactivate_expired, bounded
-        by MAX_REACTIVATIONS, never for a dead chat). Refused, the record and the reply stay, reported."""
+        the fault may have cleared, gives it one more send (delivery_ledger.reactivate_expired: one per
+        start, resumed past MAX_REACTIVATIONS, never for a dead chat). Refused, the record and the reply
+        stay, reported."""
         from gateway.delivery_ledger import EXPIRED, inbound_completion, reactivate_expired
         state, reply_id = await asyncio.to_thread(inbound_completion, obligation)
         if state != EXPIRED:
             return
         claimed = await asyncio.to_thread(reactivate_expired, reply_id)
         if claimed is None:
-            logger.error("Stored reply %s spent its retry budget undelivered and is not reactivated (its bound is "
-                         "reached, its chat refused it for good, or another process holds it); its record and "
-                         "its text stay", reply_id)
+            logger.error("Stored reply %s spent its retry budget undelivered and is not reactivated (its chat "
+                         "refused it for good, or another process holds it); its record and its text stay",
+                         reply_id)
             return
         await self._redeliver_claimed_obligations([claimed])
 
     async def _redeliver_owed_attachments(self, obligation: Any, source: Any, adapter: Any) -> None:
         """Send the attachments the stored reply of *obligation* (its answer, or the notice that ends its
         message) still owes (platforms/base.py, redeliver_owed_attachments), on the bot that received
-        the message: each at most MAX_REACTIVATIONS starts (delivery_ledger.claim_attachment_redelivery).
-        One whose tries are spent keeps its state and its record, and is reported, never tried again."""
+        the message: one try each per start (delivery_ledger.claim_attachment_redelivery). One that
+        MAX_REACTIVATIONS earlier starts could not deliver is resumed, reported, never abandoned."""
         from gateway.delivery_ledger import (
             MAX_REACTIVATIONS, claim_attachment_redelivery, inbound_completion, obligation_components)
         _state, obligation_id = await asyncio.to_thread(inbound_completion, obligation)
@@ -926,11 +927,11 @@ class GatewayStartupMixin:
         if not isinstance(adapter, BasePlatformAdapter):
             logger.info("Stored reply %s owes attachments but its bot is offline; they wait", obligation_id)
             return
-        claimed, spent = await asyncio.to_thread(claim_attachment_redelivery, obligation_id)
-        for part in spent:
-            logger.error("Stored reply %s: its attachment %s is still %s after %d later starts tried it; it is not "
-                         "tried again, and the message's record stays", obligation_id,
-                         part.get("path") or part.get("url"), part.get("state"), MAX_REACTIVATIONS)
+        claimed, resumed = await asyncio.to_thread(claim_attachment_redelivery, obligation_id)
+        for part in resumed:
+            logger.error("Stored reply %s: its attachment %s is still %s after %d later starts tried it; this "
+                         "start tries it once more, and the message's record stays until it is delivered",
+                         obligation_id, part.get("path") or part.get("url"), part.get("state"), MAX_REACTIVATIONS)
         if claimed:
             await adapter.redeliver_owed_attachments(
                 source, obligation_id, claimed, session_key=obligation.session_key,

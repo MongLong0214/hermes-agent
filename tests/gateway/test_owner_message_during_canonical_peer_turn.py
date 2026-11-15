@@ -2988,41 +2988,26 @@ def test_a_reply_whose_components_cannot_be_stored_sends_nothing_until_they_are(
     assert _marker(nxt) is None
 
 
-@pytest.mark.parametrize("back", ["next_start", "after_the_bound"])
-def test_a_stored_answer_whose_attachment_is_gone_keeps_it_owed_as_missing(
-        ingress, send, monkeypatch, tmp_path, caplog, back):
+def test_a_stored_answer_whose_attachment_is_gone_keeps_it_owed_as_missing(ingress, send, monkeypatch, tmp_path):
     """s1c review P1-3: a completed answer, text and a PDF, was stored before any of its components
     were, then the PDF is deleted. The next start owes both: the text is delivered, the PDF stays one of
     the reply's components, recorded missing (never dropped, never counted delivered), and the record
-    stays. Once the file is back, the start after that sends the PDF alone and cleans up. The tries are
-    bounded like a text's reactivation: after MAX_REACTIVATIONS starts found it gone, a start sends
-    nothing even with the file back; the PDF stays missing, the record stays, and an ERROR says so. The
-    message is never run again."""
-    import logging
-
-    from gateway import delivery_ledger
-
+    stays. Once the file is back, the start after that sends the PDF alone and cleans up. The message is
+    never run again."""
     document = tmp_path / "report.pdf"
     document.write_bytes(b"%PDF-test")
     _stored_turn(ingress, "missing", f"{_TERMINAL}\nMEDIA:{document}")
     document.unlink()
     sent = _attachment_sends(monkeypatch, set())
-    for start in range(1 if back == "next_start" else delivery_ledger.MAX_REACTIVATIONS):
-        nxt = _next_process(ingress, send, monkeypatch, crashed=True)
-        turns, _inputs, chats, left = _answered(ingress, nxt)
-        assert (turns, chats, left, sent) == ([], ["chat"] if start == 0 else [], ["inbound-missing.json"], [])
-        assert _components(ingress, "missing") == [("text", "text", "delivered"), ("media:0", "media", "missing")]
-    document.write_bytes(b"%PDF-test")
-    with caplog.at_level(logging.ERROR):
-        nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
     turns, _inputs, chats, left = _answered(ingress, nxt)
-    if back == "next_start":
-        assert (turns, chats, left) == ([], [], [])
-        assert [(kind, ok) for kind, _what, ok in sent] == [("document", True)]
-    else:
-        assert (turns, chats, left, sent) == ([], [], ["inbound-missing.json"], [])
-        assert ("media:0", "media", "missing") in _components(ingress, "missing")
-        assert any("not tried again" in r.getMessage() for r in caplog.records)
+    assert (turns, chats, left, sent) == ([], ["chat"], ["inbound-missing.json"], [])
+    assert _components(ingress, "missing") == [("text", "text", "delivered"), ("media:0", "media", "missing")]
+    document.write_bytes(b"%PDF-test")
+    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    turns, _inputs, chats, left = _answered(ingress, nxt)
+    assert (turns, chats, left) == ([], [], [])
+    assert [(kind, ok) for kind, _what, ok in sent] == [("document", True)]
 
 
 def test_a_stored_answer_that_is_only_an_attachment_is_delivered_and_never_run_again(
@@ -3042,15 +3027,15 @@ def test_a_stored_answer_that_is_only_an_attachment_is_delivered_and_never_run_a
     assert _components(ingress, "onlyfile") == [("media:0", "media", "delivered")]
 
 
-@pytest.mark.parametrize("cause", ["stale", "attempts", "send_forbidden", "bound_spent"])
+@pytest.mark.parametrize("cause", ["stale", "attempts", "send_forbidden"])
 def test_a_reply_whose_retry_budget_is_spent_is_reactivated_a_bounded_number_of_times(
         ingress, send, monkeypatch, cause):
     """s1c review P1-5: the stored answer's text row spent its retry budget undelivered (the 24-hour
     cutoff, or the attempts cap) while the record still owes it, and the transport works again. The next
     start reactivates it for one more send, reads it back delivered and cleans up. Reactivation is
-    bounded and selective: a row its chat refused for good (send-forbidden), or one already reactivated
-    MAX_REACTIVATIONS times, is never revived, not even after retention ran over its old row; it and
-    the record stay, and neither of two starts sends anything or runs the message again."""
+    selective: a row its chat refused for good (send-forbidden) is never revived, not even after
+    retention ran over its old row; it and the record stay, and neither of two starts sends anything or
+    runs the message again."""
     import time
 
     from gateway import delivery_ledger as ledger
@@ -3070,9 +3055,6 @@ def test_a_reply_whose_retry_budget_is_spent_is_reactivated_a_bounded_number_of_
             ("failed" if revived else "abandoned", 0 if stale else ledger.MAX_ATTEMPTS, time.time() - age,
              time.time() - age, "Forbidden: bot was blocked by the user" if cause == "send_forbidden" else "Bad Gateway",
              oid))
-        if cause == "bound_spent":
-            conn.execute("UPDATE delivery_obligations SET reactivations=? WHERE obligation_id=?",
-                         (ledger.MAX_REACTIVATIONS, oid))
         conn.commit()
     for start in range(2):
         nxt = _next_process(ingress, send, monkeypatch, crashed=True)
@@ -3083,6 +3065,111 @@ def test_a_reply_whose_retry_budget_is_spent_is_reactivated_a_bounded_number_of_
         ledger.record_obligation(obligation_id=f"other-{start}", session_key="other", platform="telegram",
                                  chat_id="other", thread_id=None, content="another reply")
     assert _components(ingress, "expired") == [("text", "text", "delivered" if revived else "pending")]
+
+
+@pytest.mark.parametrize("fault", ["attachment_gone", "transport_down"])
+def test_a_reply_still_owed_past_its_retry_bound_is_delivered_once_its_fault_clears(
+        ingress, send, monkeypatch, tmp_path, fault):
+    """s1d review P1 (retry bounds): a stored answer stays owed through more starts than its retry bound
+    allows, because its PDF is gone or because the transport refuses its text. Each of those starts tries
+    it at most once (a missing file is never uploaded, the text is sent at most once) and the record
+    stays. A spent bound is not the end: once the file is back, or the transport works again, the next
+    start delivers what is owed and cleans up, and the message is never run again."""
+    import time
+
+    from gateway import delivery_ledger as ledger
+    from gateway.platforms.base import SendResult
+
+    gone = fault == "attachment_gone"
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-test")
+    _stored_turn(ingress, "bounded", f"{_TERMINAL}\nMEDIA:{document}" if gone else _TERMINAL)
+    document.unlink()
+    oid, source = _inbound_obligation(ingress, "bounded"), ingress.source
+    if not gone:
+        # Its text already spent the in-process retries: only a later start's reactivation sends it.
+        ledger.record_components(oid, [{"id": "text", "kind": "text", "text": _TERMINAL}])
+        ledger.record_obligation(obligation_id=oid, session_key=ingress.entry.session_key, platform="telegram",
+                                 chat_id=source.chat_id, thread_id=source.thread_id, content=_TERMINAL)
+        with ledger._connect() as conn:
+            conn.execute("UPDATE delivery_obligations SET state='abandoned', attempts=?, updated_at=?, "
+                         "last_error='Bad Gateway' WHERE obligation_id=?", (ledger.MAX_ATTEMPTS, time.time(), oid))
+            conn.commit()
+    uploads, answers, down = _attachment_sends(monkeypatch, set()), [], [] if gone else ["Bad Gateway"]
+    original_send = RestartTestAdapter.send
+
+    async def transport(self, chat_id, content, **kwargs):
+        if _TERMINAL in content:
+            answers.append(content)
+            if down:
+                return SendResult(success=False, error=down[0])
+        return await original_send(self, chat_id, content, **kwargs)
+    monkeypatch.setattr(RestartTestAdapter, "send", transport)
+
+    def next_start():
+        # Every start of these runs in this one test process: the previous owner is gone, as across a restart.
+        with ledger._connect() as conn:
+            conn.execute("UPDATE delivery_obligations SET owner_pid=NULL, owner_started_at=NULL "
+                         "WHERE obligation_id=?", (oid,))
+            conn.commit()
+        before = len(answers)
+        nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+        return nxt, len(answers) - before
+
+    for _start in range(ledger.MAX_REACTIVATIONS + 1):
+        nxt, sent = next_start()
+        turns, _inputs, _chats, left = _answered(ingress, nxt)
+        assert (turns, left, uploads) == ([], ["inbound-bounded.json"], [])
+        assert sent <= 1
+    document.write_bytes(b"%PDF-test")
+    down.clear()
+    nxt, sent = next_start()
+    turns, _inputs, _chats, left = _answered(ingress, nxt)
+    assert (turns, left) == ([], [])
+    assert sent == (0 if gone else 1)
+    assert [(kind, ok) for kind, _what, ok in uploads] == ([("document", True)] if gone else [])
+    assert {state for _id, _kind, state in _components(ingress, "bounded")} == {"delivered"}
+
+
+def test_the_ledger_keeps_a_delivered_reply_while_its_record_is_still_on_disk(ingress, send, monkeypatch):
+    """s1d review P1 (retention): an owner message is answered and its reply delivered, but deleting its
+    record fails, and the fault lasts longer than the ledger's retention. Retention keeps the delivered
+    reply while the record exists, so the next start finds it complete: it cleans up and sends nothing
+    again. Once the record is gone the reply ages out as any other."""
+    import time
+    from pathlib import Path
+
+    from gateway import delivery_ledger as ledger
+
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    _persisting_agents(monkeypatch)
+    unlink = Path.unlink
+
+    def refused(path, *args, **kwargs):
+        if path.name.startswith("inbound-"):
+            raise OSError("spool temporarily unavailable")
+        return unlink(path, *args, **kwargs)
+
+    async def exercise():
+        await h.warm()
+        monkeypatch.setattr(Path, "unlink", refused)
+        await h.adapter.handle_message(h.owner_event())
+        await h.settle()
+    asyncio.run(exercise())
+    monkeypatch.setattr(Path, "unlink", unlink)
+    [record] = _records(ingress)
+    assert [text for _chat, text in h.owner_replies() if _TERMINAL in text]
+    answer = _recovery_id(record)
+
+    def retention(days):
+        with ledger._DB_LOCK, ledger._transaction() as conn:
+            ledger._prune_unlocked(conn, time.time() + days * 24 * 60 * 60)
+    retention(8)
+    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    turns, _inputs, _chats, left = _answered(ingress, nxt)
+    assert (turns, left, _texts_sent(nxt)) == ([], [], [])
+    retention(8)
+    assert _components(ingress, answer) == []
 
 
 def test_store_partial_delivery_interruption_restart_recovery_and_cleanup(ingress, send, monkeypatch, tmp_path):
