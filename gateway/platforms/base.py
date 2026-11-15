@@ -923,13 +923,13 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
     return False
 
 
-def _file_is_recently_produced(resolved: Path, window_seconds: float) -> bool:
-    """True if mtime is within ``window_seconds`` — a session-scoped trust signal: agents
-    produce artifacts seconds before sending; pre-existing host files are days/months old."""
+def _file_is_recently_produced(resolved: Path, window_seconds: float, mtime: Optional[float] = None) -> bool:
+    """True if mtime (*mtime*, else the path's) is within ``window_seconds`` — a session-scoped trust signal:
+    agents produce artifacts seconds before sending; pre-existing host files are days/months old."""
     if window_seconds <= 0:
         return False
     try:
-        return (time.time() - resolved.stat().st_mtime) <= window_seconds
+        return (time.time() - (resolved.stat().st_mtime if mtime is None else mtime)) <= window_seconds
     except OSError:
         return False
 
@@ -1140,21 +1140,25 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
         resolved = _resolve_path(expanded, strict=True)
     if resolved is None or not resolved.is_file():
         return None
+    return str(resolved) if _delivery_policy_allows(resolved) else None
+
+
+def _delivery_policy_allows(resolved: Path, mtime: Optional[float] = None) -> bool:
+    """The media delivery policy's decision on the regular file at *resolved* (symlinks resolved). *mtime*, an
+    open file's own (``snapshot_attachment``), stands for the path's in the recency trust."""
     # Cache / operator allowlist is trusted unconditionally, regardless of mode.
     for root in _media_delivery_allowed_roots():
         resolved_root = _resolve_path(root, expand=True)
         if resolved_root is not None and _path_is_within(resolved, resolved_root):
-            return str(resolved)
+            return True
     # Non-strict (default): anything not denylisted (/etc, /proc, ~/.ssh, Hermes-root secrets).
     from gateway.media_policy import media_delivery_strict
     if not media_delivery_strict():
-        return None if _path_under_denied_prefix(resolved) else str(resolved)
+        return not _path_under_denied_prefix(resolved)
     # Strict: recency trust for fresh files (pandoc -o /tmp/x.pdf); denylist still applies.
     window = _media_delivery_recency_seconds()
-    if (window > 0 and not _path_under_denied_prefix(resolved)
-            and _file_is_recently_produced(resolved, window)):
-        return str(resolved)
-    return None
+    return (window > 0 and not _path_under_denied_prefix(resolved)
+            and _file_is_recently_produced(resolved, window, mtime))
 
 
 # Control chars + Unicode line separators (NEL, LS, PS) that log aggregators treat as breaks: a
@@ -1239,7 +1243,7 @@ _SNAPSHOT_OPEN_FLAGS = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os,
 
 def _still_names(resolved: str, opened: os.stat_result) -> bool:
     """True when *resolved* (a path ``attachment_verdict`` resolved) resolves to itself now, no symlink
-    anywhere on it, and names the open file *opened*: what was opened is the file the check approved."""
+    anywhere on it, and names the open regular file *opened*: *resolved* is the open file's resolved path."""
     now = _resolve_path(Path(resolved), strict=True)
     if now is None or str(now) != resolved:
         return False
@@ -1254,10 +1258,12 @@ def snapshot_attachment(path: str, session_key: str = "", *, label: str = "MEDIA
                         ) -> Tuple[str, Optional[_AttachmentSnapshot]]:
     """``attachment_verdict`` bound to the bytes that are sent, for one send of an owner message's attachment
     (``_deliver_owed_attachments``). The adapters upload by path and open it again themselves, so holding a
-    validated file descriptor alone would not bind them. Here the path the check resolved is opened,
-    checked again after the open (it still resolves to itself and names the open file), and the open file is
-    copied into a private snapshot, which is what the adapter uploads: a symlink or a file swapped in after
-    the check never reaches the transport. ``(ATTACHMENT_SENDABLE, the snapshot)``, else the verdict and None.
+    validated file descriptor alone would not bind them. Here the path the check resolved is opened once,
+    and the policy decides again on the open file itself: the path must still resolve to itself and name it
+    (``_still_names``), and the policy reads that path and the open file's own mtime. The open file is then
+    copied into a private snapshot, which is what the adapter uploads, and the path is never opened again: a
+    symlink or another file swapped in under the path before the open is judged as itself, and refused when
+    the policy refuses it. ``(ATTACHMENT_SENDABLE, the snapshot)``, else the verdict and None.
     Limits: the copy is of the approved file as it is while it is copied (an in-place write to that same file
     before the copy is sent); a hard link to a protected file under an allowed path passes the path policy.
     Blocking: run it off the loop."""
@@ -1269,7 +1275,9 @@ def snapshot_attachment(path: str, session_key: str = "", *, label: str = "MEDIA
     except OSError:
         fd = None
     try:
-        if fd is None or not _still_names(safe_path, os.fstat(fd)):
+        opened = None if fd is None else os.fstat(fd)
+        if opened is None or not (_still_names(safe_path, opened)
+                                  and _delivery_policy_allows(Path(safe_path), opened.st_mtime)):
             logger.warning("Skipping %s (changed after it was checked): %s", label, _log_safe_path(str(path)))
             return (ATTACHMENT_BLOCKED if _existing_regular_file(str(path)) else ATTACHMENT_MISSING), None
         # In the document cache, one of MEDIA_DELIVERY_SAFE_ROOTS, which the policy allows in every mode: an
@@ -1442,6 +1450,49 @@ MEDIA_EXTENSIONLESS_TAG_RE = re.compile(
 # (whitespace, closing quotes, emphasis and punctuation) without the tag naming more than that path.
 _MEDIA_PATH_ANCHOR_RE = re.compile(r'(?:~/|/|[A-Za-z]:[/\\])')
 _MEDIA_TAG_CLOSERS = " \t\r\f\v`\"'*_,.;:!?)]}" + _MEDIA_CJK_TERMINATORS
+_MEDIA_TOKEN_RE = re.compile(r"MEDIA:\s*", re.IGNORECASE)
+
+
+def _media_declarations(content: str) -> List[Tuple[int, int, str, bool]]:
+    """The one parse of the ``MEDIA:`` declarations of an owner message's reply, ``[(start, end, path,
+    ambiguous), ...]`` in order, *start*:*end* the tag's span in *content*: ``declared_media`` reads the paths
+    and ``_owed_text`` deletes the spans, so what the reply owes and what its chat shows are one parse.
+    Outside a quoted path and a code span, the next ``MEDIA:`` or the end of its line ends a declaration;
+    within that, the tag grammar of ``declared_media`` ends its path. A bare path that grammar ends before
+    more than closing punctuation is ambiguous, its declaration the rest of that stretch."""
+    scan = _mask_media_scan_text(content, declarations=True)
+    codes = [m.span() for m in _INLINE_CODE_RE.finditer(scan) if m.group(0)[1:-1].lstrip()[:6].upper() == "MEDIA:"]
+    found: List[Tuple[int, int, str, bool]] = []
+    pos = 0
+    for token in _MEDIA_TOKEN_RE.finditer(scan):
+        at, path_at = token.start(), token.end()
+        if at < pos:
+            continue  # inside the declaration before it: a quoted path or a code span
+        code = next(((s, e) for s, e in codes if s < at < e), None)
+        if code is not None:  # a whole tag in inline code ends at the code span's closing backtick
+            path = _normalize_media_tag_path(scan[code[0] + 1:code[1] - 1].lstrip()[6:])
+            if _MEDIA_PATH_ANCHOR_RE.match(path):
+                found.append((*code, path, False))
+            pos = code[1]
+            continue
+        line_end = len(scan) if (nl := scan.find("\n", path_at)) < 0 else nl
+        quoted = scan[path_at:path_at + 1] in ("`", '"', "'")
+        nxt = None if quoted else _MEDIA_TOKEN_RE.search(scan, path_at, line_end)
+        limit = nxt.start() if nxt else line_end
+        start = at - len(re.search(r"[`\"'*_]{0,3}$", scan[pos:at]).group())
+        match = MEDIA_TAG_CLEANUP_RE.match(scan, start, limit) or MEDIA_EXTENSIONLESS_TAG_RE.match(scan, start, limit)
+        path = _normalize_media_tag_path(match.group("path")) if match else ""
+        if not path:
+            continue  # no path, or a relative one: no declaration
+        rest = scan[match.end("path"):limit]
+        if match.re is MEDIA_EXTENSIONLESS_TAG_RE and not quoted and rest.strip(_MEDIA_TAG_CLOSERS):
+            end = match.end("path") + len(rest.rstrip())
+            found.append((start, end, _normalize_media_tag_path(content[match.start("path"):end]), True))
+        else:
+            end = match.end()
+            found.append((start, end, path, False))
+        pos = end
+    return found
 
 
 def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tuple[str, int]]:
@@ -3614,48 +3665,37 @@ class BasePlatformAdapter(ABC):
     def declared_media(content: str) -> List[Tuple[str, bool, bool]]:
         """Every ``MEDIA:`` file *content* declares, ``[(path, is_voice, ambiguous), ...]`` in order: what an
         owner message's reply requires (``_owed_media``). Where a path ends is decided by the tag grammar
-        alone, never by whether a file exists, its extension is deliverable or the media policy allows it, so
-        no other path ever stands in for the declared one. A quoted path ends at its closing quote; a whole tag
-        in inline code (#35695) at the code span's closing backtick, spaces included; a bare path with a
-        deliverable extension at that extension (``MEDIA_TAG_CLEANUP_RE``, spaces allowed). Any other bare
-        path ends where ``MEDIA_EXTENSIONLESS_TAG_RE`` ends it; when its line goes on after it (before the next
-        ``MEDIA:``) with more than closing punctuation, the tag could as well name a longer path with spaces
-        (#24032), so it is *ambiguous*: declared under the rest of its line, and refused by its send
-        (``_snapshot_owed_attachment``). A tag in fenced code, a quote or a JSON string value is an example, a
-        relative path names nothing: neither is a declaration. ``extract_media`` still decides what other
-        replies send and what text stays, and the allowed extensions are its own."""
+        alone (``_media_declarations``), never by whether a file exists, its extension is deliverable or the
+        media policy allows it, so no other path ever stands in for the declared one. Outside a quoted path and
+        a code span, the next ``MEDIA:`` ends a declaration, as its line's end does. A quoted path ends at its
+        closing quote; a whole tag in inline code (#35695) at the code span's closing backtick, spaces
+        included; a bare path with a deliverable extension at that extension (``MEDIA_TAG_CLEANUP_RE``, spaces
+        allowed). Any other bare path ends where ``MEDIA_EXTENSIONLESS_TAG_RE`` ends it; when its line goes on
+        after it (before the next ``MEDIA:``) with more than closing punctuation, the tag could as well name a
+        longer path with spaces (#24032), so it is *ambiguous*: declared under the rest of its line, and
+        refused by its send (``_snapshot_owed_attachment``). A tag in fenced code, a quote or a JSON string
+        value is an example, a relative path names nothing: neither is a declaration. The reply's text is the
+        same parse's (``_owed_text``); ``extract_media`` still decides what other replies send and show."""
         has_voice_tag = "[[audio_as_voice]]" in content
-        scan = _mask_media_scan_text(content, declarations=True)
-        named: Dict[int, Tuple[str, bool]] = {}
-        whole_tags = []
-        for code in _INLINE_CODE_RE.finditer(scan):
-            inner = code.group(0)[1:-1].lstrip()
-            if inner[:6].upper() == "MEDIA:":
-                whole_tags.append(code.span())
-                path = _normalize_media_tag_path(inner[6:])
-                if _MEDIA_PATH_ANCHOR_RE.match(path):
-                    named[code.start()] = (path, False)
-        scan = _blank_spans(scan, whole_tags)  # bounded by their code spans, never by the patterns below
-        for match in MEDIA_TAG_CLEANUP_RE.finditer(scan):
-            if path := _normalize_media_tag_path(match.group("path")):
-                named[match.start()] = (path, False)
-        for match in MEDIA_EXTENSIONLESS_TAG_RE.finditer(scan):
-            path = _normalize_media_tag_path(match.group("path"))
-            if path and match.start() not in named:
-                line = scan[match.end("path"):].split("\n", 1)[0]
-                rest = re.split(r"MEDIA:", line, maxsplit=1, flags=re.IGNORECASE)[0]
-                if rest.strip(_MEDIA_TAG_CLOSERS):
-                    end = match.end("path") + len(rest)
-                    named[match.start()] = (_normalize_media_tag_path(content[match.start("path"):end]), True)
-                else:
-                    named[match.start()] = (path, False)
         declared: Dict[str, Tuple[bool, bool]] = {}
-        for _start, (path, ambiguous) in sorted(named.items()):
+        for _start, _end, path, ambiguous in _media_declarations(content):
             with contextlib.suppress(OSError, RuntimeError, ValueError):  # a crafted ~\x00 path names nothing
                 path = os.path.expanduser(path)
                 voice = has_voice_tag and os.path.splitext(path)[1].lower() in _AUDIO_EXTS
                 declared.setdefault(path, (voice, ambiguous))
         return [(path, voice, ambiguous) for path, (voice, ambiguous) in declared.items()]
+
+    @staticmethod
+    def _owed_text(content: str) -> str:
+        """The text of an owner message's reply *content* as its chat shows it: without the spans of the
+        declarations its attachments come from (``_media_declarations``), an ambiguous one's included, its
+        ``[[audio_as_voice]]`` / ``[[as_document]]`` markers and, after a declaration, a terminal ``<|eos|>``."""
+        spans = [(start, end) for start, end, _path, _ambiguous in _media_declarations(content)]
+        if spans and (eos := _terminal_sentinel_start(content)) >= 0:
+            spans.append((eos, len(content.rstrip())))
+        markers = [m.span() for m in re.finditer(r"\[\[(?:audio_as_voice|as_document)\]\]", content)]
+        text = _delete_spans(content, spans + markers)
+        return re.sub(r'\n{3,}', '\n\n', text).strip() if spans else text
 
     @staticmethod
     def strip_media_directives_for_display(text: str) -> str:
@@ -5166,9 +5206,8 @@ class BasePlatformAdapter(ABC):
         ``blocked`` by its send (``_deliver_owed_attachments``), which keeps the reply owed.
         The caller holds the routed profile's media scope."""
         force_document = "[[as_document]]" in response
-        _tagged, rest = cls.extract_media(response)
         media_files, ambiguous = cls._owed_media(response, session_key)
-        images, text_content = cls.extract_images(rest)
+        images, text_content = cls.extract_images(cls._owed_text(response))
         text_content = _strip_media_directives(text_content).strip()
         local_files, text_content = cls.extract_local_files(text_content)
         local_files = cls._reply_local_files(local_files, session_key)
@@ -5191,9 +5230,12 @@ class BasePlatformAdapter(ABC):
         # The handler's routed profile scope is gone by now; Docker MEDIA translation and the
         # bare-path validator infer the sandbox from the ACTIVE profile (#109024).
         with self._media_delivery_scope(event.source):
-            media_files, response = self.extract_media(response)
-            media_files, ambiguous = (self._owed_media(pre_extract, session_key) if owed
-                                      else (self._reply_media(media_files, session_key, owed=False), frozenset()))
+            if owed:  # what it owes and what its text shows are one parse of its declarations
+                media_files, ambiguous = self._owed_media(response, session_key)
+                response = self._owed_text(response)
+            else:
+                media_files, response = self.extract_media(response)
+                media_files, ambiguous = self._reply_media(media_files, session_key, owed=False), frozenset()
             images, text_content = self.extract_images(response)
             # Strip any remaining internal directives from message body (fixes #1561). _strip_media_directives
             # shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag with an unknown extension is intentionally left in

@@ -3501,6 +3501,37 @@ def test_an_owed_attachment_whose_directory_is_swapped_as_it_is_opened_is_never_
     assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "blocked")]
 
 
+def test_a_file_renamed_over_the_checked_path_as_it_is_opened_is_judged_as_itself(
+        ingress, send, monkeypatch, tmp_path):
+    """The slice A3 review, P1: the window between the check and the open, by inode. A fresh PDF the strict
+    policy's recent-file trust allows is checked; as its path is opened, an old file the policy refuses is
+    renamed over it, so the open file is the old one. The policy decides again on the open file (its own
+    mtime): the attachment is recorded blocked, the record stays, and the old file's bytes never reach the
+    transport."""
+    import os
+    import time
+
+    document, old = tmp_path / "report.pdf", tmp_path / "old.pdf"
+    document.write_bytes(b"%PDF-approved recent")
+    old.write_bytes(b"FORBIDDEN OLD FILE")
+    os.utime(old, (time.time() - 3600, time.time() - 3600))
+    _media_policy(monkeypatch, strict=True, trust_recent=True)
+    t = _held_transport(monkeypatch, None)
+    _hold_open(monkeypatch, str(document.resolve()), lambda: os.replace(old, document))
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    _answering_with(monkeypatch, f"MEDIA:{document}")
+
+    async def exercise():
+        await h.warm()
+        await h.adapter.handle_message(h.owner_event())
+        await h.settle()
+    asyncio.run(exercise())
+    assert t.uploads == [] and document.read_bytes() == b"FORBIDDEN OLD FILE"
+    [record_file] = _records(ingress)
+    assert _components(ingress, _recovery_id(record_file)) == [
+        ("text", "text", "delivered"), ("media:0", "media", "blocked")]
+
+
 def test_a_send_cancelled_while_its_snapshot_is_made_leaves_no_copy(ingress, send, monkeypatch, tmp_path):
     """The snapshot is made off the loop. The owner turn is cancelled while its attachment's snapshot is
     being made: the snapshot finishes in its thread after the send is gone, and it is discarded then. No
@@ -3564,6 +3595,15 @@ _GRAMMAR = [
     ("MEDIA:{d}/Caddyfile, MEDIA:{d}/run.log.\nThe rest", ["{d}/Caddyfile", "{d}/run.log"], [False, False]),
     ("MEDIA:{d}/my report.pdf (2 MB)", ["{d}/my report.pdf"], [False]),
     ("`MEDIA:report with spaces.log`", [], []),
+    # The slice A3 review, P1: outside quotes and code, the next MEDIA: ends a declaration.
+    ("MEDIA:{d}/first.log MEDIA:{d}/second.pdf", ["{d}/first.log", "{d}/second.pdf"], [False, False]),
+    ("MEDIA:{d}/a.pdf MEDIA:{d}/run.log MEDIA:{d}/c.png", ["{d}/a.pdf", "{d}/run.log", "{d}/c.png"],
+     [False, False, False]),
+    ("MEDIA:{d}/my notes.log MEDIA:{d}/my report.pdf", ["{d}/my notes.log", "{d}/my report.pdf"], [True, False]),
+    ("Logs: MEDIA:{d}/run.log, chart MEDIA:{d}/chart.png done", ["{d}/run.log, chart", "{d}/chart.png"],
+     [True, False]),
+    ('MEDIA:"{d}/a MEDIA:b.log" MEDIA:{d}/c.pdf', ["{d}/a MEDIA:b.log", "{d}/c.pdf"], [False, False]),
+    ("`MEDIA:{d}/a MEDIA:{d}/b.log` MEDIA:{d}/c.pdf", ["{d}/a MEDIA:{d}/b.log", "{d}/c.pdf"], [False, False]),
 ]
 
 
@@ -3676,6 +3716,38 @@ def test_a_bare_declaration_whose_line_goes_on_is_refused_as_ambiguous(ingress, 
     nxt = _next_process(ingress, send, monkeypatch, crashed=True)
     assert sent == [] and _answered(ingress, nxt)[0] == [] and _records(ingress) == [f"inbound-{rid}.json"]
     assert _components(ingress, rid) == [("text", "text", "delivered"), ("media:0", "media", "blocked")]
+
+
+@pytest.mark.parametrize("lane", ["normal", "recovery"])
+def test_adjacent_declarations_are_each_owed_uploaded_and_gone_from_the_text(
+        ingress, send, monkeypatch, tmp_path, lane):
+    """The slice A3 review, P1: ``MEDIA:…/first.log MEDIA:…/second.pdf``, both files there and allowed, in
+    the adapter's final or read from the stored answer by a later start. The next ``MEDIA:`` ends the first
+    declaration, so each file is one of the reply's components: both are uploaded, in order, and the record
+    goes. The text the chat shows comes from the same parse: neither tag is in it."""
+    first, second = tmp_path / "first.log", tmp_path / "second.pdf"
+    first.write_bytes(b"REQUIRED FIRST LOG")
+    second.write_bytes(b"%PDF-second")
+    _media_policy(monkeypatch, strict=True, allow=tmp_path)
+    sent = _attachment_sends(monkeypatch, set())
+    reply = f"MEDIA:{first} MEDIA:{second}"
+    if lane == "recovery":
+        _stored_turn(ingress, "adjacent", f"{_TERMINAL}\n{reply}")
+        h = _next_process(ingress, send, monkeypatch, crashed=True)
+    else:
+        h = _Harness(ingress, send, monkeypatch, "queue")
+        _answering_with(monkeypatch, reply)
+
+        async def exercise():
+            await h.warm()
+            await h.adapter.handle_message(h.owner_event())
+            await h.settle()
+        asyncio.run(exercise())
+    assert sent == [("document", ("first.log", b"REQUIRED FIRST LOG"), True),
+                    ("document", ("second.pdf", b"%PDF-second"), True)]
+    assert _records(ingress) == []
+    texts = _texts_sent(h)
+    assert any(_TERMINAL in text for text in texts) and not [text for text in texts if "MEDIA:" in text]
 
 
 def _snapshot_cache(monkeypatch, tmp_path):
