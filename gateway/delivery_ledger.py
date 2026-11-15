@@ -1023,7 +1023,8 @@ def _held_by_inbound_records(conn) -> Optional[List[str]]:
     that absorbed it: an id only the transcript names, and the absorbing record may be long gone. So every
     obligation of a record's session is kept, and every attachment-only reply (components, no row), until the
     record is gone. A record that cannot be read now is still on disk: it holds its session if its session is
-    known, and holds everything (None) if even that cannot be read, never nothing."""
+    known, and holds everything (None) if even that cannot be read, never nothing. The same goes for a spool
+    that cannot be listed (``Path.glob`` and ``load_inbound_records`` read that as an empty one)."""
     import json as _json
     from gateway import shutdown_flush
     from hermes_constants import get_process_hermes_home
@@ -1031,7 +1032,11 @@ def _held_by_inbound_records(conn) -> Optional[List[str]]:
         records = shutdown_flush.load_inbound_records()
         spool = get_process_hermes_home() / "pending_messages"
         prefix = shutdown_flush._INBOUND_PREFIX  # noqa: SLF001
-        listed = set(spool.glob(f"{prefix}*.json")) if spool.is_dir() else set()
+        try:
+            names = os.listdir(spool)
+        except FileNotFoundError:
+            names = []  # no spool: no record. Any other failure to list is "unknown" (raised below)
+        listed = {spool / name for name in names if name.startswith(prefix) and name.endswith(".json")}
         loaded = {spool / f"{prefix}{r['recovery_id']}.json" for r in records}
         sessions = {r["session_key"] for r in records}
         for path in listed - loaded:

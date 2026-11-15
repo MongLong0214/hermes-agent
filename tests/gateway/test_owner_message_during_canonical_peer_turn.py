@@ -3313,6 +3313,47 @@ def test_an_unreadable_record_still_holds_the_ledger_evidence_it_settles_from(in
     assert (turns, left, _texts_sent(nxt)) == ([], [], [])
 
 
+def test_a_spool_that_cannot_be_listed_still_holds_the_ledger_evidence_its_records_settle_from(
+        ingress, send, monkeypatch):
+    """Review r6 (retention, listing faults): the spool directory cannot be listed while retention runs.
+    ``Path.glob`` answers that with no records at all, which is not the same as an empty spool: retention
+    must prune nothing it cannot rule out, or the delivered answer is owed again once the directory reads
+    again."""
+    import os
+    from pathlib import Path
+
+    if os.geteuid() == 0:
+        pytest.skip("root lists any directory")
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    _persisting_agents(monkeypatch)
+    unlink = Path.unlink
+
+    def refused(path, *args, **kwargs):
+        if path.name.startswith("inbound-"):
+            raise OSError("spool temporarily unavailable")
+        return unlink(path, *args, **kwargs)
+
+    async def exercise():
+        await h.warm()
+        monkeypatch.setattr(Path, "unlink", refused)
+        await h.adapter.handle_message(h.owner_event())
+        await h.settle()
+    asyncio.run(exercise())
+    monkeypatch.setattr(Path, "unlink", unlink)
+    assert len(_records(ingress)) == 1
+    assert [text for _chat, text in h.owner_replies() if _TERMINAL in text]
+    spool = ingress.home / "pending_messages"
+    mode = spool.stat().st_mode & 0o777
+    spool.chmod(0)
+    try:
+        _retention_after(8)
+    finally:
+        spool.chmod(mode)
+    nxt = _next_process(ingress, send, monkeypatch, crashed=True)
+    turns, _inputs, _chats, left = _answered(ingress, nxt)
+    assert (turns, left, _texts_sent(nxt)) == ([], [], [])
+
+
 def test_store_partial_delivery_interruption_restart_recovery_and_cleanup(ingress, send, monkeypatch, tmp_path):
     """End-to-end acceptance. An owner message's answer is text and a PDF. Its components are stored
     before the first send; the text is delivered; while the PDF is on its way the process is killed. The
