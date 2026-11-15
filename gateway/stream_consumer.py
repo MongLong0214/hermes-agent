@@ -970,6 +970,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """Hide MEDIA:<path> / [[audio_as_voice]] directives; media is delivered post-stream."""
         return _BasePlatformAdapter.strip_media_directives_for_display(text)
 
+    def show_owner_reply_text(self) -> None:
+        """This consumer streams an owner message's reply (gateway/run_turn.py): it is shown without the
+        spans of the one parse its attachments come from, as the reply's other lanes show it
+        (``_owed_display_text``). Every other reply keeps ``_clean_for_display``."""
+        self._clean_for_display = _BasePlatformAdapter._owed_display_text
+
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
 # Names external plugins imported from this module before the Sep 2026 decomposition.

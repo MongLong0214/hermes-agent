@@ -414,9 +414,10 @@ class GatewayNotificationsMixin:
         metadata: Optional[Dict[str, Any]] = None, event_message_id: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
-        acp_admission: Any = None,
+        acp_admission: Any = None, owner_reply: bool = False,
     ) -> bool:
-        """Deliver a queued response using the normal text+attachment split.
+        """Deliver a queued response using the normal text+attachment split (an owner message's reply,
+        *owner_reply*: its text as its other lanes show it, ``_strip_response_attachments_for_direct_send``).
 
         ``session_key`` lets the text send record a delivery-ledger obligation like the normal final
         send does, keyed on ``inbound_message_id`` (the raw inbound id, distinct from the
@@ -430,7 +431,7 @@ class GatewayNotificationsMixin:
         DECLINE returns True: that destination is not approved and must not be re-sent."""
         from gateway.run import _strip_response_attachments_for_direct_send
         if not text_already_delivered:
-            text_content = _strip_response_attachments_for_direct_send(response, adapter)
+            text_content = _strip_response_attachments_for_direct_send(response, adapter, owner_reply=owner_reply)
             if text_content:
                 # Reconcile-by-edit first: a stream-sealed message already carries most of the answer;
                 # a plain send here would duplicate it.

@@ -3694,8 +3694,8 @@ class BasePlatformAdapter(ABC):
         *ambiguous*: declared under the rest of its line, and refused by its send
         (``_snapshot_owed_attachment``). A tag in fenced code, a quote or a JSON string
         value is an example, a relative path names nothing: neither is a declaration. The reply's text is the
-        same parse's (``_owed_text``), as is every streamed and queued text (``strip_media_directives_for_display``,
-        gateway/run.py); ``extract_media`` still decides what other replies send, and what their final shows."""
+        same parse's (``_owed_text``), as are its streamed and queued texts (``_owed_display_text``,
+        gateway/run.py); ``extract_media`` still decides what other replies send and show."""
         has_voice_tag = "[[audio_as_voice]]" in content
         declared: Dict[str, Tuple[bool, bool]] = {}
         for _start, _end, path, ambiguous in _media_declarations(content):
@@ -3719,10 +3719,18 @@ class BasePlatformAdapter(ABC):
 
     @staticmethod
     def strip_media_directives_for_display(text: str) -> str:
-        """Strip MEDIA: directives from streamed/display text: the text an owner message's reply shows
-        (``_owed_text``), from the one parse its attachments come from (``_media_declarations``), so the
-        streamed lane shows what the adapter's final, the queued first response and a later start show.
-        Every declaration's span goes, whether or not its file is there or the policy allows it."""
+        """Strip MEDIA: directives from streamed/display text. Known-extension tags are
+        removed unconditionally (as ``MEDIA_TAG_CLEANUP_RE``); extension-less tags only when
+        ``validate_media_delivery_path`` accepts the path, so undeliverable paths stay visible."""
+        if not _has_media_directives(text):
+            return text
+        return re.sub(r'\n{3,}', '\n\n', _strip_media_tag_directives(text)).rstrip()
+
+    @staticmethod
+    def _owed_display_text(text: str) -> str:
+        """``strip_media_directives_for_display`` for an owner message's streamed reply: the text of the one
+        parse its attachments come from (``_owed_text``), as its other lanes show it, so every declaration's
+        span goes whether or not its file is there or the policy allows it. Any other reply keeps the old."""
         if not text or not _has_media_directives(text):
             return text
         return re.sub(r'\n{3,}', '\n\n', BasePlatformAdapter._owed_text(text)).rstrip()

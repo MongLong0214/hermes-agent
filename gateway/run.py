@@ -2831,18 +2831,21 @@ def _is_control_interrupt_message(message: Optional[str]) -> bool:
     return " ".join(str(message).strip().split()).lower() in _CONTROL_INTERRUPT_MESSAGES
 
 
-def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:
+def _strip_response_attachments_for_direct_send(response: str, adapter, *, owner_reply: bool = False) -> str:
     """Return the visible text portion of a response before direct send().
-    Only explicit ``MEDIA:`` declarations are stripped, by the one parse an owner message's reply owes its
-    attachments from (``BasePlatformAdapter._owed_text`` / ``declared_media``), so the queued first response
-    shows what the adapter's final and a later start show; bare paths/URLs stay visible. *adapter* is kept
-    for the callers' signature.
+    Only explicit ``MEDIA:`` attachments are stripped; bare paths/URLs stay visible. No broad regex after
+    ``extract_media()``: it deliberately preserves protected code spans and unvalidated tags. An owner
+    message's reply (*owner_reply*) is shown as its other lanes show it: without the spans of the one parse
+    its attachments come from (``BasePlatformAdapter._owed_text``).
 
     Queued follow-up resends only replay explicit ``MEDIA:`` attachments in this path. Keep bare local paths
     and ordinary image URLs visible because the post-stream uploader intentionally ignores them (#20834).
     """
-    from gateway.platforms.base import BasePlatformAdapter
-    return BasePlatformAdapter._owed_text(response).strip()
+    if owner_reply:
+        from gateway.platforms.base import BasePlatformAdapter
+        return BasePlatformAdapter._owed_text(response).strip()
+    _, cleaned = adapter.extract_media(response)
+    return cleaned.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "").strip()
 
 
 def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None]:

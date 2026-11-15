@@ -3699,8 +3699,8 @@ def test_a_declaration_is_parsed_by_the_tag_grammar_alone(tmp_path, on_disk, rep
     extension ends at that extension, any other where the tag does; when its line goes on after that
     (before the next ``MEDIA:``) with more than closing punctuation, the tag could also name a longer path
     with spaces, so it is ambiguous: declared under the rest of its line, and refused by its send. A
-    relative path is no declaration. The slice A4 review, P2: the text every lane shows (the streamed
-    display, the queued first response) is the same parse's."""
+    relative path is no declaration. The slice A4 review, P2: the text an owner message's reply shows in
+    every lane (the streamed display, the queued first response) is the same parse's."""
     from gateway.platforms.base import BasePlatformAdapter
     from gateway.run import _strip_response_attachments_for_direct_send
 
@@ -3715,8 +3715,27 @@ def test_a_declaration_is_parsed_by_the_tag_grammar_alone(tmp_path, on_disk, rep
     assert [path for path, _voice, *_rest in declared] == [p.format(d=d) for p in paths]
     assert [bool(rest and rest[0]) for _path, _voice, *rest in declared] == ambiguous
     shown = BasePlatformAdapter._owed_text(text)
-    assert BasePlatformAdapter.strip_media_directives_for_display(text) == shown
-    assert _strip_response_attachments_for_direct_send(text, BasePlatformAdapter) == shown
+    assert BasePlatformAdapter._owed_display_text(text) == shown
+    assert _strip_response_attachments_for_direct_send(text, BasePlatformAdapter, owner_reply=True) == shown
+
+
+def test_only_an_owner_messages_reply_is_shown_by_the_parse_its_attachments_come_from(tmp_path):
+    """The slice A4 review, P2, bounded: an inline-code tag whose file is not there, in the queued first
+    response and the streamed final. An owner message's reply shows the text of the parse its attachments
+    come from, without the tag; any other reply keeps its old display, where an undeliverable tag in
+    inline code is an example and stays visible (#16434)."""
+    from gateway.platforms.base import BasePlatformAdapter
+    from gateway.run import _strip_response_attachments_for_direct_send
+    from gateway.stream_consumer import GatewayStreamConsumer
+
+    reply = f"{_TERMINAL}\n`MEDIA:{tmp_path / 'report with spaces.log'}`"
+    other, owner = GatewayStreamConsumer(adapter=None, chat_id="c"), GatewayStreamConsumer(adapter=None, chat_id="c")
+    owner.show_owner_reply_text()
+    assert (other._clean_for_display(reply), _strip_response_attachments_for_direct_send(reply, BasePlatformAdapter)
+            ) == (reply, reply)
+    assert (owner._clean_for_display(reply),
+            _strip_response_attachments_for_direct_send(reply, BasePlatformAdapter, owner_reply=True)
+            ) == (BasePlatformAdapter._owed_text(reply), _TERMINAL)
 
 
 @pytest.mark.parametrize("state", ["missing", "blocked"])

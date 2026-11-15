@@ -2324,14 +2324,14 @@ class GatewayTurnMixin:
         return BasePlatformAdapter.extract_local_files(_strip_media_directives(text).strip())[1]
 
     @staticmethod
-    def _acp_queued_send_text(text: Any) -> Any:
+    def _acp_queued_send_text(text: Any, *, owner_reply: bool = False) -> Any:
         """The text the queued first-response send leaves: that send strips only explicit ``MEDIA:``
         attachments and keeps image references and bare file paths visible, so they are its text."""
         from gateway.platforms.base import BasePlatformAdapter
         from gateway.run import _strip_response_attachments_for_direct_send
         if not isinstance(text, str):
             return text
-        return _strip_response_attachments_for_direct_send(text, BasePlatformAdapter)
+        return _strip_response_attachments_for_direct_send(text, BasePlatformAdapter, owner_reply=owner_reply)
 
     @classmethod
     def _acp_is_model_answer(cls, agent_result: Any, sent_text: Optional[Callable[[Any], Any]] = None) -> bool:
@@ -2362,13 +2362,16 @@ class GatewayTurnMixin:
         return all(cls._acp_is_answer_text(sent_text(agent_result.get(key)))
                    for key in ("answer_origin", "answer_body", "final_response"))
 
-    async def _acp_first_response_admission(self, turn_ctx: Any, delivery_result: Any) -> Any:
+    async def _acp_first_response_admission(self, turn_ctx: Any, delivery_result: Any, *,
+                                            owner_reply: bool = False) -> Any:
         """The admission the queued first response may carry: the managed turn's, only when that
-        response is its model answer. Otherwise the notice goes out ordinarily and the receipt is
-        settled as a failed turn (the admission stays on turn_ctx for the follow-up's start record)."""
+        response (an owner message's, *owner_reply*, stripped as its send strips it) is its model answer.
+        Otherwise the notice goes out ordinarily and the receipt is settled as a failed turn (the
+        admission stays on turn_ctx for the follow-up's start record)."""
         from gateway import acp_managed_ingress
         admission = getattr(turn_ctx, "acp_admission", None)
-        if admission is None or self._acp_is_model_answer(delivery_result, self._acp_queued_send_text):
+        if admission is None or self._acp_is_model_answer(
+                delivery_result, lambda text: self._acp_queued_send_text(text, owner_reply=owner_reply)):
             return admission
         with suppress(Exception):
             await asyncio.to_thread(acp_managed_ingress.abort_failed_turn, admission)
@@ -3616,10 +3619,15 @@ class GatewayTurnMixin:
         except Exception as _stts_err:
             logger.debug("Could not set up streaming TTS consumer: %s", _stts_err)
 
-    async def _run_agent_stream_consumer_task(self, stream_consumer_holder: list) -> None:
-        """Wait (up to 10s) for the stream consumer to be created inside run_sync, then run it."""
+    async def _run_agent_stream_consumer_task(self, stream_consumer_holder: list,
+                                              answer_ref: Optional[str] = None) -> None:
+        """Wait (up to 10s) for the stream consumer to be created inside run_sync, then run it. The reply
+        it streams to an owner message (*answer_ref*, ``_owes_tracked_reply``) is shown as its other lanes
+        show it."""
         for _ in range(200):
             if stream_consumer_holder[0] is not None:
+                if answer_ref and _owes_tracked_reply(stream_consumer_holder[0].adapter, answer_ref):
+                    stream_consumer_holder[0].show_owner_reply_text()
                 await stream_consumer_holder[0].run()
                 return
             await asyncio.sleep(0.05)
@@ -4131,7 +4139,7 @@ class GatewayTurnMixin:
                 _owed = await adapter.owe_explicit_reply(
                     turn_ctx.source, session_key, _row_ref,
                     first_response if _already_streamed
-                    else _strip_response_attachments_for_direct_send(first_response, adapter),
+                    else _strip_response_attachments_for_direct_send(first_response, adapter, owner_reply=True),
                     first_response, attachments=_deliver_media)
             if _owed is not None and _owed.withheld:
                 # Its components could not be stored: nothing of it is sent (delivery_ledger.
@@ -4149,7 +4157,9 @@ class GatewayTurnMixin:
                         # the raw inbound id (the anchor above is only the reply target).
                         session_key=session_key,
                         inbound_message_id=f"inbound:{_row_ref}" if _row_ref else turn_ctx.inbound_message_id,
-                        acp_admission=await self._acp_first_response_admission(turn_ctx, _delivery_result),
+                        acp_admission=await self._acp_first_response_admission(
+                            turn_ctx, _delivery_result, owner_reply=_owed is not None),
+                        owner_reply=_owed is not None,
                     )
                 except Exception as e:
                     logger.warning("Failed to send first response before queued message: %s", e)
@@ -4739,7 +4749,9 @@ class GatewayTurnMixin:
         progress_task = spawn(turn_runner.send_progress_messages()) if disp.needs_progress_queue else None
         log_task = spawn(self._run_agent_write_tool_log(disp.log_queue)) if disp.log_mode_enabled else None
         # The stream consumer is created inside run_sync; this task polls for it.
-        stream_task = spawn(self._run_agent_stream_consumer_task(turn_ctx.stream_consumer_holder))
+        stream_task = spawn(self._run_agent_stream_consumer_task(
+            turn_ctx.stream_consumer_holder,
+            _inbound_answer_ref_of(getattr(turn_ctx, "persist_user_display_metadata", None))))
         tracking_task = spawn(self._run_agent_track_agent(turn_ctx))
         _interrupt_detected = asyncio.Event()  # shared with backup check
         interrupt_monitor = spawn(self._run_agent_monitor_for_interrupt(turn_ctx, _interrupt_detected))
