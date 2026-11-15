@@ -10,11 +10,12 @@ generations, routing, delegations, delivery obligations, state_meta. What upstre
 leaves the store with a stated reason (``converted``), column by column. Work this build accepted and
 has not finished (a queued or started admission, a registered or running worker) has no representation
 in the fork, so the export refuses rather than drop it. A terminal admission is input, not bookkeeping:
-one that ran must find its input in the kept rows (its text as a user message of its sessions, quoted context
-inside it, client-supplied history as the kept messages before it), and one that never ran (cancelled) exists
-nowhere else; every other leaf of its payload, at every depth, has a rule, and data only the admission holds
-(media, platform payloads) refuses while set. So does any object, column or value this module has no rule for,
-and a session whose created_source is set and differs from its source (the fork finds sessions by source).
+one that ran must find its input in the kept rows (its text as a user message of its sessions, client-supplied
+history as the kept messages before it), and one that never ran (cancelled) exists nowhere else. Every key of its
+payload, at every depth, is on an allowlist of lossless mappings; a key no kept row holds returns only while it
+carries nothing, and a key or shape the list lacks refuses with its path. So does any object, column or value this
+module has no rule for, and a session this build's lookups (its label aliases) find under other labels than the
+fork's, which filter on sessions.source alone.
 
 Loss is measured, not assumed: after the conversion every kept table is compared row by row against
 the source on every column the result has, every removed table, column and state_meta key is counted
@@ -24,8 +25,10 @@ Paths are checked before anything is written: the output and the report are new 
 be, alias or link to the source, each other or any of their SQLite files. Working copies live in
 directories created for this run alone and are removed on any exit; the output is published with an
 exclusive link, so a file that appears there meanwhile is never replaced. The source is read again before
-publishing and once more after, when nothing is left to do; a change then (or any failure after publishing)
-takes the output back, and only while it is still the file this run linked.
+publishing and once more after; a change then (or any failure or cancel before the commit point) takes the output
+back, and only while it is still the file this run linked. The commit point is the exclusive link of the output's
+commit marker (OUTPUT.fork-return, naming its bytes): only an output whose marker verifies is a return
+(``--verify``), and nothing is taken back once it is linked.
 
 Copying the canonical tables into a fresh fork schema, as the fork's own ``sessions recover`` does, is
 ruled out: it leaves the authorities, their events, turn leases and conversation generations behind
@@ -33,11 +36,13 @@ and still reports no loss. This build's tables are removed rather than kept besi
 the fork writes with foreign keys on, and their RESTRICT keys to sessions would refuse its deletes.
 
     python -m hermes_state_fork_return SOURCE OUTPUT [--work-dir DIR] [--report PATH]
+    python -m hermes_state_fork_return --verify OUTPUT
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import os
@@ -177,7 +182,7 @@ _RUNTIME_COLUMNS = {
         "request_id": _RETRY, "principal_id": _RETRY, "payload_digest": _RETRY,
         "target_session_id": "the kept session the input was matched in",
         "lineage_json": "the kept sessions the input was matched in",
-        "payload_json": "the input and what it ran under: every leaf has a rule, its text a kept user message",
+        "payload_json": "the input and what it ran under: every key a lossless mapping into kept rows, or nothing",
         "intent": "queue, steer or redirect of input that already ran",
         "status": "terminal", "outcome": "how the run ended; the run's transcript is kept",
         "owner_epoch": _FENCE, "generation": _FENCE,
@@ -219,7 +224,7 @@ _COLUMNS = {
         "runtime_revision": "this build's runtime CAS counter; no unfinished worker reads it",
         "runtime_generation": "this build's runtime generation; no unfinished worker reads it",
         "transcript_revision": "cache key this build derives from message writes",
-        "created_source": "creation label; on every row unset or equal to source, which is kept",
+        "created_source": "creation label: unset or equal to source, and found under the same labels by the fork",
         "auto_archived": "sweep provenance of archived; archived is kept",
     },
 }
@@ -237,6 +242,57 @@ _TRIGGERS = (
     "sessions_runtime_ledger_delete_guard",
 )
 _INDEXES = ("idx_messages_session_uid", "idx_sessions_local_created_started")
+# Every rule in this module is for this pair: this build's settled store, the fork's schema and its build. Either
+# side at another version refuses until the rules are written for it.
+_RULES = {"source_schema_version": 1033, "target_schema_version": 1030, "fork_build": "420c58a13e"}
+
+
+# ── Session labels: the same sessions must be found under every label by this build's lookups and the fork's ──
+#
+# This build's listings, search and counts (hermes_cli.gateway_session_store.SurfaceLabelReader) expand a requested
+# label through its alias table, gateway.session_policy.SURFACE_GROUPS: ``gui`` and ``desktop`` name one
+# conversation, and a ``source='local'`` row is found under the group of its created_source. The fork filters on
+# sessions.source alone (``s.source IN (...)``). scripts/review_kit_fork_return.sh measures both, with the real
+# binaries, for every label below.
+
+def lookup_labels() -> list:
+    """Every label this build's session lookups resolve through its alias table, and ``local``."""
+    from gateway.session_policy import SURFACE_GROUPS, SURFACES
+
+    return sorted(set(SURFACE_GROUPS) | set(SURFACES) | set(SURFACES.values()) | {"local"})
+
+
+def label_lookups(source, created_source) -> tuple:
+    """``(labels this build's lookups find a session under, labels the fork's find it under)``."""
+    from gateway.session_policy import SURFACE_GROUPS
+
+    found = {label for label, group in SURFACE_GROUPS.items()
+             if (created_source if source == "local" else source) in group}
+    if source is not None and source not in SURFACE_GROUPS:
+        found.add(source)  # a label outside the alias table is a plain ``source = ?`` filter on both sides
+    return sorted(found), [] if source is None else [source]
+
+
+def _plan_labels(conn, inventory: dict, refused: list) -> list:
+    """Each (source, created_source) pair the sessions hold, with the labels each side's lookups find it under; a
+    pair the two find under different labels refuses: the session would leave or join a listing on return."""
+    if "sessions" not in inventory["tables"]:
+        return []
+    created = "created_source" if "created_source" in inventory["tables"]["sessions"]["columns"] else "NULL"
+    labels = []
+    for source, created_source, count, ids in conn.execute(
+            f"SELECT source, {created}, count(*), json_group_array(id) FROM (SELECT * FROM sessions ORDER BY rowid) "
+            "GROUP BY 1, 2 ORDER BY 1, 2").fetchall():
+        this_build, fork = label_lookups(source, created_source)
+        labels.append({"source": source, "created_source": created_source, "sessions": count,
+                       "this_build_finds_under": this_build, "the_fork_finds_under": fork})
+        if this_build != fork:
+            shown = json.loads(ids)
+            refused.append(f"lossless return impossible: sessions with source={source!r}, created_source="
+                           f"{created_source!r} are found under {this_build} by this build's lookups and under {fork} "
+                           f"by the fork's: {count} rows: {', '.join(map(str, shown[:10]))}"
+                           f"{' ...' if count > 10 else ''}")
+    return labels
 
 
 def _meta_keys() -> dict:
@@ -315,60 +371,78 @@ def _non_default_rows(conn, table: str, column: str, default) -> int:
     return conn.execute(f"SELECT count(*) FROM {_q(table)} WHERE {differs}").fetchone()[0]
 
 
-# ── Finished admissions: every leaf of the payload has a rule, checked against the rows the output keeps ──
+# ── Finished admissions: an allowlist of lossless mappings, checked against the rows the output keeps ──
 #
-# A finished admission's payload is the turn's input and what the turn ran under. Every key, at every depth, has
-# one rule; a key outside its level's table, or a value of another shape, refuses as having no rule:
-_ROW = ("the turn's input: the user row it stored is it (exactly its text, or with the platform's message id "
-        "and the text inside)")
-_INSIDE = "quoted context the turn wrote into its user row: it must be inside that row"
+# A finished admission's payload is the turn's input and what the turn ran under, and this build reads it after the
+# run too (an API turn's terminal replay projects settings.ephemeral_system_prompt as its ``instructions``; a webhook
+# delivery is looked up by its source and webhook_delivery). So every key, at every depth, is listed with the one
+# mapping that carries it into the fork, and a key or shape the table does not list refuses with its exact path.
+# Only these mappings carry a set value; each is verified against the rows the output keeps:
 _PRIOR = "client-supplied history: each entry a kept message of its sessions before the input's row, in order"
-_HELD = "data only its admission holds (media bytes it keeps, platform payloads): it returns only while unset"
-_SPENT = ("a label or instruction of the finished run; this build reads it afterwards only to answer an exact "
-          "retry (retry_terminal_admission), and the fork keeps no admission ledger")
 _SHARE = "a re-run of an unanswered turn: it adopted its failed attempt's tail row instead of writing it again"
+# Every other listed key has no place in the fork's schema (it keeps no admission ledger). It returns only while it
+# carries nothing: unset (null, an empty list or object), or this build's own declared default for that field.
+_HELD = "no kept row holds it, and the fork has no place for it: it returns only while it carries nothing"
 # A gateway session's source (SessionSource.to_dict, plus is_bot) and the platform event it carried.
 _SOURCE = dict.fromkeys((
     "platform", "chat_id", "chat_name", "chat_type", "user_id", "user_name", "thread_id", "chat_topic", "user_id_alt",
     "chat_id_alt", "scope_id", "guild_id", "parent_chat_id", "message_id", "profile", "auto_thread_created",
-    "auto_thread_initial_name", "prospective_thread_id", "shared_session", "is_bot"), _SPENT)
-_EVENT = {
-    **dict.fromkeys(("user_id", "user_name", "platform_update_id", "reply_to_message_id", "reply_to_author_id",
-                     "reply_to_author_name", "reply_to_is_own_message", "allow_gateway_control", "auto_skill",
-                     "channel_prompt", "reply_expected", "reply_anchor_override", "edit_revision",
-                     "inherit_channel_pin"), _SPENT),
-    "message_id": _ROW, "reply_to_text": _INSIDE, "channel_context": _INSIDE,
-    **dict.fromkeys(("metadata", "media_types", "media_text_inlined", "media_filenames"), _HELD),
-}
+    "auto_thread_initial_name", "prospective_thread_id", "shared_session", "is_bot"), _HELD)
+_EVENT = dict.fromkeys((
+    "user_id", "user_name", "message_id", "platform_update_id", "reply_to_message_id", "reply_to_text",
+    "reply_to_author_id", "reply_to_author_name", "reply_to_is_own_message", "allow_gateway_control", "auto_skill",
+    "channel_prompt", "channel_context", "reply_expected", "reply_anchor_override", "edit_revision",
+    "inherit_channel_pin", "metadata", "media_types", "media_text_inlined", "media_filenames"), _HELD)
 _ENVELOPES = {
     "native_text_v1": {
-        "source": _SOURCE, "event": _EVENT, "media": _HELD,
-        **dict.fromkeys(("route", "timestamp", "webhook_delivery", "webhook_route", "reauthorize", "provenance",
-                         "message_type", "automation", "ingress_sha256"), _SPENT),
+        "source": _SOURCE, "event": _EVENT,
+        **dict.fromkeys(("media", "route", "timestamp", "webhook_delivery", "webhook_route", "reauthorize",
+                         "provenance", "message_type", "automation", "ingress_sha256"), _HELD),
     },
     "api_turn_v1": {
-        "history": _PRIOR, "media": _HELD, "resume_unanswered": _SHARE,
+        "history": _PRIOR, "resume_unanswered": _SHARE,
         "settings": dict.fromkeys((
             "ephemeral_system_prompt", "requested_model", "requested_provider", "model_options", "route",
             "session_model", "confirmed_runtime_lock", "requested_runtime", "route_source", "room_dispatch",
-            "room_execution_policy", "session_history_delivery"), _SPENT),
-        **dict.fromkeys(("turn_author", "run_owner_scope", "browser_control", "relay_metadata"), _SPENT),
+            "room_execution_policy", "session_history_delivery"), _HELD),
+        # Client JSON (the request body's ``metadata``) the turn handed to its agent: no key of it has a mapping.
+        "relay_metadata": {},
+        **dict.fromkeys(("media", "turn_author", "run_owner_scope", "browser_control"), _HELD),
     },
 }
+_NO_DEFAULT = object()
 
 
-def _unset(value) -> bool:
-    return value is None or value is False or value in ("", [], {})
+@functools.lru_cache(maxsize=1)
+def _declared_defaults() -> dict:
+    """This build's own defaults of the native source and event fields, by payload path: a value equal to one says
+    nothing the field's absence does not (``allow_gateway_control`` defaults to true, so false is data)."""
+    import dataclasses
+
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+
+    defaults = {}
+    for path, cls in (("native_text_v1.source", SessionSource), ("native_text_v1.event", MessageEvent)):
+        for field in dataclasses.fields(cls):
+            if field.default is not dataclasses.MISSING:
+                defaults[f"{path}.{field.name}"] = field.default
+            elif field.default_factory is not dataclasses.MISSING:
+                defaults[f"{path}.{field.name}"] = field.default_factory()
+    return defaults
+
+
+def _carries_nothing(at: str, value) -> bool:
+    if value is None or (isinstance(value, (list, dict)) and not value):
+        return True
+    default = _declared_defaults().get(at, _NO_DEFAULT)
+    return default is not _NO_DEFAULT and type(value) is type(default) and value == default
 
 
 def _fits(rule, value) -> bool:
     """Whether *value* has the shape *rule* reads; anything else has no rule."""
     if isinstance(rule, dict):
-        return isinstance(value, dict) or _unset(value)
-    if rule == _ROW:
-        return value is None or isinstance(value, (str, int)) and not isinstance(value, bool)
-    if rule == _INSIDE:
-        return value is None or isinstance(value, str)
+        return value is None or isinstance(value, dict)
     if rule == _SHARE:
         return value is True
     if rule == _PRIOR:
@@ -379,8 +453,8 @@ def _fits(rule, value) -> bool:
 
 
 def _walk(value: dict, rules: dict, path: str, found: dict) -> None:
-    """Sort every leaf of *value* under its rule into *found*: ``no_rule`` and ``held`` (paths), ``inside``
-    (path, string), ``prior`` (path, role, content), ``row`` (the platform message id) and ``share``."""
+    """Sort every leaf of *value* under its mapping into *found*: ``no_rule`` and ``held`` (paths), ``prior``
+    (path, role, content) and ``share``."""
     for key, item in value.items():
         at, rule = f"{path}.{key}", rules.get(key)
         if rule is None:
@@ -388,16 +462,11 @@ def _walk(value: dict, rules: dict, path: str, found: dict) -> None:
         elif not _fits(rule, item):
             found["no_rule"].append(f"{at} is not the shape its rule reads: {json.dumps(item, default=str)[:80]}")
         elif isinstance(rule, dict):
-            if isinstance(item, dict):
+            if item is not None:
                 _walk(item, rule, at, found)
         elif rule == _HELD:
-            if not _unset(item):
+            if not _carries_nothing(at, item):
                 found["held"].append(at)
-        elif rule == _INSIDE:
-            if item is not None:
-                found["inside"].append((at, item))
-        elif rule == _ROW:
-            found["row"] = None if item in (None, "") else str(item)
         elif rule == _SHARE:
             found["share"] = True
         elif rule == _PRIOR:
@@ -405,9 +474,9 @@ def _walk(value: dict, rules: dict, path: str, found: dict) -> None:
 
 
 def _admission_input(payload_json, target, lineage_json) -> tuple:
-    """``(kind, input, None)`` for an input every leaf of which has a rule, else ``(kind, None, why not)``. *input*
-    holds its sessions, text, platform message id, whether it may share a row, the strings that must be inside its
-    row, the history entries that must precede it, and the set leaves only its admission holds."""
+    """``(kind, input, None)`` for an input every leaf of which has a mapping, else ``(kind, None, why not)``.
+    *input* holds its sessions, text, whether it may share a row, the history entries that must precede it, and
+    the set leaves no kept row holds."""
     try:
         payload, lineage = json.loads(payload_json), json.loads(lineage_json)
     except (TypeError, ValueError):
@@ -420,7 +489,7 @@ def _admission_input(payload_json, target, lineage_json) -> tuple:
         return kind, None, "lineage is not a list of session ids"
     if not isinstance(payload.get("text"), str):
         return kind, None, f"its text is a {type(payload.get('text')).__name__}"
-    found = {"no_rule": [], "held": [], "inside": [], "prior": [], "row": None, "share": False}
+    found = {"no_rule": [], "held": [], "prior": [], "share": False}
     if extra:
         envelope = payload[extra[0]]
         if (len(extra) > 1 or extra[0] not in _ENVELOPES or not isinstance(envelope, dict)
@@ -433,19 +502,12 @@ def _admission_input(payload_json, target, lineage_json) -> tuple:
 
 
 def _admission_row(conn, match: dict, taken: set):
-    """The kept user row that is this input: in its sessions, with its platform message id and its text (and quoted
-    context) inside when the platform gave one, else exactly its text. Each row is one admission's, unless shared."""
-    sessions, text, platform_id = match["sessions"], match["text"], match["row"]
-    marks = ", ".join("?" * len(sessions))
-    inside = [value for _path, value in match["inside"]]
-    contains = "".join(" AND instr(content, ?) > 0" for _ in inside)
-    if platform_id is None:
-        sql, args = "typeof(content) = 'text' AND content = ?" + contains, (text, *inside)
-    else:
-        sql, args = ("CAST(platform_message_id AS TEXT) = ? AND typeof(content) = 'text' AND instr(content, ?) > 0"
-                     + contains, (platform_id, text, *inside))
-    hits = conn.execute(f"SELECT id FROM messages WHERE role = 'user' AND {sql} AND session_id IN ({marks}) "
-                        "ORDER BY id", (*args, *sessions)).fetchall()
+    """The kept user row that is this input: a user message of its sessions that is exactly its text. Each row is
+    one admission's, unless shared."""
+    sessions = match["sessions"]
+    hits = conn.execute(f"SELECT id FROM messages WHERE role = 'user' AND typeof(content) = 'text' AND content = ? "
+                        f"AND session_id IN ({', '.join('?' * len(sessions))}) ORDER BY id",
+                        (match["text"], *sessions)).fetchall()
     return next((mid for (mid,) in hits if match["share"] or mid not in taken), None)
 
 
@@ -481,8 +543,7 @@ def _plan_admissions(conn, refused: list) -> dict:
         elif match["held"]:
             lost.append(f"{admission_id} ({kind}, {outcome}; {', '.join(match['held'])} only its admission holds)")
         elif (row := _admission_row(conn, match, taken)) is None:
-            lost.append(f"{admission_id} ({kind}, {outcome}; no kept user message of its sessions is its input"
-                        + (" with its quoted context inside" if match["inside"] else "") + ")")
+            lost.append(f"{admission_id} ({kind}, {outcome}; no kept user message of its sessions is its input)")
         elif history := _unmatched_history(conn, match, row):
             lost.append(f"{admission_id} ({kind}, {outcome}; {history})")
         else:
@@ -612,6 +673,11 @@ def _plan_objects(inventory: dict, fences: list, gone: set, refused: list) -> di
 def _plan(conn, inventory: dict) -> dict:
     """Every source object's disposition, decided on the read-only source view; every refusal collected."""
     refused = []
+    built_for = (_RULES["source_schema_version"], _RULES["target_schema_version"])
+    if (fence.STORED_SCHEMA_VERSION, FORK_STORED_SCHEMA_VERSION) != built_for:
+        refused.append(f"these conversion rules are for schema {built_for[0]} -> {built_for[1]} (fork "
+                       f"{_RULES['fork_build']}); this build stores {fence.STORED_SCHEMA_VERSION} and returns to "
+                       f"{FORK_STORED_SCHEMA_VERSION}")
     try:
         lineage = fence.decode_store_lineage(conn.cursor())
         fences = sorted(n.lower() for n in fence.owned_turn_fence_literals(conn.cursor()))
@@ -622,6 +688,7 @@ def _plan(conn, inventory: dict) -> dict:
         refused.append(f"source is {lineage.lineage} at schema_version {lineage.stored}; only this build's "
                        f"settled {fence.STORED_SCHEMA_VERSION} store returns to the fork")
     plan = _plan_tables(conn, inventory, lineage.stored if lineage else None, refused)
+    plan["labels"] = _plan_labels(conn, inventory, refused)
     gone = set(plan["drop_tables"])
     objects = _plan_objects(inventory, fences, gone, refused)
     keys = _meta_keys()
@@ -733,10 +800,20 @@ def _integrity(conn) -> list:
 # ── The entry point ──
 
 _SIDECARS = ("", "-wal", "-shm", "-journal")
+MARKER_SUFFIX = ".fork-return"  # OUTPUT + this: the commit marker (see verify_return)
+
+
+def _marker(output: Path) -> Path:
+    return _sidecar(output, MARKER_SUFFIX)
 
 
 def _bundle(path: Path) -> list:
     return [_sidecar(path, suffix) for suffix in _SIDECARS]
+
+
+def _output_files(path: Path) -> list:
+    """The output's SQLite files and its commit marker: all new files, none another path's."""
+    return [*_bundle(path), _marker(path)]
 
 
 def _same_path(a: Path, b: Path) -> bool:
@@ -762,7 +839,7 @@ def _directory(path, what: str) -> Path:
 def _new_path(path, what: str) -> Path:
     path = Path(path).expanduser()
     path = _directory(path.parent, f"the {what}'s directory") / path.name
-    for candidate in (_bundle(path) if what == "output" else [path]):
+    for candidate in (_output_files(path) if what == "output" else [path]):
         if os.path.lexists(candidate):
             raise ForkReturnError(f"refusing to overwrite {candidate}: the {what} must be a new file")
     return path
@@ -782,10 +859,10 @@ def _validated(source, output, work_dir, report_path) -> tuple:
         if what == "output" or path:
             path = _new_path(path, what)
             for owner, files in named.items():
-                if clash := next((f for f in files for p in (_bundle(path) if what == "output" else [path])
+                if clash := next((f for f in files for p in (_output_files(path) if what == "output" else [path])
                                   if _same_path(f, p)), None):
                     raise ForkReturnError(f"the {what} {path} would be {owner}'s file {clash}")
-            named[f"the {what}"] = _bundle(path) if what == "output" else [path]
+            named[f"the {what}"] = _output_files(path) if what == "output" else [path]
     output = named["the output"][0]
     report = named["the report"][0] if "the report" in named else None
     work = _directory(work_dir, "the work directory") if work_dir else output.parent
@@ -794,20 +871,21 @@ def _validated(source, output, work_dir, report_path) -> tuple:
     return source, output, work, report
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 22), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _source_state(source: Path) -> dict:
     """The source's bytes: a sha256 of the database and of each journal file it has."""
-    state = {}
-    for path in (source, _sidecar(source, "-wal"), _sidecar(source, "-journal")):
-        if path is source or path.exists():
-            digest = hashlib.sha256()
-            with open(path, "rb") as handle:
-                for chunk in iter(lambda: handle.read(1 << 22), b""):
-                    digest.update(chunk)
-            state[path.name] = digest.hexdigest()
-    return state
+    return {path.name: _sha256(path) for path in (source, _sidecar(source, "-wal"), _sidecar(source, "-journal"))
+            if path is source or path.exists()}
 
 
-_STAGED, _BUILDING = "source.db", "build.db"  # the only names this run creates, inside its own scratch
+_STAGED, _BUILDING, _MARKING = "source.db", "build.db", "marker.json"  # the only names this run creates, in its scratch
 
 
 def _scratch(parent: Path) -> Path:
@@ -817,7 +895,7 @@ def _scratch(parent: Path) -> Path:
 
 def _remove_scratch(directory: Path) -> Optional[str]:
     """Delete the files this run made in *directory*, then the directory if that empties it; never anything else."""
-    for name in (_STAGED, _BUILDING):
+    for name in (_STAGED, _BUILDING, _MARKING):
         for path in _bundle(directory / name):
             path.unlink(missing_ok=True)
     try:
@@ -902,40 +980,158 @@ def _retract(output: Path, identity: tuple, report: dict) -> None:
         pass  # durability of the removal only; the path's state is already what the report says
 
 
+# ── The commit point ──
+#
+# An export succeeded exactly when its commit marker, OUTPUT + MARKER_SUFFIX, exists and names OUTPUT's bytes. The
+# marker is linked once, exclusively, after the output is published and every check (the source read again
+# included) passed: that link is the commit point. Before it nothing the run left counts: an output without its
+# marker (a run killed after publishing it, or one whose retraction failed) is not a return, whatever any report
+# says. After it nothing is taken back: a cancel, or a report that cannot be written, leaves the committed output and
+# its marker. The report is written after the marker and is an account of the run, never the verdict. A consumer
+# runs verify_return (``--verify OUTPUT``) before the fork first opens OUTPUT: the fork's first write changes it.
+
+_MARKER_FORMAT = "hermes_state_fork_return/1"
+
+
+def _stage_marker(output: Path, record: dict) -> tuple:
+    """The marker's content, durable in a new private directory beside the output (so it links on the output's
+    filesystem): ``(directory, identity of the staged file)``."""
+    directory = _scratch(output.parent)
+    try:
+        fd = os.open(directory / _MARKING, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(record, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            st = os.fstat(handle.fileno())
+    except BaseException:
+        _remove_scratch(directory)
+        raise
+    return directory, (st.st_dev, st.st_ino)
+
+
+def verify_return(output) -> dict:
+    """The rule a consumer applies: *output* is a successful return only when its commit marker exists and names its
+    exact bytes, and no journal beside it holds more. Returns the marker's record; raises ForkReturnError with the
+    reason otherwise (no marker means the export never reached its commit point)."""
+    output = Path(output)
+    marker = _marker(output)
+    try:
+        fd = os.open(marker, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise ForkReturnError(f"{output} has no commit marker {marker} ({exc.strerror}): the export that made it did "
+                              "not reach its commit point") from exc
+    with os.fdopen(fd) as handle:
+        try:
+            record = json.load(handle)
+        except ValueError as exc:
+            raise ForkReturnError(f"the commit marker {marker} is not this tool's record: {exc}") from exc
+    if not isinstance(record, dict) or record.get("format") != _MARKER_FORMAT or record.get("output") != output.name:
+        raise ForkReturnError(f"the commit marker {marker} is not this tool's record for {output.name}")
+    for suffix in ("-wal", "-journal"):
+        if (journal := _sidecar(output, suffix)).exists() and (suffix == "-journal" or journal.stat().st_size):
+            raise ForkReturnError(f"{journal} exists: {output} has been opened for writing since it was committed")
+    try:
+        size, digest = output.stat().st_size, _sha256(output)
+    except OSError as exc:
+        raise ForkReturnError(f"{output} cannot be read: {exc}") from exc
+    if (size, digest) != (record.get("size"), record.get("sha256")):
+        raise ForkReturnError(f"{output} is not the file its commit marker names (sha256 {digest}, {size} bytes; the "
+                              f"marker names {record.get('sha256')}, {record.get('size')} bytes)")
+    return record
+
+
+def _stage_wal(source: Path, work: Path) -> tuple:
+    """``(staging directory or None, the file to read)``: a source whose WAL holds pages the main file lacks is read
+    through a private copy with them folded in, never folded into the source."""
+    if not (_sidecar(source, "-wal").exists() and _sidecar(source, "-wal").stat().st_size):
+        return None, source
+    stage = _scratch(work)
+    try:
+        view = stage / _STAGED
+        shutil.copyfile(source, view)
+        shutil.copyfile(_sidecar(source, "-wal"), _sidecar(view, "-wal"))
+        conn = sqlite3.connect(view, isolation_level=None)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("PRAGMA journal_mode=DELETE")
+        finally:
+            conn.close()
+    except BaseException:
+        _remove_scratch(stage)
+        raise
+    return stage, view
+
+
+def _record_build(report: dict, lineage, differences: dict, integrity: list) -> None:
+    report.update(
+        output_lineage={"lineage": lineage.lineage, "schema_version": lineage.stored,
+                        "fence_generations": sorted(lineage.fence_literals), "fork_store": lineage.migratable},
+        differences=differences, loss_detected=bool(differences), integrity_check=integrity)
+    if differences:
+        report["refused"].append(f"the output differs from the source: {sorted(differences)}")
+    if not lineage.migratable:
+        report["refused"].append("the output is not exactly the fork's fenced 1030 store")
+    if integrity != ["ok"]:
+        report["refused"].append(f"integrity_check: {integrity[:5]}")
+
+
+def _check_published(source: Path, before: dict, output: Path, identity: tuple, digest: str, report: dict) -> None:
+    """The last check before the commit point: the source is still the bytes this output was made from, and the
+    output path still holds the file this run linked, unwritten."""
+    if why := _verify_source(source, before, report):
+        report["refused"].append(why)
+    if not _ours(output, identity):
+        report["published"] = False
+        report["refused"].append(f"the output {output} was replaced or removed by another process")
+    elif _sha256(output) != digest:
+        report["refused"].append(f"the output {output} was written by another process after it was published")
+
+
+def _clean(report: dict, *directories) -> None:
+    for directory in directories:
+        if directory is not None and (left := _remove_scratch(directory)):
+            report.setdefault("scratch_left", []).append(left)
+
+
+def _final_report(report_file: Optional[Path], report: dict) -> None:
+    """Write the report once, last. Before the commit point a report that cannot be written fails the export;
+    after it the committed return stands and only its account is missing (``report_error``)."""
+    if not report_file:
+        return
+    try:
+        _write_report(report_file, report)
+    except ForkReturnError as error:
+        if not report["committed"]:
+            raise
+        report["report_error"] = str(error)
+
+
 def return_to_fork(source, output, *, work_dir=None, report_path=None) -> dict:
     """Write *source* (a settled 1033 store) to *output* as the live fork's fenced 1030 store; return the report.
 
-    The output is built and verified under a private name and published by one exclusive link only after every
-    check passed and the source was read again unchanged; after the scratch is removed the source is read once
-    more, and a change found then (or any failure after publishing) takes back the published output, only when it
-    is still the file this run linked. Raises ForkReturnRefused (carrying the report) when anything cannot be
-    carried or the source changed, ForkReturnError on unusable paths, ForkReturnResidual when a published output
-    could not be taken back; the report's ``published`` is the output path's state, ``succeeded`` the verdict."""
+    The output is built and verified under a private name, published by one exclusive link once every check passed
+    and the source was read again unchanged, then checked again (the source, and that the output path holds this
+    run's unchanged file) and committed by linking its marker. Any failure or cancel before the commit point takes
+    the published output back, only while it is still the file this run linked; none after it does. Raises
+    ForkReturnRefused (carrying the report) when anything cannot be carried or the source changed, ForkReturnError on
+    unusable paths, ForkReturnResidual when a published output could not be taken back. The report's ``committed``
+    (and ``succeeded``) is whether the marker is this run's, ``published`` the output path's state; a report that
+    cannot be written after the commit point is named in ``report_error``."""
     source, output, work, report_file = _validated(source, output, work_dir, report_path)
     try:
         before = _source_state(source)
     except OSError as exc:
         raise ForkReturnError(f"cannot read the source: {exc}") from exc
     wal_mode = _is_wal_file(source)
-    report = {"operation": "return_to_fork", "source": str(source), "output": str(output),
-              "target_schema_version": FORK_STORED_SCHEMA_VERSION, "published": False, "succeeded": False,
-              "refused": [], "source_unchanged": False}
-    stage = build = identity = pinned = None
+    marker = _marker(output)
+    report = {"operation": "return_to_fork", "source": str(source), "output": str(output), "marker": str(marker),
+              "rules": _RULES, "target_schema_version": FORK_STORED_SCHEMA_VERSION, "published": False,
+              "committed": False, "succeeded": False, "refused": [], "source_unchanged": False}
+    stage = build = identity = pinned = marking = marker_id = None
     reported = verified = False
     try:
-        view = source
-        if _sidecar(source, "-wal").exists() and _sidecar(source, "-wal").stat().st_size:
-            # The WAL holds pages the main file lacks: fold them into a private copy, never into the source.
-            stage = _scratch(work)
-            view = stage / _STAGED
-            shutil.copyfile(source, view)
-            shutil.copyfile(_sidecar(source, "-wal"), _sidecar(view, "-wal"))
-            conn = sqlite3.connect(view, isolation_level=None)
-            try:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                conn.execute("PRAGMA journal_mode=DELETE")
-            finally:
-                conn.close()
+        stage, view = _stage_wal(source, work)
         conn = sqlite3.connect(_ro_uri(view), uri=True, isolation_level=None)
         try:
             inventory = _inventory(conn)
@@ -943,7 +1139,7 @@ def return_to_fork(source, output, *, work_dir=None, report_path=None) -> dict:
         finally:
             conn.close()
         report.update(tables=plan["tables"], columns=plan["columns"], state_meta=plan["state_meta"],
-                      schema_objects=plan["objects"])
+                      schema_objects=plan["objects"], labels=plan["labels"])
         if plan["refused"]:
             report["refused"] = plan["refused"]
             raise ForkReturnRefused(report)
@@ -967,19 +1163,9 @@ def return_to_fork(source, output, *, work_dir=None, report_path=None) -> dict:
             conn.execute(f"PRAGMA journal_mode={'WAL' if wal_mode else 'DELETE'}")
         finally:
             conn.close()
-        report.update(
-            output_lineage={"lineage": lineage.lineage, "schema_version": lineage.stored,
-                            "fence_generations": sorted(lineage.fence_literals), "fork_store": lineage.migratable},
-            differences=differences, loss_detected=bool(differences), integrity_check=integrity)
-        if differences:
-            report["refused"].append(f"the output differs from the source: {sorted(differences)}")
-        if not lineage.migratable:
-            report["refused"].append("the output is not exactly the fork's fenced 1030 store")
-        if integrity != ["ok"]:
-            report["refused"].append(f"integrity_check: {integrity[:5]}")
+        _record_build(report, lineage, differences, integrity)
         # The staging copy is done with: removed before the source is read again, so that read is after it.
-        if stage is not None and (left := _remove_scratch(stage)):
-            report.setdefault("scratch_left", []).append(left)
+        _clean(report, stage)
         stage = None
         if why := _verify_source(source, before, report):
             report["refused"].append(why)
@@ -987,6 +1173,7 @@ def return_to_fork(source, output, *, work_dir=None, report_path=None) -> dict:
             raise ForkReturnRefused(report)
 
         # Publish: one exclusive link of the verified file, pinned open so its identity cannot be reused.
+        digest = _sha256(building)
         pinned = os.open(building, os.O_RDONLY)
         os.fsync(pinned)
         st = os.fstat(pinned)
@@ -996,26 +1183,29 @@ def return_to_fork(source, output, *, work_dir=None, report_path=None) -> dict:
             raise ForkReturnError(f"refusing to overwrite {output}: it appeared during the export") from exc
         identity, report["published"] = (st.st_dev, st.st_ino), True
         _fsync_directory(output.parent)
-        if left := _remove_scratch(build):
-            report.setdefault("scratch_left", []).append(left)
+        _clean(report, build)
         build = None
-        # Final verification, after the last step that touches anything: the source is still the bytes this
-        # output was made from, and the output path still holds the file this run linked.
-        if why := _verify_source(source, before, report):
-            report["refused"].append(why)
-        if not _ours(output, identity):
-            report["published"] = False
-            report["refused"].append(f"the output {output} was replaced or removed by another process")
+        _check_published(source, before, output, identity, digest, report)
         verified = True
         if report["refused"]:
             raise ForkReturnRefused(report)
-        report["succeeded"] = True
-        if report_file:
-            reported = True
-            _write_report(report_file, report)
+        marking, marker_id = _stage_marker(output, {
+            "format": _MARKER_FORMAT, "output": output.name, "size": st.st_size, "sha256": digest,
+            "source": str(source), "source_state": before, "rules": _RULES})
+        try:
+            os.link(marking / _MARKING, marker)  # the commit point
+        except FileExistsError as exc:
+            raise ForkReturnError(f"refusing to overwrite {marker}: it appeared during the export") from exc
+        report["committed"] = report["succeeded"] = True
+        _fsync_directory(output.parent)
         return report
-    except BaseException:
-        report["succeeded"] = False
+    except BaseException as exc:
+        if marker_id is not None and _ours(marker, marker_id):
+            # Past the commit point (the link may have landed just before the interruption): nothing is taken back.
+            report["committed"] = report["succeeded"] = True
+            report["after_commit"] = f"{type(exc).__name__}: {exc}"
+            raise
+        report["committed"] = report["succeeded"] = False
         if report["published"]:
             _retract(output, identity, report)
             if report.get("residual"):
@@ -1023,30 +1213,42 @@ def return_to_fork(source, output, *, work_dir=None, report_path=None) -> dict:
                     reported = True
                     try:
                         _write_report(report_file, report)
-                    except ForkReturnError as exc:  # the residual is what must reach the caller
-                        report["report_error"] = str(exc)
-                raise ForkReturnResidual(report)
+                    except ForkReturnError as error:  # the residual is what must reach the caller
+                        report["report_error"] = str(error)
+                raise ForkReturnResidual(report) from exc
         raise
     finally:
         if pinned is not None:
             os.close(pinned)
-        for directory in (stage, build):
-            if directory is not None and (left := _remove_scratch(directory)):
-                report.setdefault("scratch_left", []).append(left)
+        _clean(report, stage, build, marking)
         if not verified:
             _verify_source(source, before, report)  # what the report says is a real read, on every exit
-        if report_file and not reported:
-            _write_report(report_file, report)
+        if not reported:
+            _final_report(report_file, report)
 
 
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m hermes_state_fork_return",
                                      description="Return this build's state.db to the live fork's schema 1030.")
-    parser.add_argument("source", help="this build's state.db (schema_version 1033); never written")
-    parser.add_argument("output", help="new file for the fork's 1030 store; must not exist")
+    parser.add_argument("source", nargs="?", help="this build's state.db (schema_version 1033); never written")
+    parser.add_argument("output", nargs="?", help="new file for the fork's 1030 store; must not exist")
     parser.add_argument("--work-dir", help="where a WAL-bearing source is staged (default: the output's directory)")
     parser.add_argument("--report", help="write the JSON report here")
+    parser.add_argument("--verify", metavar="OUTPUT", help="exit 0 only when OUTPUT is a committed return: its "
+                        "commit marker names its exact bytes (check before the fork first opens it)")
     args = parser.parse_args(argv)
+    if args.verify:
+        if args.source or args.output or args.work_dir or args.report:
+            parser.error("--verify takes only OUTPUT")
+        try:
+            record = verify_return(args.verify)
+        except ForkReturnError as exc:
+            print(f"Not a committed return: {exc}", file=sys.stderr)
+            return 2
+        print(f"Committed return of {record['source']}: {args.verify} (sha256 {record['sha256']})")
+        return 0
+    if not (args.source and args.output):
+        parser.error("SOURCE and OUTPUT are required")
 
     def cancel(signum, _frame):
         raise SystemExit(128 + signum)  # a terminated export still removes its scratch and reports
@@ -1069,11 +1271,15 @@ def main(argv: Optional[list] = None) -> int:
     finally:
         signal.signal(signal.SIGTERM, previous)
     tables = report["tables"]
-    print(f"Returned to the fork's schema {FORK_STORED_SCHEMA_VERSION}: {report['output']}")
+    print(f"Returned to the fork's schema {FORK_STORED_SCHEMA_VERSION}: {report['output']} (committed: "
+          f"{report['marker']})")
     print(f"  tables preserved: {sum(v['disposition'] == 'preserved' for v in tables.values())}; converted: "
           + (", ".join(f"{k} ({v['rows']} rows)" for k, v in tables.items() if v["disposition"] == "converted")
              or "none"))
     print("  columns converted: " + ", ".join(f"{k} ({v['non_default_rows']} set)" for k, v in report["columns"].items()))
+    if report.get("report_error"):
+        print(f"The return is committed, but its report was not written: {report['report_error']}", file=sys.stderr)
+        return 4
     return 0
 
 

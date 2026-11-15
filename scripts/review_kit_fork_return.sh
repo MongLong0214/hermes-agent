@@ -12,10 +12,17 @@
 #    fork binary writes fork-era sessions, messages, a conversation boundary and an expired turn lease.
 # 2. this checkout: migrates it to 1033 and writes what this build writes (candidate_writes in that test
 #    module: a turn, a revoked and a reopened authority, a reclaimed lease, a run admission, a worker).
-# 3. this checkout: python -m hermes_state_fork_return SOURCE OUTPUT --report REPORT. Then lookups: every
-#    session label the store holds (source, created_source) and every surface name, looked up by this checkout's
-#    CLI reader on a copy of SOURCE and by the fork binary on a copy of OUTPUT (listings with and without archived
-#    rows, search, count, each session's own row): the same sessions must come back for every label.
+#    Then label probes: one new session per label of this checkout's alias table (lookup_labels), on a copy, each
+#    looked up under every label by this checkout's CLI reader; one session is added to SOURCE for every label the
+#    module returns (label_lookups equal on both sides).
+# 3. this checkout: python -m hermes_state_fork_return SOURCE OUTPUT --report REPORT, then --verify OUTPUT (the
+#    consumer's check: its commit marker names its bytes; a copy without the marker must fail it). Then lookups:
+#    every session label the store holds (source, created_source) and every alias-table label, looked up by this
+#    checkout's CLI reader on a copy of SOURCE and by the fork binary on a copy of OUTPUT (listings with and without
+#    archived rows, search, count, each session's own row): the same sessions must come back for every label. Then
+#    the fork binary's own probe sessions, one per label, on a copy of OUTPUT: for every label, the labels each
+#    side's real lookups find a probe under must be the ones label_lookups names, so the module returns exactly the
+#    labels both binaries find alike. A copy of SOURCE with a desktop/desktop session must refuse.
 # 4. fork binary, on a copy of OUTPUT in a fresh HOME: open, read, write a turn, reopen a revoked session,
 #    try the superseded lease holder, cross a conversation boundary; then a new process (restart) reads it
 #    all back, and the fork's `hermes sessions list` reads it.
@@ -226,11 +233,11 @@ from pathlib import Path
 from hermes_state import SessionDB
 MODE, DB, OUT = sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3])
 if MODE == "candidate":
-    from gateway.session_policy import SURFACES
+    from hermes_state_fork_return import lookup_labels
     conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
     held = {v for (v,) in conn.execute("SELECT source FROM sessions UNION SELECT created_source FROM sessions")}
     conn.close()
-    labels = sorted((held | set(SURFACES) | set(SURFACES.values()) | {"local"}) - {None})
+    labels = sorted((held | set(lookup_labels())) - {None})
 else:
     labels = json.loads(Path(sys.argv[4]).read_text())["labels"]
 db = SessionDB(db_path=DB)
@@ -268,6 +275,98 @@ from hermes_cli.main import main
 main()
 PY
 
+cat >"$W/steps/label_probe.py" <<'PY'
+"""label_probe.py MODE DB OUT [CANDIDATE_OUT]: a new session per label (MODE=candidate: this checkout's SessionDB and
+its alias-table labels; MODE=fork: the fork binary, the candidate's labels), then every label's listing and search
+through that side's own reader: the labels that find each probe session."""
+import json, sys
+from pathlib import Path
+from hermes_state import SessionDB
+MODE, DB, OUT = sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3])
+if MODE == "candidate":
+    from hermes_state_fork_return import lookup_labels
+    labels = sorted(set(lookup_labels()) | {"telegram"})
+else:
+    labels = json.loads(Path(sys.argv[4]).read_text())["labels"]
+db = SessionDB(db_path=DB)
+try:
+    for label in labels:
+        db.create_session(f"probe-{label}", source=label)
+        db.append_message(f"probe-{label}", role="user", content=f"probe under {label}")
+    reader = db
+    if MODE == "candidate":
+        from hermes_cli.gateway_session_store import SurfaceLabelReader
+        reader = SurfaceLabelReader(db)
+    probes = {f"probe-{label}": {"listed": [], "searched": []} for label in labels}
+    for label in labels:
+        for row in reader.list_sessions_rich(source=label, include_archived=True, limit=100000,
+                                             include_children=True, include_hidden=True):
+            if row["id"] in probes:
+                probes[row["id"]]["listed"].append(label)
+        for row in reader.search_sessions(source=label, limit=100000):
+            if row["id"] in probes:
+                probes[row["id"]]["searched"].append(label)
+    for probe, found in probes.items():
+        row = db.get_session(probe)
+        found.update(source=row.get("source"), created_source=row.get("created_source"))
+finally:
+    db.close()
+OUT.write_text(json.dumps({"labels": labels, "probes": probes}, sort_keys=True))
+print(f"  {MODE}: {len(labels)} probe sessions")
+PY
+
+cat >"$W/steps/label_sessions.py" <<'PY'
+"""label_sessions.py DB PROBES: on DB, one session for every probed label the module returns."""
+import json, sys
+from pathlib import Path
+from hermes_state import SessionDB
+from hermes_state_fork_return import label_lookups
+probes = json.loads(Path(sys.argv[2]).read_text())["probes"]
+returned = sorted(p["source"] for p in probes.values() if p["created_source"] in (None, p["source"])
+                  and label_lookups(p["source"], p["created_source"])[0] == [p["source"]]
+                  and label_lookups(p["source"], p["created_source"])[1] == [p["source"]])
+db = SessionDB(db_path=Path(sys.argv[1]))
+try:
+    for label in returned:
+        db.create_session(f"label-{label}", source=label)
+        db.append_message(f"label-{label}", role="user", content=f"kept under {label}")
+finally:
+    db.close()
+print("  a session for every label the module returns:", " ".join(returned))
+PY
+
+cat >"$W/steps/compare_probes.py" <<'PY'
+"""compare_probes.py CANDIDATE FORK: each side's measured lookups against label_lookups, for every probe label."""
+import json, sys
+from hermes_state_fork_return import label_lookups
+cand, fork = (json.load(open(p)) for p in sys.argv[1:3])
+bad = []
+for probe, c in sorted(cand["probes"].items()):
+    f = fork["probes"][probe]
+    this_build, the_fork = label_lookups(c["source"], c["created_source"])
+    for side, found, model in (("this build", c, this_build), ("the fork", f, the_fork)):
+        if sorted(found["listed"]) != model or sorted(found["searched"]) != model:
+            bad.append((side, probe, found["listed"], found["searched"], model))
+    returns = this_build == the_fork and c["created_source"] in (None, c["source"])
+    print(f"  {c['source']}/{c['created_source']}: this build finds it under {sorted(c['listed'])}, the fork under "
+          f"{sorted(f['listed'])} -> {'returned' if returns else 'refused'}")
+for b in bad:
+    print("  FAIL measured lookups differ from label_lookups:", json.dumps(b))
+sys.exit(1 if bad else 0)
+PY
+
+cat >"$W/steps/desktop_session.py" <<'PY'
+import sys
+from pathlib import Path
+from hermes_state import SessionDB
+db = SessionDB(db_path=Path(sys.argv[1]))
+try:
+    db.create_session("d1", source="desktop")
+    db.append_message("d1", role="user", content="made in the desktop app")
+finally:
+    db.close()
+PY
+
 sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 step() { echo; echo "== $*"; }
 
@@ -282,6 +381,10 @@ step "2. this build: migrate to 1033 and write"
 SRC=$W/candidate/state.db
 cp "$W/fork-era.db" "$SRC"
 run "$W/cand-home" "$CANDIDATE_PYTHON" "$REPO" "$W/steps/candidate.py" "$SRC"
+cp "$SRC" "$W/probe-source.db"
+run "$W/cand-home" "$CANDIDATE_PYTHON" "$REPO" "$W/steps/label_probe.py" candidate "$W/probe-source.db" \
+  "$W/probes-candidate.json"
+run "$W/cand-home" "$CANDIDATE_PYTHON" "$REPO" "$W/steps/label_sessions.py" "$SRC" "$W/probes-candidate.json"
 SRC_SHA=$(sha "$SRC")
 
 step "3. this build: the return"
@@ -301,10 +404,18 @@ print("  removed tables:", json.dumps({k: [v["disposition"], v["rows"]] for k, v
       if v["disposition"] != "preserved"}))
 print("  admission inputs:", json.dumps(r["tables"]["session_admissions"].get("inputs")))
 print("  creation labels:", json.dumps(r["columns"]["sessions.created_source"]))
-assert r["published"] and r["succeeded"] and not r["loss_detected"] and r["source_unchanged"] is True, "report"
+print("  labels:", " ".join(f"{e['source']}/{e['created_source']}" for e in r["labels"]))
+assert r["published"] and r["committed"] and r["succeeded"] and not r["loss_detected"], "report"
+assert r["source_unchanged"] is True, "source_unchanged"
 assert r["columns"]["sessions.created_source"]["condition_broken_rows"] == 0, "created_source"
 PY
 [ "$(sha "$SRC")" = "$SRC_SHA" ] && echo "  source bytes unchanged: $SRC_SHA" || { echo "  FAIL source changed"; exit 1; }
+run "$W/cand-home" "$CANDIDATE_PYTHON" "$REPO" "$W/steps/return.py" --verify "$W/out/state.db"
+mkdir "$W/unmarked" && cp "$W/out/state.db" "$W/unmarked/state.db"
+if run "$W/cand-home" "$CANDIDATE_PYTHON" "$REPO" "$W/steps/return.py" --verify "$W/unmarked/state.db"; then
+  echo "  FAIL an output without its commit marker verified"; exit 1
+fi
+echo "  an output without its commit marker does not verify"
 run "$W/cand-home" "$CANDIDATE_PYTHON" "$REPO" "$W/steps/compare_shape.py" "$W/fork-era.db" "$W/out/state.db"
 
 step "3b. lookups: this build on the source, the fork binary on the output, for every label"
@@ -335,6 +446,24 @@ print(f"  {len(cand['labels'])} labels x {kinds} lookups, {len(cand['rows'])} se
       + ("same" if not bad else f"{len(bad)} differ"))
 sys.exit(1 if bad else 0)
 PY
+
+step "3c. label probes: both binaries' own lookups against the module's, for every alias-table label"
+cp "$W/out/state.db" "$W/probe-output.db"
+run "$W/return-home" "$FORK_PYTHON" "$FORK_TREE" "$W/steps/label_probe.py" fork "$W/probe-output.db" \
+  "$W/probes-fork.json" "$W/probes-candidate.json"
+run "$W/cand-home" "$CANDIDATE_PYTHON" "$REPO" "$W/steps/compare_probes.py" "$W/probes-candidate.json" \
+  "$W/probes-fork.json"
+mkdir "$W/desktop" && cp "$SRC" "$W/desktop/state.db"
+run "$W/cand-home" "$CANDIDATE_PYTHON" "$REPO" "$W/steps/desktop_session.py" "$W/desktop/state.db"
+set +e
+run "$W/cand-home" "$CANDIDATE_PYTHON" "$REPO" "$W/steps/return.py" "$W/desktop/state.db" "$W/desktop/out.db" \
+  2>"$W/desktop/stderr"
+code=$?
+set -e
+grep -o "sessions with source='desktop'[^:]*" "$W/desktop/stderr" | sed 's/^/  refused: /' || true
+if [ "$code" != 2 ] || [ -e "$W/desktop/out.db" ] || ! grep -q "source='desktop'" "$W/desktop/stderr"; then
+  echo "  FAIL a desktop/desktop session did not refuse (exit $code)"; cat "$W/desktop/stderr"; exit 1
+fi
 
 step "4. fork binary on a copy of the output: open, read, write"
 RET_DB=$W/return-home/.hermes/state.db

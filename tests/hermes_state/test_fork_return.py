@@ -13,7 +13,10 @@ import json
 import os
 import signal
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -321,6 +324,8 @@ def test_returned_store_is_the_forks_own_shape_with_every_row(stores):
 
     report = json.loads(report_path.read_text())
     assert report["published"] and not report["loss_detected"] and report["source_unchanged"]
+    assert report["committed"] and report["succeeded"] and report["marker"] == f"{output}.fork-return"
+    assert fork_return.verify_return(output)["sha256"] == _sha(output)  # the consumer's check: a committed return
     assert report["output_lineage"] == {"lineage": "fenced", "schema_version": 1030,
                                         "fence_generations": [1030], "fork_store": True}
     assert _sha(source) == sha
@@ -442,7 +447,7 @@ def test_a_wal_bearing_source_is_read_through_a_copy(stores, tmp_path):
 
     assert {p: _sha(p) for p in shas} == shas and not Path(f"{crashed}-shm").exists()
     assert _rows(output, "SELECT value FROM state_meta WHERE key = 'only-in-the-wal'") == [("1",)]
-    assert sorted(p.name for p in output.parent.iterdir()) == ["state.db"]
+    assert sorted(p.name for p in output.parent.iterdir()) == ["state.db", "state.db.fork-return"]
 
 
 # ── Refusals: nothing is published and the source is untouched ──
@@ -453,6 +458,7 @@ def _assert_refused(source, output, match: str) -> dict:
         _export(source, output)
     assert _sha(source) == sha
     assert not output.exists() and not list(output.parent.glob(".*return*"))
+    assert not Path(f"{output}.fork-return").exists() and not caught.value.report.get("committed")
     assert not caught.value.report["published"] and caught.value.report["source_unchanged"] is True
     return caught.value.report
 
@@ -685,7 +691,7 @@ def test_scratch_never_takes_an_existing_path(stores, tmp_path):
 
     assert report["published"] and report["source_unchanged"] is True
     after = _snapshot(tmp_path)
-    assert after.pop("out/state.db")[0] == "file" and after == before
+    assert after.pop("out/state.db")[0] == after.pop("out/state.db.fork-return")[0] == "file" and after == before
 
 
 @pytest.mark.parametrize("stage", ["_plan", "_convert", "_compare"])
@@ -857,59 +863,106 @@ def native_payload(monkeypatch, tmp_path, text: str, message_id, **event_fields)
     return payload
 
 
-def api_payload(text, **fields) -> dict:
-    """An API admission payload as ``session_api_turn`` builds it."""
-    return {"text": text, "api_turn_v1": {"history": None, "settings": {"requested_model": "m"}, **fields}}
+def api_payload(text, settings=None, **fields) -> dict:
+    """An API admission payload as ``session_api_turn`` builds it (no settings unless given)."""
+    return {"text": text, "api_turn_v1": {"history": None, "settings": settings or {}, **fields}}
 
 
-# Finished inputs whose envelope has a rule, matched by the field the turn stores from it.
+# Finished inputs whose every key has a mapping, matched by the row the turn stored.
 _MATCHED = {
-    "native: its platform message id, the text inside the stored row": lambda db, native: run_input(
-        db, "s3", "r9", "hi there", transcript=True, payload=native("hi there", "m-7"),
-        stored="[voice message] hi there", platform_message_id="m-7"),
-    "native without a platform id: exactly its text": lambda db, native: run_input(
-        db, "s3", "r9", "an automation wake", transcript=True, payload=native("an automation wake", None)),
-    "api: exactly its text": lambda db, native: run_input(
+    "api: exactly its text": lambda db: run_input(
         db, "s3", "r9", "an api question", transcript=True, payload=api_payload("an api question")),
-    "api: a resumed unanswered turn adopts its failed attempt's row": lambda db, native: (
+    "api: a resumed unanswered turn adopts its failed attempt's row": lambda db: (
         run_input(db, "s3", "r8", "unanswered", transcript=True, outcome="failed", payload=api_payload("unanswered")),
         run_input(db, "s3", "r9", "unanswered", transcript=False,
                   payload=api_payload("unanswered", resume_unanswered=True))),
+    "api: settings and relay metadata that carry nothing": lambda db: run_input(
+        db, "s3", "r9", "an api question", transcript=True, payload=api_payload(
+            "an api question", {"ephemeral_system_prompt": None, "model_options": {}}, relay_metadata={})),
 }
 
 
 @pytest.mark.parametrize("case", list(_MATCHED))
-def test_a_finished_input_with_its_envelope_returns(stores, monkeypatch, tmp_path, case):
+def test_a_finished_input_with_its_envelope_returns(stores, case):
     source, _, output = stores
-    _runtime_write(source, lambda db: _MATCHED[case](
-        db, lambda text, mid: native_payload(monkeypatch, tmp_path, text, mid)))
+    _runtime_write(source, _MATCHED[case])
     report = _export(source, output)
     inputs = report["tables"]["session_admissions"]["inputs"]
-    assert report["published"] and inputs["lossless_return_impossible"] == inputs["no_rule"] == 0
+    assert report["committed"] and inputs["lossless_return_impossible"] == inputs["no_rule"] == 0
     assert inputs["matched_to_messages"] == len(_rows(source, "SELECT 1 FROM session_admissions"))
-    assert set(inputs["by_kind"]) == {"text", "api_turn_v1" if case.startswith("api") else "native_text_v1"}
+    assert set(inputs["by_kind"]) == {"text", "api_turn_v1"}
 
 
-_UNMATCHED = {
-    "native: its text, but in another message's row": lambda db, native: (
-        db.append_message("s3", role="user", content="hi there", platform_message_id="m-6"),
-        run_input(db, "s3", "r9", "hi there", transcript=False, payload=native("hi there", "m-7"))),
-    "native: its platform id, but its text withheld": lambda db, native: run_input(
-        db, "s3", "r9", "hi there", transcript=True, payload=native("hi there", "m-7"),
-        stored="[prompt withheld]", platform_message_id="m-7"),
-    "api: its text in no row": lambda db, native: run_input(
-        db, "s3", "r9", "an api question", transcript=False, payload=api_payload("an api question")),
-}
-
-
-@pytest.mark.parametrize("case", list(_UNMATCHED))
-def test_a_finished_input_with_its_envelope_but_no_row_refuses(stores, monkeypatch, tmp_path, case):
+def test_an_api_input_in_no_row_refuses(stores):
     source, _, output = stores
-    _runtime_write(source, lambda db: _UNMATCHED[case](
-        db, lambda text, mid: native_payload(monkeypatch, tmp_path, text, mid)))
-    report = _assert_refused(source, output, r"lossless return impossible: 1 session_admissions inputs")
-    kind = "api_turn_v1" if case.startswith("api") else "native_text_v1"
-    assert report["tables"]["session_admissions"]["inputs"]["by_kind"][kind]["lossless_return_impossible"] == 1
+    _runtime_write(source, lambda db: run_input(db, "s3", "r9", "an api question", transcript=False,
+                                                payload=api_payload("an api question")))
+    report = _assert_refused(source, output, r"lossless return impossible: 1 session_admissions inputs .*no kept "
+                                             r"user message of its sessions is its input")
+    assert report["tables"]["session_admissions"]["inputs"]["by_kind"]["api_turn_v1"]["lossless_return_impossible"] == 1
+
+
+def test_an_api_turns_instructions_are_data_its_terminal_replay_reads(stores):
+    """This build's terminal replay of a finished API turn projects settings.ephemeral_system_prompt as its
+    ``instructions``; the fork has no place for it, so the export refuses rather than drop it."""
+    from gateway.platforms.api_server_response_admissions import admitted_context
+    from hermes_state_runtime import get_session_admission
+
+    source, _, output = stores
+    _runtime_write(source, lambda db: _api_turn(
+        db, "responses:r9", "and now?", None, transcript=True,
+        settings={"ephemeral_system_prompt": "answer as the night shift zx3"}))
+    (admission_id,) = _rows(source, "SELECT admission_id FROM session_admissions WHERE request_id = 'responses:r9'")[0]
+    db = SessionDB(db_path=source)
+    try:
+        row = get_session_admission(db, admission_id=admission_id)
+    finally:
+        db.close()
+    assert row["status"] == "terminal"
+    assert admitted_context((None, SimpleNamespace(session_id="s3"), row))["instructions"] == (
+        "answer as the night shift zx3")
+    report = _assert_refused(source, output, r"lossless return impossible: 1 session_admissions inputs .*"
+                                             r"api_turn_v1.settings.ephemeral_system_prompt only its admission holds")
+    assert report["tables"]["session_admissions"]["inputs"]["by_kind"]["api_turn_v1"]["lossless_return_impossible"] == 1
+
+
+@pytest.mark.parametrize("metadata, match", [
+    ({"trace": {"span": "zx4", "baggage": {"k": "v"}}}, r"no rule for api_turn_v1.relay_metadata.trace"),
+    ({"client": "zx5"}, r"no rule for api_turn_v1.relay_metadata.client"),
+], ids=["a nested subtree", "a scalar"])
+def test_relay_metadata_has_no_mapping_and_refuses_at_its_path(stores, metadata, match):
+    source, _, output = stores
+    _runtime_write(source, lambda db: run_input(db, "s3", "r9", "q", transcript=True,
+                                                payload=api_payload("q", relay_metadata=metadata)))
+    report = _assert_refused(source, output, r"session_admissions rows no rule carries to the fork: .*" + match)
+    assert report["tables"]["session_admissions"]["inputs"]["no_rule"] == 1
+
+
+def test_a_native_turns_source_route_and_timestamp_have_no_place_in_the_fork(stores, monkeypatch, tmp_path):
+    """Its user row is kept with its platform message id, but the sender, route and time it carried are on no kept
+    row; this build's own defaults (is_bot, allow_gateway_control, reply_to_is_own_message) are not data."""
+    source, _, output = stores
+    _runtime_write(source, lambda db: run_input(
+        db, "s3", "r9", "hi there", transcript=True, platform_message_id="m-7",
+        payload=native_payload(monkeypatch, tmp_path, "hi there", "m-7")))
+    report = _assert_refused(source, output, r"lossless return impossible: 1 session_admissions inputs .*\(native_text_v1,"
+                                             r" completed; native_text_v1.event.message_id, native_text_v1.route, "
+                                             r"native_text_v1.source.chat_id, .*native_text_v1.source.platform, .*"
+                                             r"native_text_v1.timestamp only its admission holds\)")
+    held = "; ".join(report["refused"])
+    for default in ("source.is_bot", "event.allow_gateway_control", "event.reply_to_is_own_message", "source.thread_id"):
+        assert f"native_text_v1.{default}" not in held
+
+
+@pytest.mark.parametrize("value, data", [(True, False), (False, True)], ids=["its default", "not its default"])
+def test_only_a_declared_default_carries_nothing(stores, monkeypatch, tmp_path, value, data):
+    """``allow_gateway_control`` defaults to true: false is what the turn ran under, not an unset value."""
+    source, _, output = stores
+    _runtime_write(source, lambda db: run_input(
+        db, "s3", "r9", "hi", transcript=True, payload=native_payload(
+            monkeypatch, tmp_path, "hi", "m-7", allow_gateway_control=value)))
+    report = _assert_refused(source, output, r"lossless return impossible")
+    assert ("native_text_v1.event.allow_gateway_control" in "; ".join(report["refused"])) is data
 
 
 def _with_unknown_envelope_key(payload: dict, key: str) -> dict:
@@ -976,12 +1029,13 @@ def test_a_removed_tables_data_without_a_rule_refuses(stores, sql, match):
 
 # ── Every leaf of a finished payload: found in the kept rows, held nowhere but its admission, or refused ──
 
-def _api_turn(db, request_id: str, text: str, history, **kwargs) -> None:
+def _api_turn(db, request_id: str, text: str, history, settings=None, **kwargs) -> None:
     """An API turn as session_api_turn admits it, then settlement's own compaction (a Responses row keeps its
     history: its terminal replay rebuilds the previous_response_id snapshot from it)."""
     from gateway.session_api_media import compact_settled_api_payloads
 
-    run_input(db, "s3", request_id, text, principal="api", payload=api_payload(text, history=history), **kwargs)
+    run_input(db, "s3", request_id, text, principal="api", payload=api_payload(text, settings, history=history),
+              **kwargs)
     compact_settled_api_payloads(db)
 
 
@@ -1038,12 +1092,12 @@ def _nested(payload: dict, *path_and_value) -> dict:
 _HELD_ONLY_BY_ITS_ADMISSION = {
     "native media": (lambda native: _nested(native("hi", "m-7"), "native_text_v1", "media",
                                             [{"path": "native-inputs/ab", "sha256": "ab"}]),
-                     r"native_text_v1.media only its admission holds"),
+                     r"native_text_v1.media"),
     "native platform metadata": (lambda native: _nested(native("hi", "m-7"), "native_text_v1", "event", "metadata",
                                                         {"whatsapp_native_type": "locationMessage"}),
-                                 r"native_text_v1.event.metadata only its admission holds"),
+                                 r"native_text_v1.event.metadata"),
     "api media": (lambda native: _nested(api_payload("hi"), "api_turn_v1", "media", [{"sha256": "ab"}]),
-                  r"api_turn_v1.media only its admission holds"),
+                  r"api_turn_v1.media"),
 }
 
 
@@ -1054,24 +1108,8 @@ def test_data_only_its_admission_holds_refuses(stores, monkeypatch, tmp_path, ca
     _runtime_write(source, lambda db: run_input(
         db, "s3", "r9", "hi", transcript=True, platform_message_id="m-7",
         payload=make(lambda text, mid: native_payload(monkeypatch, tmp_path, text, mid))))
-    _assert_refused(source, output, r"lossless return impossible: 1 session_admissions inputs .*" + match)
-
-
-_QUOTED = '[Replying to: "the quoted line"]\n\nhi there'
-
-
-@pytest.mark.parametrize("stored, returns", [(_QUOTED, True), ("hi there", False)],
-                         ids=["inside its row", "in no kept row"])
-def test_quoted_context_must_be_inside_its_row(stores, monkeypatch, tmp_path, stored, returns):
-    source, _, output = stores
-    _runtime_write(source, lambda db: run_input(
-        db, "s3", "r9", "hi there", transcript=True, stored=stored, platform_message_id="m-7",
-        payload=native_payload(monkeypatch, tmp_path, "hi there", "m-7", reply_to_message_id="m-5",
-                               reply_to_text="the quoted line")))
-    if returns:
-        assert _export(source, output)["published"]
-    else:
-        _assert_refused(source, output, r"no kept user message of its sessions is its input with its quoted context")
+    _assert_refused(source, output, r"lossless return impossible: 1 session_admissions inputs .*" + match
+                    + r"(, [\w.]+)* only its admission holds")
 
 
 @pytest.mark.parametrize("make, match", [
@@ -1081,10 +1119,6 @@ def test_quoted_context_must_be_inside_its_row(stores, monkeypatch, tmp_path, st
      r"no rule for native_text_v1.source.later"),
     (lambda native: _nested(api_payload("hi"), "api_turn_v1", "settings", "later", 1),
      r"no rule for api_turn_v1.settings.later"),
-    (lambda native: _nested(native("hi", "m-7"), "native_text_v1", "event", "message_id", {"id": "m-7"}),
-     r"native_text_v1.event.message_id is not the shape its rule reads"),
-    (lambda native: _nested(native("hi", "m-7"), "native_text_v1", "event", "reply_to_text", 5),
-     r"native_text_v1.event.reply_to_text is not the shape its rule reads"),
     (lambda native: _nested(native("hi", "m-7"), "native_text_v1", "source", "a2a peer"),
      r"native_text_v1.source is not the shape its rule reads"),
     (lambda native: _nested(api_payload("hi"), "api_turn_v1", "resume_unanswered", "yes"),
@@ -1097,9 +1131,9 @@ def test_quoted_context_must_be_inside_its_row(stores, monkeypatch, tmp_path, st
     (lambda native: _nested(api_payload("hi"), "api_turn_v1", "history",
                             [{"role": "user", "content": [{"type": "text"}]}]),
      r"api_turn_v1.history is not the shape its rule reads"),
-], ids=["an unknown event field", "an unknown source field", "an unknown api setting", "a message id object",
-        "quoted context not text", "a source not an object", "a resume flag not true", "a history not a list",
-        "a history entry with more than role and content", "a multimodal history entry"])
+], ids=["an unknown event field", "an unknown source field", "an unknown api setting", "a source not an object",
+        "a resume flag not true", "a history not a list", "a history entry with more than role and content",
+        "a multimodal history entry"])
 def test_a_nested_leaf_no_rule_carries_refuses(stores, monkeypatch, tmp_path, make, match):
     source, _, output = stores
     _runtime_write(source, lambda db: run_input(
@@ -1109,12 +1143,88 @@ def test_a_nested_leaf_no_rule_carries_refuses(stores, monkeypatch, tmp_path, ma
     assert report["tables"]["session_admissions"]["inputs"]["no_rule"] == 1
 
 
-# ── created_source: the fork finds a session by its source alone ──
+# ── Session labels: found under the same labels by this build's lookups and the fork's ──
+
+# Every label this build's alias table (gateway.session_policy) resolves, and a platform outside it. The fork filters
+# on sessions.source alone; this build lists ``gui`` and ``desktop`` as one conversation, so a session under either
+# would leave or join a listing on return. The kit measures the fork side with the fork binary.
+_LABELS_RETURNED = ("acp", "cli", "local", "oneshot", "telegram", "tool", "tui")
+_LABELS_REFUSED = ("desktop", "gui")
+
+
+def _labelled(db, session_id: str, label: str) -> None:
+    db.create_session(session_id, source=label)
+    db.append_message(session_id, role="user", content=f"made under {label}")
+
+
+def test_every_label_of_the_alias_table_has_a_fixture():
+    assert set(fork_return.lookup_labels()) <= set(_LABELS_RETURNED + _LABELS_REFUSED)
+
+
+@pytest.mark.parametrize("label", _LABELS_RETURNED + _LABELS_REFUSED)
+def test_a_session_label_returns_only_when_both_sides_find_it_under_the_same_labels(stores, label):
+    source, _, output = stores
+    _runtime_write(source, lambda db: _labelled(db, "s4", label))
+    (created,) = _rows(source, "SELECT created_source FROM sessions WHERE id = 's4'")[0]
+    this_build, fork = fork_return.label_lookups(label, created)
+    if label in _LABELS_RETURNED:
+        report = _export(source, output)
+        assert report["committed"] and this_build == fork == [label]
+        assert [(e["this_build_finds_under"], e["the_fork_finds_under"]) for e in report["labels"]
+                if (e["source"], e["created_source"]) == (label, created)] == [([label], [label])]
+    else:
+        report = _assert_refused(source, output, rf"lossless return impossible: sessions with source='{label}', "
+                                                 rf"created_source='{created}' are found under \['desktop', 'gui'\] "
+                                                 rf"by this build's lookups and under \['{label}'\] by the fork's: "
+                                                 rf"1 rows: s4")
+        assert this_build == ["desktop", "gui"] and fork == [label]
+
+
+def test_a_desktop_session_this_builds_gui_listing_finds_refuses(stores):
+    """The counterexample: created through this build's SessionDB as desktop/desktop, its CLI reader finds it with
+    ``list_sessions_rich(source='gui')``; the fork's equivalent query returns nothing."""
+    from hermes_cli.gateway_session_store import SurfaceLabelReader
+
+    source, _, output = stores
+    _runtime_write(source, lambda db: _labelled(db, "d1", "desktop"))
+    assert _rows(source, "SELECT source, created_source FROM sessions WHERE id = 'd1'") == [("desktop", "desktop")]
+    db = SessionDB(db_path=source)
+    try:
+        assert [r["id"] for r in SurfaceLabelReader(db).list_sessions_rich(source="gui", limit=100)] == ["d1"]
+    finally:
+        db.close()
+    _assert_refused(source, output, r"sessions with source='desktop', created_source='desktop' are found under "
+                                    r"\['desktop', 'gui'\] by this build's lookups and under \['desktop'\]")
+
+
+def test_label_lookups_are_what_this_builds_reader_finds(stores):
+    """The module's account of this build's lookups is this build's reader: for one session per label, the labels
+    whose listing and search find it are the ones label_lookups names."""
+    from hermes_cli.gateway_session_store import SurfaceLabelReader
+
+    source, _, _ = stores
+    labels = sorted(set(_LABELS_RETURNED + _LABELS_REFUSED))
+    _runtime_write(source, lambda db: [_labelled(db, f"probe-{label}", label) for label in labels])
+    db = SessionDB(db_path=source)
+    try:
+        reader, finds = SurfaceLabelReader(db), {}
+        wide = dict(limit=1000, include_children=True, include_hidden=True)
+        for label in labels:
+            for row in reader.list_sessions_rich(source=label, include_archived=True, **wide):
+                finds.setdefault(row["id"], set()).add(label)
+            searched = {r["id"] for r in reader.search_sessions(source=label, limit=1000)}
+            assert {i for i, found in finds.items() if label in found and i.startswith("probe-")} == {
+                i for i in searched if i.startswith("probe-")}
+    finally:
+        db.close()
+    for label in labels:
+        (created,) = _rows(source, f"SELECT created_source FROM sessions WHERE id = 'probe-{label}'")[0]
+        assert sorted(finds[f"probe-{label}"]) == fork_return.label_lookups(label, created)[0], label
+
 
 @pytest.mark.parametrize("source_label, created", [("local", "tui"), ("local", "unknown"), ("cli", "")])
 def test_a_creation_label_other_than_its_source_refuses(stores, source_label, created):
-    """This build lists a ``local`` session under the surface that created it; the fork lists by source alone, so
-    the session would leave that listing."""
+    """The minimum safeguard: a creation label set and other than its source refuses, whatever the lookups say."""
     source, _, output = stores
     _runtime_write(source, lambda db: (db.create_session("s4", source=source_label),
                                        db.append_message("s4", role="user", content="made in the tui"),
@@ -1133,6 +1243,13 @@ def test_a_creation_label_equal_to_its_source_or_unset_returns(stores):
     assert labels["s2"] == "tui" and labels["s1"] is None  # this build's own session, and a fork-era one
     report = _export(source, output)
     assert report["published"] and report["columns"]["sessions.created_source"]["condition_broken_rows"] == 0
+
+
+def test_rules_written_for_other_schemas_refuse(stores, monkeypatch):
+    source, _, output = stores
+    monkeypatch.setitem(fork_return._RULES, "source_schema_version", 1034)
+    _assert_refused(source, output, r"these conversion rules are for schema 1034 -> 1030 \(fork 420c58a13e\); this "
+                                    r"build stores 1033")
 
 
 # ── The verify/publish boundary: a change found at any point is a failure, and its output is taken back ──
@@ -1216,6 +1333,23 @@ def test_an_output_replaced_after_publication_is_not_a_success_and_is_left_alone
     assert any("was replaced or removed by another process" in r for r in report["refused"])
 
 
+def test_an_output_written_in_place_after_publication_is_not_committed(stores, monkeypatch, tmp_path):
+    """Same file, other bytes: another process wrote into the published output before the commit point."""
+    source, _, output = stores
+    output.parent.mkdir()
+
+    def write_into():
+        with open(output, "r+b") as handle:
+            handle.seek(60)
+            handle.write((7).to_bytes(4, "big"))
+        return True
+
+    _after_publication(monkeypatch, output, write_into)
+    report = _fail(source, output, tmp_path / "report.json")
+    assert any("was written by another process after it was published" in r for r in report["refused"])
+    assert not output.exists() and not Path(f"{output}.fork-return").exists() and report["committed"] is False
+
+
 def test_a_retraction_never_moves_a_file_it_did_not_create(stores, monkeypatch, tmp_path):
     """The source changed after publication, and before the output is taken back another process replaced it."""
     source, _, output = stores
@@ -1278,10 +1412,140 @@ def test_an_output_that_cannot_be_taken_back_is_named_and_never_a_success(stores
     assert sorted(p.name for p in output.parent.iterdir()) == ["state.db"]
 
 
-def test_a_report_that_cannot_be_written_takes_the_output_back(stores, monkeypatch, tmp_path):
+def test_a_report_that_cannot_be_written_after_the_commit_leaves_the_committed_return(stores, monkeypatch, tmp_path):
+    """The report is written after the commit point and is not the verdict: the committed output stays, the other
+    process's file stays, and the exit status says the account is missing."""
     source, _, output = stores
     output.parent.mkdir()
     report_path = tmp_path / "report.json"
     _after_publication(monkeypatch, output, lambda: report_path.write_bytes(b"another process's report"))
-    assert fork_return.main([str(source), str(output), "--report", str(report_path)]) == 2
-    assert not output.exists() and report_path.read_bytes() == b"another process's report"
+    assert fork_return.main([str(source), str(output), "--report", str(report_path)]) == 4
+    assert report_path.read_bytes() == b"another process's report"
+    assert fork_return.verify_return(output)["sha256"] == _sha(output)
+
+
+# ── The commit point: the marker's link; an interruption before it is never a success, one after it takes nothing back ──
+
+_INTERRUPT = '''
+import os, signal, sys
+import hermes_state_fork_return as fork_return
+
+point, signum = sys.argv[1], int(sys.argv[2])
+marker = str(sys.argv[4]) + getattr(fork_return, "MARKER_SUFFIX", ".fork-return")
+link, write_report = os.link, fork_return._write_report
+
+
+def interrupt():
+    os.kill(os.getpid(), signum)  # SIGKILL ends the process here; SIGTERM runs the export's own handler
+    for _ in range(10 ** 8):
+        pass
+    raise AssertionError("the signal was not delivered")
+
+
+def linking(src, dst, *args, **kwargs):
+    if str(dst) == marker and point == "before the commit":
+        interrupt()
+    link(src, dst, *args, **kwargs)
+    if str(dst) == marker and point == "after the commit":
+        interrupt()
+
+
+def reporting(path, report):
+    write_report(path, report)
+    if point == "after the report":
+        interrupt()
+
+
+os.link, fork_return._write_report = linking, reporting
+sys.exit(fork_return.main(sys.argv[3:]))
+'''
+
+
+def _interrupted(tmp_path, source, output, point: str, signum: int) -> tuple:
+    """The CLI in its own process, *signum* delivered at *point*: ``(exit status, report or None)``."""
+    driver, report_path = tmp_path / "interrupt.py", tmp_path / "report.json"
+    driver.write_text(_INTERRUPT)
+    repo = Path(fork_return.__file__).resolve().parent
+    done = subprocess.run([sys.executable, str(driver), point, str(int(signum)), str(source), str(output),
+                           "--report", str(report_path)], cwd=repo, env={**os.environ, "PYTHONPATH": str(repo)},
+                          capture_output=True, text=True, timeout=300, check=False)
+    return done.returncode, json.loads(report_path.read_text()) if report_path.exists() else None
+
+
+def _not_a_return(output: Path) -> None:
+    assert not Path(f"{output}.fork-return").exists()
+    with pytest.raises(fork_return.ForkReturnError, match="no commit marker"):
+        fork_return.verify_return(output)
+    assert fork_return.main(["--verify", str(output)]) == 2
+
+
+def _a_return(output: Path) -> None:
+    assert fork_return.verify_return(output)["sha256"] == _sha(output)
+    assert fork_return.main(["--verify", str(output)]) == 0
+
+
+def test_a_cancel_before_the_commit_point_takes_the_output_back(stores, tmp_path):
+    source, _, output = stores
+    output.parent.mkdir()
+    code, report = _interrupted(tmp_path, source, output, "before the commit", signal.SIGTERM)
+    assert code == 128 + signal.SIGTERM and not output.exists()
+    assert report["published"] is report["committed"] is report["succeeded"] is False
+    assert report["retraction"].startswith("retracted")
+    _not_a_return(output)
+    assert not list(output.parent.iterdir())
+
+
+def test_a_kill_before_the_commit_point_leaves_no_return(stores, tmp_path):
+    """SIGKILL runs no handler: the published output stays, without its marker, and no report is written. The
+    consumer's rule reads that as no return."""
+    source, _, output = stores
+    output.parent.mkdir()
+    code, report = _interrupted(tmp_path, source, output, "before the commit", signal.SIGKILL)
+    assert code == -signal.SIGKILL and output.exists() and report is None
+    _not_a_return(output)
+
+
+@pytest.mark.parametrize("point", ["after the commit", "after the report"])
+def test_a_cancel_after_the_commit_point_takes_nothing_back(stores, tmp_path, point):
+    """The review's counterexample: a SIGTERM right after the success report was written took the output back while
+    the report still said succeeded. Past the marker's link nothing is taken back, and the report says so."""
+    source, _, output = stores
+    output.parent.mkdir()
+    code, report = _interrupted(tmp_path, source, output, point, signal.SIGTERM)
+    assert code == 128 + signal.SIGTERM and output.exists()
+    assert report["published"] is report["committed"] is report["succeeded"] is True and "retraction" not in report
+    assert report.get("after_commit", "SystemExit").startswith("SystemExit")
+    _a_return(output)
+
+
+def test_a_kill_after_the_commit_point_is_a_return_without_its_report(stores, tmp_path):
+    source, _, output = stores
+    output.parent.mkdir()
+    code, report = _interrupted(tmp_path, source, output, "after the commit", signal.SIGKILL)
+    assert code == -signal.SIGKILL and report is None
+    _a_return(output)
+
+
+@pytest.mark.parametrize("change, match", [
+    (lambda output: output.write_bytes(output.read_bytes() + b"\0"), "is not the file its commit marker names"),
+    (lambda output: Path(f"{output}-journal").write_bytes(b"x"), "has been opened for writing"),
+    (lambda output: Path(f"{output}.fork-return").write_text("{}"), "is not this tool's record"),
+    (lambda output: Path(f"{output}.fork-return").unlink(), "no commit marker"),
+], ids=["other bytes", "a journal beside it", "another record", "no marker"])
+def test_only_the_bytes_its_marker_names_verify(stores, change, match):
+    source, _, output = stores
+    _export(source, output)
+    _a_return(output)
+    change(output)
+    with pytest.raises(fork_return.ForkReturnError, match=match):
+        fork_return.verify_return(output)
+    assert fork_return.main(["--verify", str(output)]) == 2
+
+
+def test_a_marker_that_appears_during_the_export_is_never_replaced(stores, monkeypatch):
+    source, _, output = stores
+    marker = Path(f"{output}.fork-return")
+    _after_publication(monkeypatch, output, lambda: marker.write_text("another process's marker"))
+    with pytest.raises(fork_return.ForkReturnError, match="refusing to overwrite .*fork-return"):
+        _export(source, output)
+    assert marker.read_text() == "another process's marker" and not output.exists()
