@@ -1014,8 +1014,12 @@ def test_an_admission_no_rule_carries_refuses(stores, monkeypatch, tmp_path, act
      r"worker_executions.kind holds values no rule carries to the fork: \{'future': 1\}"),
     ("ALTER TABLE worker_receipts DROP COLUMN payload_digest",
      r"worker_receipts lacks \['payload_digest'\]; its rows are not the shape this export reads"),
+    ("""UPDATE worker_receipts SET result_json = '{"unknown_receipt_field": {"input": "only receipt z733"}}'""",
+     r"worker_receipts answers no rule carries to the fork: x1/1: no rule for "
+     r"worker_receipts.result_json.unknown_receipt_field"),
 ], ids=["a set unknown column", "an unset unknown column", "an unknown column with a default",
-        "an unknown schema_version column", "a receipt of no worker", "an unknown value", "a missing column"])
+        "an unknown schema_version column", "a receipt of no worker", "an unknown value", "a missing column",
+        "an unmapped key in a receipt's answer"])
 def test_a_removed_tables_data_without_a_rule_refuses(stores, sql, match):
     source, _, output = stores
     conn = _connect_as(source, 1033)  # foreign keys off, as any raw writer may have left them
@@ -1245,6 +1249,20 @@ def test_a_creation_label_equal_to_its_source_or_unset_returns(stores):
     assert report["published"] and report["columns"]["sessions.created_source"]["condition_broken_rows"] == 0
 
 
+def test_a_message_uid_shared_by_two_rows_refuses(stores):
+    """A compaction's carried tail keeps its original's uid: this build reads the two rows as one message."""
+    source, _, output = stores
+    db = SessionDB(db_path=source)
+    try:
+        db.append_message("s3", role="user", content="question one")
+        db.append_message("s3", role="assistant", content="REPLY-ONE")
+        tail = db.get_messages_as_conversation("s3")[-1]
+        db.archive_and_compact("s3", [{"role": "user", "content": "[CONTEXT COMPACTION] summary"}, tail], tail_count=1)
+    finally:
+        db.close()
+    _assert_refused(source, output, r"messages.message_uid is shared by other rows.*: 2 rows: id=\d+, session_id='s3'")
+
+
 def test_rules_written_for_other_schemas_refuse(stores, monkeypatch):
     source, _, output = stores
     monkeypatch.setitem(fork_return._RULES, "source_schema_version", 1034)
@@ -1347,6 +1365,44 @@ def test_an_output_written_in_place_after_publication_is_not_committed(stores, m
     _after_publication(monkeypatch, output, write_into)
     report = _fail(source, output, tmp_path / "report.json")
     assert any("was written by another process after it was published" in r for r in report["refused"])
+    assert not output.exists() and not Path(f"{output}.fork-return").exists() and report["committed"] is False
+
+
+def test_a_source_written_while_the_marker_is_staged_is_not_committed(stores, monkeypatch, tmp_path):
+    source, _, output = stores
+    output.parent.mkdir()
+    stage = fork_return._stage_marker
+
+    def staging(out, record):
+        _append_to(source, "committed while the marker was staged q80")
+        return stage(out, record)
+
+    monkeypatch.setattr(fork_return, "_stage_marker", staging)
+    report = _fail(source, output, tmp_path / "report.json")
+    assert "the source changed while it was read" in report["refused"] and report["committed"] is False
+    assert not output.exists() and not Path(f"{output}.fork-return").exists()
+
+
+def test_an_output_written_through_its_wal_after_publication_is_not_committed(stores, monkeypatch, tmp_path):
+    """Another connection commits into the published output's WAL and stays open: its main file is unchanged."""
+    source, _, output = stores
+    output.parent.mkdir()
+    held, wal = [], []
+
+    def write_through_wal():
+        held.append(_connect_as(output, 1030))
+        held[0].execute("INSERT INTO state_meta (key, value) VALUES ('written-after-publication', '1')")
+        wal.append(Path(f"{output}-wal").stat().st_size)
+        return True
+
+    _after_publication(monkeypatch, output, write_through_wal)
+    try:
+        report = _fail(source, output, tmp_path / "report.json")
+    finally:
+        for conn in held:
+            conn.close()
+    assert wal[0] > 0 and any("-wal exists: the output" in r and "was opened by another process" in r
+                              for r in report["refused"])
     assert not output.exists() and not Path(f"{output}.fork-return").exists() and report["committed"] is False
 
 
@@ -1528,7 +1584,7 @@ def test_a_kill_after_the_commit_point_is_a_return_without_its_report(stores, tm
 
 @pytest.mark.parametrize("change, match", [
     (lambda output: output.write_bytes(output.read_bytes() + b"\0"), "is not the file its commit marker names"),
-    (lambda output: Path(f"{output}-journal").write_bytes(b"x"), "has been opened for writing"),
+    (lambda output: Path(f"{output}-journal").write_bytes(b"x"), "has been opened since it was committed"),
     (lambda output: Path(f"{output}.fork-return").write_text("{}"), "is not this tool's record"),
     (lambda output: Path(f"{output}.fork-return").unlink(), "no commit marker"),
 ], ids=["other bytes", "a journal beside it", "another record", "no marker"])

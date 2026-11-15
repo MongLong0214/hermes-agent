@@ -195,7 +195,7 @@ _RUNTIME_COLUMNS = {
     "worker_receipts": {
         "execution_id": "the terminal worker it answered", "sequence": "the step it answered",
         "payload_digest": "fingerprint of the step a late duplicate must match",
-        "result_json": "the answer a late duplicate replays; the step's effect is kept",
+        "result_json": "the answer a late duplicate replays: no key of it has a mapping, so only an empty one returns",
     },
 }
 # Unfinished work has no representation in the fork; values outside these sets have no rule either.
@@ -214,7 +214,7 @@ _COLUMNS = {
         "owner_execution_id": "execution fence of a terminal worker; owner_pid/owner_started_at are kept",
     },
     "messages": {
-        "message_uid": "row identity this build mints; the fork keys rows by id, which is kept",
+        "message_uid": "message identity this build mints: one row's alone, so the kept row id names the same message",
         "absorbed_message_uids": "uids folded into this row for display dedupe; their content is kept",
         "tool_call_uid": "tool-call identity this build mints; tool_call_id is kept",
         "tool_call_uids": "tool-call identities this build mints; tool_calls is kept",
@@ -231,11 +231,15 @@ _COLUMNS = {
 # A converted column whose rows must satisfy a condition, else the fork reads them differently: (the rows that
 # break it, what that means, the columns that name such a row). This build lists a ``source='local'`` session
 # under the surface that created it (created_source); the fork finds every session by its source alone, so a
-# row whose two labels differ would leave that listing. Unset is the fork-era rows' own state.
+# row whose two labels differ would leave that listing. Unset is the fork-era rows' own state. A message_uid held by
+# more than one row (a compaction's copies) makes them one message to this build's reads; the fork reads each row.
 _COLUMN_CONDITIONS = {
     ("sessions", "created_source"): ("created_source IS NOT NULL AND created_source IS NOT source",
                                      "differs from source; the fork finds a session by its source alone",
                                      ("id", "source", "created_source")),
+    ("messages", "message_uid"): ("message_uid IN (SELECT message_uid FROM messages GROUP BY 1 HAVING count(*) > 1)",
+                                  "is shared by other rows; this build reads them as one message, the fork as one each",
+                                  ("id", "session_id", "message_uid")),
 }
 _TRIGGERS = (
     "messages_display_revision_update", "messages_message_uid_insert", "messages_transcript_revision_update",
@@ -561,6 +565,22 @@ def _plan_admissions(conn, refused: list) -> dict:
             "no_rule": len(unruled), "by_kind": kinds}
 
 
+def _unmapped_answers(conn) -> list:
+    """Each receipt answer that holds anything, by its paths: no key of an answer has a mapping into the fork."""
+    at, unmapped = "worker_receipts.result_json", []
+    for execution_id, sequence, result_json in conn.execute(
+            "SELECT execution_id, sequence, result_json FROM worker_receipts ORDER BY execution_id, sequence"):
+        try:
+            answer = json.loads(result_json)
+        except (TypeError, ValueError):
+            answer = result_json
+        if answer is not None and answer != {} and answer != []:
+            paths = ([f"{at}.{key}" for key in answer] if isinstance(answer, dict)
+                     else [f"{at} ({type(answer).__name__})"])
+            unmapped.append(f"{execution_id}/{sequence}: no rule for {', '.join(paths)}")
+    return unmapped
+
+
 def _plan_runtime_table(conn, name: str, info: dict, columns: dict, refused: list) -> dict:
     entry = {"disposition": "converted", "rows": info["rows"], "reason": _RUNTIME_TABLES[name]}
     known, before = _RUNTIME_COLUMNS[name], len(refused)
@@ -594,6 +614,9 @@ def _plan_runtime_table(conn, name: str, info: dict, columns: dict, refused: lis
             orphans = f"unknown ({exc})"
         if orphans:
             refused.append(f"worker_receipts rows of no terminal worker: {orphans}")
+        if unmapped := _unmapped_answers(conn):
+            refused.append(f"worker_receipts answers no rule carries to the fork: {'; '.join(unmapped[:10])}"
+                           f"{' ...' if len(unmapped) > 10 else ''}")
     if name == "session_admissions":
         entry["inputs"] = _plan_admissions(conn, refused)
     if len(refused) > before:
@@ -1010,10 +1033,16 @@ def _stage_marker(output: Path, record: dict) -> tuple:
     return directory, (st.st_dev, st.st_ino)
 
 
+def _opened(output: Path) -> Optional[Path]:
+    """The first SQLite file beside *output* (WAL, shared memory, rollback journal), or None. Only a never-opened
+    output is wholly its own bytes; one beside it means a connection, and bytes the output's hash may not cover."""
+    return next((path for path in _bundle(output)[1:] if os.path.lexists(path)), None)
+
+
 def verify_return(output) -> dict:
-    """The rule a consumer applies: *output* is a successful return only when its commit marker exists and names its
-    exact bytes, and no journal beside it holds more. Returns the marker's record; raises ForkReturnError with the
-    reason otherwise (no marker means the export never reached its commit point)."""
+    """The rule a consumer applies, and the export's last check: *output* is a successful return only when its commit
+    marker exists and names its exact bytes, and no SQLite file beside it exists. Returns the marker's record; raises
+    ForkReturnError with the reason otherwise (no marker means the export never reached its commit point)."""
     output = Path(output)
     marker = _marker(output)
     try:
@@ -1028,9 +1057,8 @@ def verify_return(output) -> dict:
             raise ForkReturnError(f"the commit marker {marker} is not this tool's record: {exc}") from exc
     if not isinstance(record, dict) or record.get("format") != _MARKER_FORMAT or record.get("output") != output.name:
         raise ForkReturnError(f"the commit marker {marker} is not this tool's record for {output.name}")
-    for suffix in ("-wal", "-journal"):
-        if (journal := _sidecar(output, suffix)).exists() and (suffix == "-journal" or journal.stat().st_size):
-            raise ForkReturnError(f"{journal} exists: {output} has been opened for writing since it was committed")
+    if journal := _opened(output):
+        raise ForkReturnError(f"{journal} exists: {output} has been opened since it was committed")
     try:
         size, digest = output.stat().st_size, _sha256(output)
     except OSError as exc:
@@ -1078,12 +1106,15 @@ def _record_build(report: dict, lineage, differences: dict, integrity: list) -> 
 
 def _check_published(source: Path, before: dict, output: Path, identity: tuple, digest: str, report: dict) -> None:
     """The last check before the commit point: the source is still the bytes this output was made from, and the
-    output path still holds the file this run linked, unwritten."""
+    output path still holds the file this run linked, unopened and unwritten (verify_return's rule)."""
     if why := _verify_source(source, before, report):
         report["refused"].append(why)
     if not _ours(output, identity):
         report["published"] = False
         report["refused"].append(f"the output {output} was replaced or removed by another process")
+    elif journal := _opened(output):
+        report["refused"].append(f"{journal} exists: the output {output} was opened by another process after it "
+                                 "was published")
     elif _sha256(output) != digest:
         report["refused"].append(f"the output {output} was written by another process after it was published")
 
@@ -1185,13 +1216,14 @@ def return_to_fork(source, output, *, work_dir=None, report_path=None) -> dict:
         _fsync_directory(output.parent)
         _clean(report, build)
         build = None
+        # Staged before the last check, so nothing lies between that check and the commit point but the link.
+        marking, marker_id = _stage_marker(output, {
+            "format": _MARKER_FORMAT, "output": output.name, "size": st.st_size, "sha256": digest,
+            "source": str(source), "source_state": before, "rules": _RULES})
         _check_published(source, before, output, identity, digest, report)
         verified = True
         if report["refused"]:
             raise ForkReturnRefused(report)
-        marking, marker_id = _stage_marker(output, {
-            "format": _MARKER_FORMAT, "output": output.name, "size": st.st_size, "sha256": digest,
-            "source": str(source), "source_state": before, "rules": _RULES})
         try:
             os.link(marking / _MARKING, marker)  # the commit point
         except FileExistsError as exc:
