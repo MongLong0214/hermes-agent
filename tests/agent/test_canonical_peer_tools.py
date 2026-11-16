@@ -970,3 +970,20 @@ def test_a_genuine_policy_refusal_keeps_the_permission_text_even_when_the_probe_
     assert ceo_tools == [] and refused(messages, batch)
     assert all("A peer has no approval authority" in m["content"] for m in messages)
     assert all("ceoSessionId" not in m["content"] for m in messages)
+
+
+@pytest.mark.parametrize("dispatcher", DISPATCHERS)
+def test_a_sibling_refused_on_its_final_arguments_keeps_the_permission_text_beside_a_schema_failure(
+        agent, ceo_tools, monkeypatch, dispatcher):
+    """The policy is decided on the FINAL arguments: an escalation a pre-tool hook rewrites out of the
+    grant is a policy refusal, and a schema-failing sibling must not relabel it a retryable bystander."""
+    _strict_decision_schema(monkeypatch)
+    escalation = ceo("escalation_resolve")
+    _rewrite_before_the_final_check(
+        monkeypatch, "hook", lambda n, a: {**a, "runId": "run_other"} if n == escalation else a)
+    batch = [call(escalation, {"runId": RUN}, "c0"), _wrapped(_decision(), "c1")]
+    with peer_turn(agent):
+        messages = run(agent, batch, dispatcher)
+    assert ceo_tools == [] and refused(messages, batch)
+    assert all("A peer has no approval authority" in m["content"] for m in messages)
+    assert all("This call was not refused" not in m["content"] for m in messages)

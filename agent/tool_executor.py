@@ -402,8 +402,8 @@ def _resolve_peer_batch(agent, tool_calls, messages: list, effective_task_id: st
     if batch_resolved(agent, tool_calls, _pairing_tool_call_id):
         return False
     as_emitted = [(_tc_name(tc), getattr(getattr(tc, "function", None), "arguments", None)) for tc in tool_calls]
-    finals, scope_blocks = [], []
-    for tc in tool_calls:
+    finals, scope_blocks, policy_calls = [], [], []
+    for tc, emitted in zip(tool_calls, _peer_emitted_calls(tool_calls)):
         pc = _parse_emitted_call(agent, tc)
         final = None
         if (pc.parse_error is None and pc.scope_block is None and pc.name != TOOL_CALL_NAME
@@ -411,7 +411,12 @@ def _resolve_peer_batch(agent, tool_calls, messages: list, effective_task_id: st
             block, final = _peer_final_args(agent, pc.ref(effective_task_id))
             final = coerce_tool_args(pc.name, final) if block is None else None
         finals.append((pc.name, final))
-        scope_blocks.append(pc.scope_block if pc.parse_error is None else None)
+        scope_block = pc.scope_block if pc.parse_error is None else None
+        scope_blocks.append(scope_block)
+        # What the policy judges for the argument-check-only path: the FINAL arguments of every call
+        # prepared (after hooks, middleware and coercion); only a call stopped by its own argument or
+        # scope block, which was never prepared, is judged as emitted.
+        policy_calls.append(emitted if scope_block else (pc.name, final))
     unchanged = as_emitted == [(_tc_name(tc), getattr(getattr(tc, "function", None), "arguments", None))
                                for tc in tool_calls]
     if unchanged and batch_allowed(agent, finals, emitted=[(_pairing_tool_call_id(tc), tc) for tc in tool_calls]):
@@ -419,18 +424,19 @@ def _resolve_peer_batch(agent, tool_calls, messages: list, effective_task_id: st
     if not unchanged:
         batch_allowed(agent, [])  # an emitted call was changed while it was prepared: clear everything
     append_peer_refusals(agent, tool_calls, messages,
-                         reasons=_peer_argument_reasons(agent, tool_calls, scope_blocks) if unchanged else None)
+                         reasons=_peer_argument_reasons(agent, policy_calls, scope_blocks) if unchanged else None)
     return True
 
 
-def _peer_argument_reasons(agent, tool_calls, scope_blocks) -> Optional[list]:
+def _peer_argument_reasons(agent, policy_calls, scope_blocks) -> Optional[list]:
     """The scope/schema block of each call when that is why the batch was refused: the policy admits
-    every call as emitted (by name, constraint, grant and fence) and at least one call failed the
-    tool's own argument check or is not available in this session. None otherwise, so a refusal by
-    the policy keeps its permission text. Nothing runs either way."""
+    every call (by name, constraint, grant and fence) on its FINAL arguments (``policy_calls``: as
+    prepared, or as emitted for a call its own block stopped before preparation) and at least one call
+    failed the tool's own argument check or is not available in this session. None otherwise, so a
+    refusal by the policy keeps its permission text. Nothing runs either way."""
     from agent.canonical_peer_tools import batch_policy_allows
 
-    if not any(scope_blocks) or not batch_policy_allows(agent, _peer_emitted_calls(tool_calls)):
+    if not any(scope_blocks) or not batch_policy_allows(agent, policy_calls):
         return None
     return list(scope_blocks)
 
