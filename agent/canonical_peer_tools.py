@@ -336,6 +336,15 @@ def batch_allowed(agent: Any, calls: Sequence[tuple[str, Any]], emitted: Optiona
     return checked is not None
 
 
+def batch_policy_allows(agent: Any, calls: Sequence[tuple[str, Any]]) -> bool:
+    """Whether the policy alone admits EVERY ``(tool name, arguments)`` of a peer batch: the check
+    :func:`batch_allowed` applies (grant, fence, names, constraints), with no pin or prepared call
+    touched. It only tells a refusal for another reason (a call's arguments failing the tool's own
+    schema check) from a refusal by the policy; it never lets anything run."""
+    policy = _active_policy(agent)
+    return policy is not None and bool(calls) and all(_check(policy, name, args) is not None for name, args in calls)
+
+
 def batch_resolved(agent: Any, tool_calls: Sequence[Any], call_id: Callable[[Any], str]) -> bool:
     """Whether the executor already prepared exactly these emitted calls as part of one batch."""
     grant = _grant.get()

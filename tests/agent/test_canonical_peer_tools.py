@@ -879,3 +879,94 @@ def test_a_peer_call_without_a_prepared_entry_never_reaches_a_registry_handler(a
         registry.deregister(unlisted)
     assert effects == [] and "NOT run" in unprepared and "NOT run" in listed_but_unprepared
     assert ceo_tools == [(ceo("run_get"), {})]
+
+
+# ── A schema-probe failure of an allowed call is reported as itself, never as a permission refusal ────
+# Live 2026-11-16 13:26Z: a peer turn wrapped ceo_decision_submit in tool_call without the two required
+# fields candidateSnapshotDigest and ceoSessionId. The tool is allowed in peer turns, but the refusal read
+# "Only the configured ACP CEO tools ... A peer has no approval authority", and the turn stalled for hours
+# on what it took for a policy block. The probe's own reason (the missing fields) must reach the model.
+
+_DECISION_FIELDS = ("runId", "decision", "rationale", "idempotencyKey", "candidateSnapshotDigest", "ceoSessionId")
+_STRICT_DECISION = {"type": "object", "additionalProperties": False, "required": list(_DECISION_FIELDS),
+                    "properties": {field: {"type": "string"} for field in _DECISION_FIELDS}}
+
+
+def _strict_decision_schema(monkeypatch):
+    """ceo_decision_submit with the live server's required fields and additionalProperties:false."""
+    from tools.registry import registry
+
+    name, real = ceo("ceo_decision_submit"), registry.get_schema
+    monkeypatch.setattr(registry, "get_schema", lambda tool, *a, **k: (
+        {"name": name, "description": "ceo decision", "parameters": _STRICT_DECISION} if tool == name
+        else real(tool, *a, **k)))
+
+
+def _decision(**args):
+    return {"runId": RUN, "decision": "CONFIRM", "rationale": "verified", "idempotencyKey": "key-1", **args}
+
+
+def _wrapped(args, call_id="c1"):
+    return call("tool_call", {"calls": [{"arguments": args, "name": ceo("ceo_decision_submit")}]}, call_id)
+
+
+@pytest.mark.parametrize("dispatcher", DISPATCHERS)
+def test_a_wrapped_allowed_call_missing_required_fields_is_refused_naming_those_fields(
+        agent, ceo_tools, monkeypatch, dispatcher):
+    """The 689430 shape: an allowed, in-scope decision missing two required fields runs nothing, and its
+    result names both fields; it does not read as a permission refusal."""
+    _strict_decision_schema(monkeypatch)
+    with peer_turn(agent):
+        [result] = run(agent, [_wrapped(_decision())], dispatcher)
+    assert ceo_tools == []
+    content = result["content"]
+    assert "not executed" in content and "canonical peer turn" in content
+    assert "candidateSnapshotDigest" in content and "ceoSessionId" in content
+    assert "A peer has no approval authority" not in content and "Only the configured ACP CEO tools" not in content
+
+
+def test_the_same_call_with_every_required_field_runs(agent, ceo_tools, monkeypatch):
+    _strict_decision_schema(monkeypatch)
+    full = _decision(candidateSnapshotDigest="sha256:" + "0" * 64, ceoSessionId="ses_fixture")
+    with peer_turn(agent):
+        [result] = run(agent, [_wrapped(full)])
+    assert ceo_tools == [(ceo("ceo_decision_submit"), full)] and real_result(result, ceo("ceo_decision_submit"))
+
+
+def test_an_allowed_sibling_of_a_call_failing_its_argument_check_runs_nothing_and_says_why(
+        agent, ceo_tools, monkeypatch):
+    _strict_decision_schema(monkeypatch)
+    batch = [call(ceo("run_get"), {"runId": RUN}, "c0"), _wrapped(_decision(), "c1")]
+    with peer_turn(agent):
+        sibling, failing = run(agent, batch)
+    assert ceo_tools == []
+    assert "not executed" in sibling["content"] and "another call" in sibling["content"]
+    assert "ceoSessionId" in failing["content"]
+    assert all("A peer has no approval authority" not in m["content"] for m in (sibling, failing))
+
+
+def test_an_allowed_call_not_available_in_this_session_says_so(agent, ceo_tools, monkeypatch):
+    import agent.tool_executor as executor
+
+    full = _decision(candidateSnapshotDigest="sha256:" + "0" * 64, ceoSessionId="ses_fixture")
+    monkeypatch.setattr(executor, "_tool_search_scoped_names", lambda _agent: frozenset({ceo("run_get")}))
+    with peer_turn(agent):
+        [result] = run(agent, [_wrapped(full)])
+    assert ceo_tools == []
+    assert "is not available in this session" in result["content"]
+    assert "A peer has no approval authority" not in result["content"]
+
+
+@pytest.mark.parametrize("case", ["decision_out_of_scope", "unlisted_tool", "no_grant"])
+def test_a_genuine_policy_refusal_keeps_the_permission_text_even_when_the_probe_also_fails(
+        agent, ceo_tools, monkeypatch, case):
+    """Missing fields never turn a refusal the policy makes into an argument message."""
+    _strict_decision_schema(monkeypatch)
+    batch = {"decision_out_of_scope": [_wrapped(_decision(decision="REJECT"))],
+             "unlisted_tool": [_wrapped(_decision()), call(ceo("owner_decision_submit"), {"runId": RUN}, "c2")],
+             "no_grant": [_wrapped(_decision())]}[case]
+    with peer_turn(agent, grant=case != "no_grant"):
+        messages = run(agent, batch)
+    assert ceo_tools == [] and refused(messages, batch)
+    assert all("A peer has no approval authority" in m["content"] for m in messages)
+    assert all("ceoSessionId" not in m["content"] for m in messages)

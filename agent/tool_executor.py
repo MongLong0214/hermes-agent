@@ -365,14 +365,18 @@ def peer_batch_refused(agent, tool_calls, emitted_names=None) -> bool:
 
     if batch_resolved(agent, tool_calls, _pairing_tool_call_id):
         return False  # part of a batch already prepared and pinned as a whole (a segment)
+    return not batch_allowed(agent, _peer_emitted_calls(tool_calls))
 
+
+def _peer_emitted_calls(tool_calls) -> list:
+    """``(name, arguments)`` of each call as the model emitted it, as the peer policy reads it."""
     calls = []
     for tc in tool_calls:
         raw_name = _tc_name(tc)
         args, parse_error = _parse_tool_arguments(getattr(getattr(tc, "function", None), "arguments", None))
         # An alias would dispatch as a different tool than the one the policy names.
         calls.append((raw_name if _canonical_tool_name(raw_name) == raw_name else "", None if parse_error else args))
-    return not batch_allowed(agent, calls)
+    return calls
 
 
 def _peer_turn(agent) -> bool:
@@ -398,7 +402,7 @@ def _resolve_peer_batch(agent, tool_calls, messages: list, effective_task_id: st
     if batch_resolved(agent, tool_calls, _pairing_tool_call_id):
         return False
     as_emitted = [(_tc_name(tc), getattr(getattr(tc, "function", None), "arguments", None)) for tc in tool_calls]
-    finals = []
+    finals, scope_blocks = [], []
     for tc in tool_calls:
         pc = _parse_emitted_call(agent, tc)
         final = None
@@ -407,14 +411,28 @@ def _resolve_peer_batch(agent, tool_calls, messages: list, effective_task_id: st
             block, final = _peer_final_args(agent, pc.ref(effective_task_id))
             final = coerce_tool_args(pc.name, final) if block is None else None
         finals.append((pc.name, final))
+        scope_blocks.append(pc.scope_block if pc.parse_error is None else None)
     unchanged = as_emitted == [(_tc_name(tc), getattr(getattr(tc, "function", None), "arguments", None))
                                for tc in tool_calls]
     if unchanged and batch_allowed(agent, finals, emitted=[(_pairing_tool_call_id(tc), tc) for tc in tool_calls]):
         return False
     if not unchanged:
         batch_allowed(agent, [])  # an emitted call was changed while it was prepared: clear everything
-    append_peer_refusals(agent, tool_calls, messages)
+    append_peer_refusals(agent, tool_calls, messages,
+                         reasons=_peer_argument_reasons(agent, tool_calls, scope_blocks) if unchanged else None)
     return True
+
+
+def _peer_argument_reasons(agent, tool_calls, scope_blocks) -> Optional[list]:
+    """The scope/schema block of each call when that is why the batch was refused: the policy admits
+    every call as emitted (by name, constraint, grant and fence) and at least one call failed the
+    tool's own argument check or is not available in this session. None otherwise, so a refusal by
+    the policy keeps its permission text. Nothing runs either way."""
+    from agent.canonical_peer_tools import batch_policy_allows
+
+    if not any(scope_blocks) or not batch_policy_allows(agent, _peer_emitted_calls(tool_calls)):
+        return None
+    return list(scope_blocks)
 
 
 def _peer_final_args(agent, ref: "_ToolCallRef"):
@@ -432,9 +450,28 @@ def _peer_final_args(agent, ref: "_ToolCallRef"):
     return block, final
 
 
-def append_peer_refusals(agent, tool_calls, messages: list) -> None:
-    """One refusal result per call, so the assistant turn keeps its matching results."""
-    _append_skipped_tool_results(agent, messages, tool_calls, "", content=_PEER_TOOL_REFUSAL)
+_PEER_ARGUMENT_REFUSAL = ("[Tool call not executed — {name} was requested during a canonical peer turn and "
+                          "failed the tool's own argument check, so this batch ran nothing. This is not a "
+                          "permission refusal: the tool is allowed in a peer turn. Fix the arguments and call it "
+                          "again. {reason}]")
+_PEER_SIBLING_REFUSAL = ("[Tool call not executed — {name} was requested during a canonical peer turn in a batch "
+                         "where another call failed its tool's own argument check, so the batch ran nothing. This "
+                         "call was not refused; send it again with the corrected batch.]")
+
+
+def append_peer_refusals(agent, tool_calls, messages: list, *, reasons: Optional[list] = None) -> None:
+    """One refusal result per call, so the assistant turn keeps its matching results. Given
+    ``reasons`` (:func:`_peer_argument_reasons`), each call states its own argument or scope block,
+    or that a sibling's block stopped the batch, instead of the permission text."""
+    if reasons is None:
+        _append_skipped_tool_results(agent, messages, tool_calls, "", content=_PEER_TOOL_REFUSAL)
+        return
+    for tc, block in zip(tool_calls, reasons):
+        name = _tc_name(tc)
+        # No str.format over the block: it carries a JSON schema, braces included.
+        result = (_PEER_ARGUMENT_REFUSAL.replace("{name}", name).replace("{reason}", _flatten_probe(block)) if block
+                  else _PEER_SIBLING_REFUSAL.replace("{name}", name))
+        messages.append(make_tool_result_message(name, result, _pairing_tool_call_id(tc), effect_disposition="none"))
 
 
 def _refuse_peer_tool_calls(agent, tool_calls, messages: list) -> bool:
@@ -521,15 +558,26 @@ def _unwrap_tool_search_call(
         if scope_block is None:
             return underlying, underlying_args, None
         if flatten_probe:
-            probe = json.loads(scope_block)
-            scope_block = (
-                f"{probe.get('error', '')} Parameters schema: "
-                f"{json.dumps(probe.get('parameters', {}), ensure_ascii=False)}. "
-                f"{probe.get('hint', '')}"
-            ).strip()
+            scope_block = _flatten_probe(scope_block)
     except Exception:
         pass
     return function_name, function_args, scope_block
+
+
+def _flatten_probe(block: str) -> str:
+    """A deferred-schema probe's JSON payload as one plain string (error, parameters schema, hint);
+    a block that is no such payload (``... is not available in this session``) as it is."""
+    try:
+        probe = json.loads(block)
+    except (TypeError, ValueError):
+        return block
+    if not isinstance(probe, dict):
+        return block
+    return (
+        f"{probe.get('error', '')} Parameters schema: "
+        f"{json.dumps(probe.get('parameters', {}), ensure_ascii=False)}. "
+        f"{probe.get('hint', '')}"
+    ).strip()
 
 
 @dataclass
