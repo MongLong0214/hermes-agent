@@ -762,6 +762,57 @@ def submit(text, event_id, author, channel):
         return json.loads(response.read().decode()).get("text", "")
 
 
+# 2026-11-16 20:56-20:59 KST: asked by the owner to stop the replies that wake the CTO, the CEO answered two
+# CTO progress reports with no text at all. This path had no "no reply" outcome, so one turn ended in a
+# failure notice to the thread and the other posted the empty-turn explanation as its answer. Exactly
+# SILENT_ANSWER is that outcome: the gateway records it as the event's answer (its receipt) and the shim
+# journals it and posts nothing. Empty or reasoning-only output stays the gateway's error path.
+SILENT_ANSWER = "[SILENT]"
+SILENT_OFFER = (f"If this message needs no reply, answer with exactly {SILENT_ANSWER} and nothing else: it is "
+                "recorded as your answer and nothing is posted to the thread.")
+
+
+def offer_silent_answer(text):
+    """*text* with ``SILENT_OFFER`` as the last line of buzz-acp's ``[Context]`` element, right above the
+    quoted history or the event section (both kept byte for byte); *text* itself when it does not open with
+    ``[Context]`` or would then exceed the gateway limit. A recovered event opens with the bridge's own
+    header instead, and the gateway's owner-relay check reads its first lines and its content exactly as
+    signed (gateway/owner_relay.py ``event_content``), so nothing is added there."""
+    if not text.startswith("[Context]\n"):
+        return text
+    lines = text.split("\n")
+    at = next((i for i, line in enumerate(lines) if line.startswith((EVENT_HEADER, *CONVERSATION_HEADERS))), None)
+    if at is None:
+        return text
+    offered = "\n".join(lines[:at] + [SILENT_OFFER] + lines[at:])
+    return offered if len(offered) <= GATEWAY_TEXT_LIMIT else text
+
+
+def is_silent_answer(answer):
+    """True for an answer that is exactly ``SILENT_ANSWER``, surrounding whitespace aside."""
+    return isinstance(answer, str) and answer.strip() == SILENT_ANSWER
+
+
+def journal_silent(event_id, channel, answer):
+    """Journal the CEO's explicit no-reply answer in the event's one delivery slot, the slot its post would
+    take: ``kind`` ``answer``, ``state`` ``silent``, ``delivery`` ``not_posted``. Nothing is sent. The slot
+    keeps a replay from posting it later, and recovery reads the event as answered."""
+    name = outcome_key(event_id, channel)
+    fd, why = _claim(name)
+    if fd is None:
+        log(f"prompt {name[:12]}… silent answer already journaled once; nothing posted" if why == "exists"
+            else f"prompt {name[:12]}… silent answer not journaled: {why}; nothing posted")
+        return
+    with os.fdopen(fd, "w") as marker:
+        marker.write(json.dumps({
+            "journal": 2, "sent": False, "state": "silent", "delivery": "not_posted", "kind": "answer",
+            "event_id": event_id, "ref": None, "channel": channel,
+            "roster_generation": getattr(_local, "roster_generation", None), "reply_to": event_id,
+            "reason": f"the CEO answered {SILENT_ANSWER}: no reply", "body_sha256": _sha256(answer),
+            "attempts": 0, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
+    log(f"prompt {name[:12]}… answer SILENT: recorded, not posted")
+
+
 def _registry_peer(channel):
     """(the channel's registered counterpart handle, None) or (None, why not). Never raises: the reason
     is a fixed category and the exception type, nothing else, as for ``_own_signers``."""
@@ -1377,7 +1428,7 @@ def recovery_delivery_state(event_id):
     """
     records = [publication_record(event_id + suffix) for suffix in ("", ".answer")]
     records = [r for r in records if r.get("event_id") == event_id]
-    if any(r.get("kind") == "answer" and r.get("sent") is True for r in records):
+    if any(r.get("kind") == "answer" and (r.get("sent") is True or r.get("state") == "silent") for r in records):
         return "answered"
     with _INFLIGHT_LOCK:
         if event_id in _INFLIGHT:
@@ -1913,7 +1964,7 @@ def deliver_event(session, parsed, text, mentioned):
     if fitted[0] is not text:
         log(f"prompt {base[:12]}… {len(text)} chars is over the gateway limit {GATEWAY_TEXT_LIMIT}: "
             f"omitted {fitted[1]} thread messages ({fitted[2]} chars), submitting {len(fitted[0])} chars")
-    text = fitted[0]
+    text = offer_silent_answer(fitted[0])
     if not begin_submission(session, base, channel):
         return
     # Every attempt and every replay of this event uses its own Buzz event id. A busy refusal is
@@ -1976,7 +2027,9 @@ def deliver_event(session, parsed, text, mentioned):
         "sessionId": session,
         "update": {"sessionUpdate": "agent_message_chunk",
                    "content": {"type": "text", "text": answer}}}})
-    if answered and answer and answer.strip():
+    if answered and is_silent_answer(answer):
+        journal_silent(base, channel, answer)
+    elif answered and answer and answer.strip():
         publish_reply(base, channel, answer)
     elif notice is not None:
         # A notice that fails stays journaled as that failure and is the end of it. It is not

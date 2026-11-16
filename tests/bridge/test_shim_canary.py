@@ -367,8 +367,8 @@ def test_an_over_limit_thread_drops_its_oldest_history_and_keeps_the_event_whole
     assert found.group(4) == f"[{dropped}] {newest_who} 2026-10-09T{dropped:02d}:00:00+00:00"
     assert all(f"history-{n:02d} " not in sent for n in range(1, dropped + 1))
     assert all(f"history-{n:02d} " in sent for n in range(dropped + 1, 14))
-    # The marker states exactly what was removed.
-    assert len(text) - chars + len(marker) + 1 == len(sent)
+    # The marker states exactly what was removed; the [SILENT] offer line is the only addition.
+    assert len(text) - chars + len(marker) + 1 + len(shim.SILENT_OFFER) + 1 == len(sent)
     assert shim.submitted == [{"event_id": EVENT, "author": SIGNER, "channel": CHANNEL}]
 
 
@@ -396,7 +396,9 @@ def test_text_within_the_limit_is_submitted_byte_identical(shim, monkeypatch, si
     text = thread_prompt([entry(1, 100 + size - len(text))], "@ceo hello")
     assert len(text) == size
     drive(shim, text)
-    assert shim.sent_texts == [text]
+    # Byte for byte but for the [SILENT] offer line, added only where it still fits the gateway limit.
+    assert shim.sent_texts == [shim.offer_silent_answer(text)]
+    assert shim.sent_texts[0].replace(shim.SILENT_OFFER + "\n", "", 1) == text
     assert "[earlier thread context omitted:" not in shim.sent_texts[0]
 
 
@@ -451,7 +453,7 @@ def test_a_body_line_shaped_like_the_next_entry_is_not_taken_as_a_boundary(shim,
                          r"`buzz messages thread --channel (\S+) --event ([0-9a-f]{64})`\]", marker)
     assert found, marker
     assert found.group(2) == ROOT and found.group(3) == CHANNEL and found.group(4) == ROOT
-    assert len(text) - int(found.group(1)) + len(marker) + 1 == len(sent)
+    assert len(text) - int(found.group(1)) + len(marker) + 1 + len(shim.SILENT_OFFER) + 1 == len(sent)
 
 
 def test_a_result_within_the_gateway_limit_is_never_refused_for_the_margin(shim, monkeypatch):

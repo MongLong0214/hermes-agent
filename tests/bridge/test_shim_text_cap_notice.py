@@ -353,7 +353,8 @@ def test_a_gateway_400_over_its_cap_tells_the_sender_once_and_nothing_is_resent(
     [post] = shim.posts()
     channel, reply_to, notice = _reply(post)
     assert (channel, reply_to) == (CHANNEL, EVENT)
-    assert "HTTP 400 canonical_invalid_request" in notice and f"제출 {len(text)}자" in notice
+    submitted = json.loads(gw.received[0])["text"]  # buzz-acp's text plus the [SILENT] offer line
+    assert "HTTP 400 canonical_invalid_request" in notice and f"제출 {len(submitted)}자" in notice
     assert EVENT in notice and "BODY-MARK" not in notice and "z" * 32 not in notice
     assert len(notice) < 1_000 and gw.key not in notice
     assert shim.journal()["sent"] is True and shim.journal()["kind"] == "notice"
@@ -511,8 +512,11 @@ def test_control_a_short_thread_reply_reaches_the_gateway_byte_for_byte(gw, shim
 
     drive(shim, text)
 
+    # Byte for byte but for the [SILENT] offer line, the last line of buzz-acp's [Context].
+    offered = shim.offer_silent_answer(text)
+    assert offered.replace(shim.SILENT_OFFER + "\n", "", 1) == text and offered != text
     assert gw.received == [json.dumps({"binding": "canonical", "event_id": EVENT, "author_id": SIGNER,
-                                       "channel_id": CHANNEL, "text": text}).encode()]
+                                       "channel_id": CHANNEL, "text": offered}).encode()]
     [post] = shim.posts()
     assert _reply(post) == (CHANNEL, EVENT, "@cto-repo-factory answer #1")
 
