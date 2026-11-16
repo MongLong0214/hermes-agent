@@ -373,3 +373,73 @@ def test_rotation_reads_the_owning_profiles_requests(ingress, monkeypatch):
         assert "B request still needs an answer" in notice["content"]
     finally:
         set_multiplex_active(before)
+
+
+def test_an_event_arriving_while_the_new_route_is_published_is_busy(ingress, send, monkeypatch):
+    """Review r2: an event resolved while /new publishes the new route (before its session row
+    exists) is refused busy, not stale."""
+    import threading
+
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    _instrument(h, monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    original = h.runner.session_store._finish_route_transition
+
+    def finish(*args, **kwargs):
+        entered.set()
+        assert release.wait(10)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(h.runner.session_store, "_finish_route_transition", finish)
+
+    async def exercise():
+        await h.warm()
+        _age(h)
+        rotating = asyncio.ensure_future(h.runner._rotate_aged_session(h.key))
+        await h.wait(entered.is_set, "the new route to be published")
+        try:
+            result = await h.send(event_id="during-route-publication")
+        finally:
+            release.set()
+            assert await rotating is True
+        return result
+
+    assert _code(asyncio.run(exercise())) == (409, "canonical_turn_busy")
+
+
+def test_the_idle_check_uses_the_owning_profiles_threshold(ingress, monkeypatch):
+    """Review r2: under multiplexing the idle check defers the threshold to the rotation, which reads
+    it in the session's own profile scope."""
+    import hermes_state
+    from agent.secret_scope import is_multiplex_active, set_multiplex_active
+    from gateway.config import Platform
+    from gateway.run import _profile_runtime_scope
+    from gateway.session import SessionSource
+
+    runner = ingress.runner
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH)
+    runner.config.multiplex_profiles = True
+    b = ingress.home / "profiles" / "b"
+    b.mkdir(parents=True)
+    (ingress.home / "config.yaml").write_text("compression:\n  threshold_tokens: 300000\n")
+    (b / "config.yaml").write_text("compression:\n  threshold_tokens: 200000\n")
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="b-chat", chat_type="dm", user_id="b-user",
+                           profile="b")
+    before = is_multiplex_active()
+    set_multiplex_active(True)
+    try:
+        with _profile_runtime_scope(b):
+            entry = runner.session_store.get_or_create_session(source)
+            entry.last_prompt_tokens = 250_000
+        old_sid = entry.session_id
+
+        async def reload(event):
+            return "reloaded"
+        monkeypatch.setattr(runner, "_execute_mcp_reload", reload)
+
+        async def exercise():
+            runner._on_session_idle(entry.session_key)
+            await asyncio.gather(*list(getattr(runner, "_session_rotation_tasks", ())))
+        asyncio.run(exercise())
+        assert runner.session_store._entries[entry.session_key].session_id != old_sid
+    finally:
+        set_multiplex_active(before)

@@ -275,13 +275,19 @@ class GatewaySessionCommandsMixin:
     def _on_session_idle(self, session_key: str) -> None:
         """A turn on ``session_key`` has ended and nothing else holds it: rotate it if it is aged."""
         from gateway.session_rotation import rotation_due
-        try:
-            due = rotation_due(self, session_key)
-        except Exception:
-            logger.debug("Session rotation check failed for %s", session_key, exc_info=True)
+        entry = getattr(self.session_store, "_entries", {}).get(session_key)
+        source = getattr(entry, "origin", None)
+        if not isinstance(source, SessionSource) or not self._session_idle(session_key):
             return
-        if due is None or not self._session_idle(session_key):
-            return
+        # Under multiplexing the threshold is the session's own profile's: the rotation checks it in
+        # that scope. Otherwise it is checked here, so an idle session that is not aged costs no task.
+        if self._profile_scope_key_for_source(source) is None:
+            try:
+                if rotation_due(self, session_key) is None:
+                    return
+            except Exception:
+                logger.debug("Session rotation check failed for %s", session_key, exc_info=True)
+                return
         tasks = getattr(self, "_session_rotation_tasks", None)
         if tasks is None:
             tasks = self._session_rotation_tasks = set()

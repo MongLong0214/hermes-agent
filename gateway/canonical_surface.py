@@ -1085,6 +1085,8 @@ class CanonicalReceiptCoordinator:
         except ValueError as refusal:
             if str(refusal) in {"canonical_principal_rejected", "canonical_roster_unavailable"}:
                 raise
+            # Mid-rotation the route, row or agent is between sessions: busy, retried into the new one.
+            refusal = self._busy_if_rotated(refusal, binding.session_key, self._rotation_epoch(binding.session_key))
             return self._recorded_or_refuse(binding, event, key, fingerprint, str(refusal))
         epoch = self._rotation_epoch(proof.session_key)
         if cached_actor(self._runner, proof.session_key)[0] is None:
