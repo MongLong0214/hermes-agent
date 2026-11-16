@@ -102,9 +102,9 @@ def build_handoff(db: Any, old_session_id: str, tokens: int, threshold: int) -> 
             if current is not None:
                 open_requests.append(current)
             current = line
-        elif (current is not None and row.get("role") == "assistant"
+        elif (current is not None and row.get("role") == "assistant" and not row.get("tool_calls")
               and _text(row.get("content")).strip()):
-            current = None  # answered
+            current = None  # answered: a final text, not commentary beside a tool call
     if current is not None:
         open_requests.append(current)
     open_requests = open_requests[-_HANDOFF_ITEMS:]

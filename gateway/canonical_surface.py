@@ -700,6 +700,20 @@ class CanonicalReceiptCoordinator:
         rotating = getattr(self._runner, "_session_rotating", None)
         return callable(rotating) and rotating(session_key) is True
 
+    def _rotation_epoch(self, session_key: str) -> int:
+        epoch = getattr(self._runner, "_session_rotation_epoch", None)
+        value = epoch(session_key) if callable(epoch) else 0
+        return value if isinstance(value, int) else 0
+
+    def _busy_if_rotated(self, refusal: ValueError, session_key: str, epoch: int) -> ValueError:
+        """A refusal before the claim, for an event whose session began rotating after it was
+        resolved (its route, agent or row moved under it), is ``canonical_turn_busy``: the event never
+        ran, and its retry resolves the new session. Any other refusal stands."""
+        if str(refusal) in ("canonical_binding_stale", "canonical_agent_replaced") and (
+                self._session_rotating(session_key) or self._rotation_epoch(session_key) != epoch):
+            return ValueError("canonical_turn_busy")
+        return refusal
+
     def _session_held(self, session_key: str) -> bool:
         """A turn runs on the session, or it is mid-rotation."""
         return self._runner._is_session_running(session_key) or self._session_rotating(session_key)
@@ -1072,6 +1086,7 @@ class CanonicalReceiptCoordinator:
             if str(refusal) in {"canonical_principal_rejected", "canonical_roster_unavailable"}:
                 raise
             return self._recorded_or_refuse(binding, event, key, fingerprint, str(refusal))
+        epoch = self._rotation_epoch(proof.session_key)
         if cached_actor(self._runner, proof.session_key)[0] is None:
             # No agent cached (a clean restart, before any ordinary turn). An event already recorded
             # answers from its receipt here, as it always has; only an unrecorded one goes on to have
@@ -1107,6 +1122,7 @@ class CanonicalReceiptCoordinator:
             if relay is not None:
                 peer = None
         except ValueError as refusal:
+            refusal = self._busy_if_rotated(refusal, proof.session_key, epoch)
             refused = refusal if getattr(refusal, "reason", None) else None
             try:
                 return self._recorded_or_refuse(binding, event, key, fingerprint, str(refusal), proof)
@@ -1149,6 +1165,7 @@ class CanonicalReceiptCoordinator:
                     # At the point of use, under the lease: still the canonical CTO of that session.
                     await asyncio.to_thread(relay[3])
             except ValueError as refusal:
+                refusal = self._busy_if_rotated(refusal, proof.session_key, epoch)
                 refused = refusal if getattr(refusal, "reason", None) else None
                 try:
                     return self._recorded_or_refuse(binding, event, key, fingerprint, str(refusal), proof)

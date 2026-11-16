@@ -248,3 +248,128 @@ def test_the_handoff_notice_never_makes_the_new_session_unanswered(tmp_path):
         assert db.open_user_tail_is_delivery_only("new") is False
     finally:
         db.close()
+
+
+def test_unanswered_tool_work_is_carried():
+    """Commentary beside a tool call is no answer: the request stays open (review r1)."""
+    from gateway.session_rotation import build_handoff
+
+    note = build_handoff(_Rows([
+        {"role": "user", "content": "Please deploy the fix"},
+        {"role": "assistant", "content": "I will inspect the deployment first.",
+         "tool_calls": [{"id": "inspect", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "inspect", "content": "deployment status"},
+        {"role": "assistant", "content": ""},
+    ]), "old", 250_000, 200_000)
+    assert "owner: Please deploy the fix" in note["content"]
+
+
+def test_an_event_resolved_before_a_rotation_is_answered_busy(ingress, send, monkeypatch):
+    """Review r1: a relayed owner event paused in its relay verification while the session rotated
+    is refused busy (the shim retries into the new session), never canonical_binding_stale."""
+    import threading
+
+    import gateway.owner_relay as relay_module
+    from tests.gateway.test_canonical_owner_relay import _entitle, _owner_record, _relay, _transcript
+
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    _entitle()
+    _transcript(_owner_record())
+    finish_reload = asyncio.Event()
+    _instrument(h, monkeypatch, gate=finish_reload)
+
+    async def exercise():
+        await h.warm()
+        _age(h)
+        waiting, finish_admission = threading.Event(), threading.Event()
+        original = relay_module.verify_relay
+
+        def verify(*args, **kwargs):
+            waiting.set()
+            assert finish_admission.wait(10)
+            return original(*args, **kwargs)
+        monkeypatch.setattr(relay_module, "verify_relay", verify)
+        pending = asyncio.ensure_future(h.send(event_id="overlap", text=_relay()))
+        await h.wait(waiting.is_set, "the relay verification")
+        rotating = asyncio.ensure_future(h.runner._rotate_aged_session(h.key))
+        await h.wait(lambda: h.reloads, "the rotation to reach its MCP reconnect")
+        finish_admission.set()
+        result = await pending
+        finish_reload.set()
+        assert await rotating is True
+        return result
+
+    assert _code(asyncio.run(exercise())) == (409, "canonical_turn_busy")
+
+
+def test_a_typed_new_during_an_automatic_rotation_waits_for_it(ingress, send, monkeypatch):
+    """Review r1: rotations of one session run one at a time, so a typed /new never ends the busy
+    marker of an automatic rotation still reconnecting MCP."""
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    first = asyncio.Event()
+    calls = []
+
+    async def reload(event):
+        calls.append(_session_id(h))
+        if len(calls) == 1:
+            await first.wait()
+        return "reloaded"
+    monkeypatch.setattr(h.runner, "_execute_mcp_reload", reload)
+
+    async def exercise():
+        await h.warm()
+        old_sid = _session_id(h)
+        _age(h)
+        auto = asyncio.ensure_future(h.runner._rotate_aged_session(h.key))
+        await h.wait(lambda: calls, "the automatic rotation to reach its MCP reconnect")
+        typed = asyncio.ensure_future(h.runner._handle_reset_command(
+            MessageEvent(text="/new", message_type=MessageType.COMMAND, source=ingress.source)))
+        await asyncio.sleep(0.1)
+        during = await h.send(event_id="during-both")
+        assert not typed.done() and h.runner._session_rotating(h.key)
+        first.set()
+        await auto
+        await typed
+        return old_sid, during
+
+    old_sid, during = asyncio.run(exercise())
+    assert _code(during) == (409, "canonical_turn_busy")
+    assert len(calls) == 2 and old_sid != calls[0] != calls[1] == _session_id(h)
+    assert not h.runner._session_rotating(h.key)
+
+
+def test_rotation_reads_the_owning_profiles_requests(ingress, monkeypatch):
+    """Review r1: under multiplexing the handoff is read from the rotated session's own profile."""
+    import hermes_state
+    from agent.secret_scope import is_multiplex_active, set_multiplex_active
+    from gateway.config import Platform
+    from gateway.run import _profile_runtime_scope
+    from gateway.session import SessionSource
+
+    runner = ingress.runner
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH)
+    runner.config.multiplex_profiles = True
+    b = ingress.home / "profiles" / "b"
+    b.mkdir(parents=True)
+    for home in (ingress.home, b):
+        (home / "config.yaml").write_text("compression:\n  threshold_tokens: 200000\n")
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="b-chat", chat_type="dm", user_id="b-user",
+                           profile="b")
+    before = is_multiplex_active()
+    set_multiplex_active(True)
+    try:
+        with _profile_runtime_scope(b):
+            entry = runner.session_store.get_or_create_session(source)
+            db = runner.session_store._db
+            db.append_message(entry.session_id, role="user", content="B request still needs an answer")
+            entry.last_prompt_tokens = 250_000
+
+        async def reload(event):
+            return "reloaded"
+        monkeypatch.setattr(runner, "_execute_mcp_reload", reload)
+        assert asyncio.run(runner._rotate_aged_session(entry.session_key)) is True
+        new = runner.session_store._entries[entry.session_key]
+        [notice] = db.get_messages(new.session_id)
+        assert "B request still needs an answer" in notice["content"]
+    finally:
+        set_multiplex_active(before)
