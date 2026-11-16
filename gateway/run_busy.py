@@ -316,14 +316,20 @@ class GatewayBusySessionMixin:
         state = self._peek_session_state(session_key)
         reserved = (state is not None and state.turn.agent is _AGENT_PENDING_SENTINEL
                     and getattr(state.turn.event, "_turn_reservation", None) is not None)
-        return reserved or self._canonical_peer_turn_running(session_key)
+        return reserved or self._rotating(session_key) or self._canonical_peer_turn_running(session_key)
+
+    def _rotating(self, session_key: str) -> bool:
+        """True while the session is being rotated (gateway/slash_commands_session.py): what arrives
+        meanwhile waits in its FIFO, and the rotation hands it the new session when it ends."""
+        rotating = getattr(self, "_session_rotating", None)
+        return callable(rotating) and rotating(session_key) is True
 
     def _defers_pending_drain(self, session_key: str) -> bool:
-        """True while the session's queued follow-ups wait for a canonical peer turn, which hands them
-        on itself when it releases the session (:meth:`_dispatch_queued_turn_after_peer_turn`). The
-        adapter leaves them queued meanwhile: a dispatched one would only find the session busy and
-        be queued again, in a loop."""
-        return self._canonical_peer_turn_running(session_key)
+        """True while the session's queued follow-ups wait for a canonical peer turn or a rotation,
+        which hands them on itself when it releases the session
+        (:meth:`_dispatch_queued_turn_after_peer_turn`). The adapter leaves them queued meanwhile: a
+        dispatched one would only find the session busy and be queued again, in a loop."""
+        return self._rotating(session_key) or self._canonical_peer_turn_running(session_key)
 
     def _adapter_holding_pending(self, session_key: str) -> Any:
         """The live adapter whose pending slot holds ``session_key``'s FIFO head, or None."""

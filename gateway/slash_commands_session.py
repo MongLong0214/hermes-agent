@@ -199,7 +199,119 @@ class GatewaySessionCommandsMixin:
         await self.hooks.emit("session:reset", dict(hook_payload))
 
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
-        """Handle /new or /reset command."""
+        """Handle /new or /reset command: rotate the session, then refresh MCP for the new one."""
+        session_key = self._session_key_for_source(event.source)
+        rotating = self._rotating_session_keys()
+        rotating.add(session_key)
+        try:
+            reply = await self._reset_session_for_event(event)
+            await self._refresh_mcp_after_rotation(event)
+        finally:
+            rotating.discard(session_key)
+        return reply
+
+    # ------------------------------------------------------- rotation without /new typed
+
+    def _rotating_session_keys(self) -> set:
+        """Session keys mid-rotation. While one rotates, an owner message queues in its FIFO
+        (``_queues_behind_peer_turn``) and a canonical event is refused ``canonical_turn_busy``."""
+        keys = getattr(self, "_session_rotations", None)
+        if keys is None:
+            keys = self._session_rotations = set()
+        return keys
+
+    def _session_rotating(self, session_key: str) -> bool:
+        return session_key in self._rotating_session_keys()
+
+    async def _refresh_mcp_after_rotation(self, event: MessageEvent) -> None:
+        """Reconnect MCP servers as ``/reload-mcp`` does. A new connection is what lets ACP's tool
+        admission read the Gateway identity again and advance the CEO head to the new session; a
+        rotation without it leaves every ACP tool call refused (``MCP_TOOL_PROVENANCE_REFUSED``)
+        until someone types ``/reload-mcp``."""
+        try:
+            result = await self._execute_mcp_reload(event)
+            logger.info("MCP servers reconnected after session rotation: %s",
+                        " / ".join(str(result).splitlines()[:4]))
+        except Exception:
+            logger.exception("MCP reconnect after session rotation failed")
+
+    def _session_idle(self, session_key: str) -> bool:
+        """No turn runs, is reserved, prepares or waits for ``session_key`` anywhere in the gateway."""
+        if self._is_session_running(session_key) or self._session_rotating(session_key):
+            return False
+        if getattr(self, "_draining", False) or self._overflow_queue(session_key):
+            return False
+        for adapters in (self._primary_adapters(), *self._profile_adapters_map().values()):
+            for adapter in (adapters or {}).values():
+                if (session_key in (getattr(adapter, "_active_sessions", None) or {})
+                        or session_key in (getattr(adapter, "_pending_messages", None) or {})):
+                    return False
+        entry = getattr(self.session_store, "_entries", {}).get(session_key)
+        leases = getattr(getattr(self, "_turn_leases", None), "_leases", None) or {}
+        lease = leases.get(getattr(entry, "session_id", None)) if entry is not None else None
+        return getattr(lease, "holder", None) is None
+
+    def _on_session_idle(self, session_key: str) -> None:
+        """A turn on ``session_key`` has ended and nothing else holds it: rotate it if it is aged."""
+        from gateway.session_rotation import rotation_due
+        try:
+            due = rotation_due(self, session_key)
+        except Exception:
+            logger.debug("Session rotation check failed for %s", session_key, exc_info=True)
+            return
+        if due is None or not self._session_idle(session_key):
+            return
+        tasks = getattr(self, "_session_rotation_tasks", None)
+        if tasks is None:
+            tasks = self._session_rotation_tasks = set()
+        task = asyncio.ensure_future(self._rotate_aged_session(session_key))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def _rotate_aged_session(self, session_key: str) -> bool:
+        """Rotate an aged, idle session through the ``/new`` path, open the new one with the handoff
+        of its open requests, reconnect MCP, then hand the session to anything that queued meanwhile.
+        Everything up to marking the session rotating runs without an await, so no turn is admitted
+        between the idle check and the mark. True when it rotated."""
+        from gateway.session_rotation import build_handoff, rotation_due
+        due = rotation_due(self, session_key)
+        entry = getattr(self.session_store, "_entries", {}).get(session_key)
+        source = getattr(entry, "origin", None)
+        if (due is None or not isinstance(source, SessionSource) or not self._session_idle(session_key)
+                or self._session_key_for_source(source) != session_key):
+            return False
+        old_sid = entry.session_id
+        event = MessageEvent(text="/new", message_type=MessageType.COMMAND, source=source, internal=True)
+        rotating = self._rotating_session_keys()
+        rotating.add(session_key)
+        try:
+            logger.info("Rotating session %s (%s): last prompt %d tokens >= compaction threshold %d",
+                        session_key, old_sid, *due)
+            db = getattr(self._session_db, "_db", self._session_db)
+            handoff = None
+            if db is not None:
+                try:
+                    handoff = await asyncio.to_thread(build_handoff, db, old_sid, *due)
+                except Exception:
+                    logger.warning("Session rotation handoff for %s could not be read", old_sid, exc_info=True)
+            await self._reset_session_for_event(event)
+            new_entry = getattr(self.session_store, "_entries", {}).get(session_key)
+            if handoff is not None and new_entry is not None and new_entry.session_id != old_sid:
+                await self.async_session_store.append_to_transcript(new_entry.session_id, handoff)
+            await self._refresh_mcp_after_rotation(event)
+            logger.info("Session %s rotated: %s -> %s", session_key, old_sid,
+                        getattr(new_entry, "session_id", None))
+            return True
+        except Exception:
+            logger.exception("Automatic rotation of session %s failed", session_key)
+            return False
+        finally:
+            rotating.discard(session_key)
+            # What queued behind the rotation runs now, in order, before any new canonical event.
+            self._dispatch_queued_turn_after_peer_turn(session_key)
+
+    async def _reset_session_for_event(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+        """The /new rotation itself, and the reply a typed /new gets."""
         source = event.source
         session_key = self._session_key_for_source(source)
         self._invalidate_session_run_generation(session_key, reason="session_reset")

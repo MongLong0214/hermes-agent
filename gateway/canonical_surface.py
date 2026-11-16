@@ -693,6 +693,17 @@ class CanonicalReceiptCoordinator:
     def __init__(self, runner: Any) -> None:
         self._runner = runner
 
+    def _session_rotating(self, session_key: str) -> bool:
+        """The session is mid-rotation (``/new``, typed or automatic): the event is refused busy and
+        its sender retries, into the new session. Checked before the cached agent is borrowed, which
+        a half-rotated session would answer stale."""
+        rotating = getattr(self._runner, "_session_rotating", None)
+        return callable(rotating) and rotating(session_key) is True
+
+    def _session_held(self, session_key: str) -> bool:
+        """A turn runs on the session, or it is mid-rotation."""
+        return self._runner._is_session_running(session_key) or self._session_rotating(session_key)
+
     @staticmethod
     def _fingerprint(binding: CanonicalSurfaceBinding, event: CanonicalIngressEvent) -> str:
         payload = json.dumps(
@@ -1072,10 +1083,12 @@ class CanonicalReceiptCoordinator:
                     raise
         actor = db = relay = None
         try:
+            if self._session_rotating(proof.session_key):
+                raise ValueError("canonical_turn_busy")
             # A cached agent is borrowed as always.
             if cached_actor(self._runner, proof.session_key)[0] is not None:
                 actor, db = self._borrow_actor_db(self._runner, proof)
-            if self._runner._is_session_running(proof.session_key):
+            if self._session_held(proof.session_key):
                 raise ValueError("canonical_turn_busy")
             if actor is not None and _runs_tools_outside_hermes(actor):
                 raise ValueError("canonical_runtime_refused")
@@ -1122,7 +1135,7 @@ class CanonicalReceiptCoordinator:
                 self._require_current_claim_target(proof, actor, db)
                 if event.expected_identity is not None:
                     self._require_expected_identity(proof, event.expected_identity)
-                if self._runner._is_session_running(proof.session_key):
+                if self._session_held(proof.session_key):
                     raise ValueError("canonical_turn_busy")
                 # An open user row would be merged with this peer turn by the agent's alternation
                 # repair, erasing the boundary between the two principals. Checked under the lease.
@@ -1369,3 +1382,10 @@ class CanonicalReceiptCoordinator:
                     self._runner._dispatch_queued_turn_after_peer_turn(proof.session_key)
                 except Exception:
                     logger.exception("Failed to start the follow-up queued behind a canonical peer turn")
+                # Nothing queued took it: the session is idle, and an aged one is rotated now.
+                idle = getattr(self._runner, "_on_session_idle", None)
+                if callable(idle) and not self._runner._is_session_running(proof.session_key):
+                    try:
+                        idle(proof.session_key)
+                    except Exception:
+                        logger.exception("Session idle check after a canonical peer turn failed")

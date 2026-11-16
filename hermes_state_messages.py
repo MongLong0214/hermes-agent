@@ -76,6 +76,10 @@ _INVALID = object()  # _json_or sentinel where the fallback must be distinguisha
 # turn, but no principal's message, so it never makes the history unanswered.
 MCP_RELOAD_NOTICE_DISPLAY_KIND = "mcp_reload_notice"
 MCP_RELOAD_NOTICE_METADATA = {"system_notice": "mcp_reload"}
+# The notice an automatically rotated session opens with (gateway/session_rotation.py), the same kind
+# of row: written by the gateway, read with the next turn, no principal's message.
+ROTATION_HANDOFF_DISPLAY_KIND = "session_rotation_handoff"
+ROTATION_HANDOFF_METADATA = {"system_notice": "session_rotation_handoff"}
 # Notices written before they were typed carry no kind and no metadata: only the exact text the gateway
 # writes counts, never a longer message that merely contains it.
 _LEGACY_MCP_RELOAD_NOTICE_RE = re.compile(
@@ -563,8 +567,8 @@ class SessionMessagesMixin:
     def open_user_tail_is_delivery_only(self, session_id: str) -> bool:
         """True when the open user tail (active user rows after the newest assistant/tool row) holds
         only recorded delegation deliveries (``async_delegation_complete`` / ``hidden``), which
-        ``append_delegation_delivery`` writes between client turns to be read with the next one, and
-        /reload-mcp notices. Such rows are no principal's message, so they do not make the history
+        ``append_delegation_delivery`` writes between client turns to be read with the next one,
+        /reload-mcp notices and a rotated session's handoff notice. Such rows are no principal's message, so they do not make the history
         unanswered."""
         # ``hidden`` also marks ordinary off-screen user prompts (#102 r1 H102-01): only a row that
         # carries the delivery's own delegation_id, as append_delegation_delivery writes it, counts.
@@ -579,7 +583,9 @@ class SessionMessagesMixin:
             role == "user" and (
                 (kind in ("async_delegation_complete", "hidden")
                  and isinstance(delegation_id, str) and bool(delegation_id.strip()))
-                or self._is_mcp_reload_notice(kind, notice, metadata, content))
+                or self._is_mcp_reload_notice(kind, notice, metadata, content)
+                or (kind == ROTATION_HANDOFF_DISPLAY_KIND
+                    and notice == ROTATION_HANDOFF_METADATA["system_notice"]))
             for role, kind, delegation_id, notice, metadata, content in rows)
 
     def _is_mcp_reload_notice(self, kind: Any, notice: Any, metadata: Any, content: Any) -> bool:

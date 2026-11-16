@@ -4535,6 +4535,15 @@ class BasePlatformAdapter(ABC):
                 self._spawn_drain_task(late_pending, session_key)
         elif current_task is not None and self._session_tasks.get(session_key) is current_task:
             self._cleanup_finished_session_task(session_key, interrupt_event)
+            if session_key not in self._active_sessions and session_key not in self._pending_messages:
+                # The session is idle: the runner rotates it now if it is aged.
+                idle = getattr(self.gateway_runner, "_on_session_idle", None)
+                if callable(idle):
+                    try:
+                        idle(session_key)
+                    except Exception:
+                        logger.debug("[%s] Session idle check failed for %s", self.name, session_key,
+                                     exc_info=True)
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
