@@ -6,7 +6,8 @@ original text, verbatim, and its transcript record. A canonical event carrying s
 the same canonical CEO session as an *owner* turn (gateway/run.py, run_bound_existing_turn), not as a
 peer turn, and its answer goes to the Buzz thread it came from. Nothing asks the owner anything.
 
-The relay is a closed block at the very start of the event's text::
+The relay is a closed block at the very start of the event's own content (inside the canonical bridge's
+framing of it, :func:`event_content`)::
 
     [owner-relay v1]
     session: <the CTO's Claude session id>         (optional)
@@ -21,7 +22,8 @@ A reference left out is recovered here from the CTO's transcript, never asked of
 an owner instruction only when ALL of these hold (:func:`verify_relay`), read when the event arrives:
 
 * the relaying Buzz actor (the event's verified author) holds the ACP canonical session entitlement of
-  exactly one Claude session (``canonical_session_entitlements``, active, in ACP's state, read only),
+  exactly one Claude session (``canonical_session_entitlements`` active, or a claimed unrevoked
+  ``canonical_entitlement_transfers`` row to it, in ACP's state, read only),
   and, when the routing roster lists the room, it is that room's canonical peer and the room names the
   entitlement's project;
 * that session's transcript (``~/.claude/projects/*/<session>.jsonl``) holds the cited record: a
@@ -136,6 +138,44 @@ def parse_relay(text: Any) -> Optional[RelayClaim]:
                       note="\n".join(lines[end + 1:]).strip())
 
 
+# The canonical bridge (bridge/canonical/) never submits an event's content bare: a single event is
+# buzz-acp's whole prompt (its [Context] and any quoted thread history, then the event's header lines and
+# ``Content: <content>``; acp-canonical-shim.py ``prompt_text``), a recovered batch member is the bridge's
+# own header and then ``Content: <content>`` (canonical_batch.py ``deliver_member``).
+_RECOVERED_TITLE = "[Buzz event: recovered]"
+_EVENT_TITLE = "[Buzz event:"
+_CONTENT = "Content: "
+_THREAD_ROOT = "Thread root: "
+
+
+def event_content(text: Any, *, event_id: str, channel_id: str, author_id: str) -> Any:
+    """The event's own content inside the bridge's framing of *text*, where its relay opens; *text* itself
+    when *text* is not framed as this very event (its id, channel and author). The relay is read only
+    there: a block quoted in the thread history or the [Context] above it is not this event's."""
+    if not isinstance(text, str):
+        return text
+    lines = text.replace("\r\n", "\n").split("\n")
+    if lines[:4] == [_RECOVERED_TITLE, f"Event ID: {event_id}", f"Channel ID: {channel_id}", f"Author ID: {author_id}"]:
+        # Everything after the Author ID line is the author's own signed event (the root is a tag of it).
+        at = 5 if len(lines) > 5 and lines[4].startswith(_THREAD_ROOT) else 4
+    else:
+        # buzz-acp's event section is the prompt's last, and its title the section's one line opening
+        # with the title prefix (the bridge forwards nothing else), so it is the text's last such line.
+        titles = [index for index, line in enumerate(lines) if line.startswith(_EVENT_TITLE)]
+        if not titles:
+            return text
+        at = titles[-1] + 6
+        header = lines[titles[-1] + 1:at]
+        if not (len(header) == 5 and header[0] == f"Event ID: {event_id}"
+                and header[1].startswith("Channel: ") and header[1].endswith(f" (#{channel_id})")
+                and header[2].startswith("Kind: ") and header[3].startswith("From: ")
+                and header[3].endswith(f"hex: {author_id})") and header[4].startswith("Time: ")):
+            return text
+    if at >= len(lines) or not lines[at].startswith(_CONTENT):
+        return text
+    return "\n".join([lines[at][len(_CONTENT):], *lines[at + 1:]])
+
+
 def _instant(value: Any) -> Optional[datetime]:
     if not isinstance(value, str) or not value:
         return None
@@ -157,8 +197,10 @@ def claude_projects_dir() -> Path:
 def entitled_session(actor_id: str, *, project_id: Optional[str] = None,
                      state_path: Optional[Path] = None) -> str:
     """The Claude session whose ACP canonical session entitlement the Buzz actor *actor_id* holds now
-    (one active row; of *project_id* when the room names one), read from ACP's state read only. Raises
-    :class:`OwnerRelayRefused`."""
+    (one active row; of *project_id* when the room names one), read from ACP's state read only. A
+    rotated CTO's entitlement is its claimed, unrevoked transfer (ACP ``CanonicalSessionRegistry.effective``:
+    the row it superseded is a tombstone; a pending transfer leaves the predecessor the entitlement).
+    Raises :class:`OwnerRelayRefused`."""
     path = state_path if state_path is not None else acp_state_path()
     if not path.is_file():
         raise OwnerRelayRefused("acp_state_unavailable")
@@ -166,7 +208,10 @@ def entitled_session(actor_id: str, *, project_id: Optional[str] = None,
         with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0)) as conn:
             rows = conn.execute(
                 "SELECT session_uuid, project_id FROM canonical_session_entitlements "
-                "WHERE buzz_actor_id = ? AND revoked_at IS NULL", (actor_id,)).fetchall()
+                "WHERE buzz_actor_id = ? AND revoked_at IS NULL "
+                "UNION ALL SELECT to_session_uuid, project_id FROM canonical_entitlement_transfers "
+                "WHERE buzz_actor_id = ? AND claimed_at IS NOT NULL AND revoked_at IS NULL",
+                (actor_id, actor_id)).fetchall()
     except sqlite3.Error:
         raise OwnerRelayRefused("acp_state_unavailable") from None
     rows = [row for row in rows if project_id is None or row[1] == project_id]
