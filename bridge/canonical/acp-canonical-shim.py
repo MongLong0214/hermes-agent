@@ -793,6 +793,22 @@ def is_silent_answer(answer):
     return isinstance(answer, str) and answer.strip() == SILENT_ANSWER
 
 
+# gateway/owner_relay.py ``HEADER``: a CTO message whose content opens with it relays the owner.
+OWNER_RELAY_HEADER = "[owner-relay v1]"
+
+
+def silence_allowed(snapshot, author, channel, body):
+    """True only for a message from the room's own peer (its CTO) that relays no owner instruction: the one
+    kind of event the CEO may leave unanswered, so the only one offered ``SILENT_ANSWER`` and the only one
+    whose ``SILENT_ANSWER`` is not posted. The owner, a relay of the owner (the relay header anywhere in the
+    content, a superset of the gateway's own test, so a relay is never taken for a peer message), another
+    author, an unreadable roster or an inactive room give False: their answer is posted whatever it says."""
+    if snapshot is None or author == OWNER or not isinstance(body, str) or OWNER_RELAY_HEADER in body:
+        return False
+    room = snapshot.active(channel)
+    return bool(room) and author == room["peer"]["pubkey"]
+
+
 def journal_silent(event_id, channel, answer):
     """Journal the CEO's explicit no-reply answer in the event's one delivery slot, the slot its post would
     take: ``kind`` ``answer``, ``state`` ``silent``, ``delivery`` ``not_posted``. Nothing is sent. The slot
@@ -806,7 +822,7 @@ def journal_silent(event_id, channel, answer):
     with os.fdopen(fd, "w") as marker:
         marker.write(json.dumps({
             "journal": 2, "sent": False, "state": "silent", "delivery": "not_posted", "kind": "answer",
-            "event_id": event_id, "ref": None, "channel": channel,
+            "principal": "peer", "event_id": event_id, "ref": None, "channel": channel,
             "roster_generation": getattr(_local, "roster_generation", None), "reply_to": event_id,
             "reason": f"the CEO answered {SILENT_ANSWER}: no reply", "body_sha256": _sha256(answer),
             "attempts": 0, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
@@ -1428,7 +1444,9 @@ def recovery_delivery_state(event_id):
     """
     records = [publication_record(event_id + suffix) for suffix in ("", ".answer")]
     records = [r for r in records if r.get("event_id") == event_id]
-    if any(r.get("kind") == "answer" and (r.get("sent") is True or r.get("state") == "silent") for r in records):
+    if any(r.get("kind") == "answer" and (r.get("sent") is True
+                                          or (r.get("state") == "silent" and r.get("principal") == "peer"))
+           for r in records):
         return "answered"
     with _INFLIGHT_LOCK:
         if event_id in _INFLIGHT:
@@ -1964,7 +1982,9 @@ def deliver_event(session, parsed, text, mentioned):
     if fitted[0] is not text:
         log(f"prompt {base[:12]}… {len(text)} chars is over the gateway limit {GATEWAY_TEXT_LIMIT}: "
             f"omitted {fitted[1]} thread messages ({fitted[2]} chars), submitting {len(fitted[0])} chars")
-    text = offer_silent_answer(fitted[0])
+    # Silence is the peer's alone: an owner message or an owner relay is never offered it.
+    silent_ok = silence_allowed(snapshot, author, channel, body)
+    text = offer_silent_answer(fitted[0]) if silent_ok else fitted[0]
     if not begin_submission(session, base, channel):
         return
     # Every attempt and every replay of this event uses its own Buzz event id. A busy refusal is
@@ -2027,7 +2047,7 @@ def deliver_event(session, parsed, text, mentioned):
         "sessionId": session,
         "update": {"sessionUpdate": "agent_message_chunk",
                    "content": {"type": "text", "text": answer}}}})
-    if answered and is_silent_answer(answer):
+    if answered and silent_ok and is_silent_answer(answer):
         journal_silent(base, channel, answer)
     elif answered and answer and answer.strip():
         publish_reply(base, channel, answer)

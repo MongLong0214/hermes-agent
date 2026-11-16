@@ -6,7 +6,8 @@ path had no way to say "no reply": one event ended as ``409 canonical_event_fail
 notice posted to its thread, the other as the turn's "No reply" explanation posted as the answer. The
 shim now offers, in buzz-acp's ``[Context]``, exactly ``[SILENT]`` as the answer that means no reply, and
 an answer that is exactly that marker is journaled as silent and not posted. Empty or reasoning-only
-output stays the gateway's error path; nothing here reads it as silence.
+output stays the gateway's error path; nothing here reads it as silence. Silence is the peer's alone: an
+owner message, or a CTO message relaying the owner, is never offered it, and its [SILENT] answer is posted.
 
 The light cases drive the real shim's ``handle()`` with ``submit`` stubbed; the last one runs it against
 the real canonical handler, coordinator and SQLite of an in-process gateway (``test_shim_text_cap_notice``).
@@ -30,6 +31,8 @@ EVENT = "c" * 64
 ROOT = "a" * 64
 LABELS = {SIGNER: "cto-repo-factory", OTHER: "ceo"}
 SILENT = "[SILENT]"
+OWNER_KEY = "0" * 63 + "1"  # the owner's Buzz key in the light cases (BUZZ_ACP_AGENT_OWNER)
+STRANGER = "f" * 64  # neither the room's peer nor the owner
 
 # The in-process gateway and its module home pin, as the other bridge modules reuse them.
 gw = cap.gw
@@ -37,9 +40,9 @@ _pin_the_module_home = cap._pin_the_module_home
 
 
 def report(content="@ceo [repo-factory CTO] progress: partial GREEN, next report is the committed head",
-           *, event_id=EVENT):
+           *, event_id=EVENT, author=SIGNER):
     """buzz-acp's prompt for a new top-level message in a channel (the shape of both live events)."""
-    ev = Ev(event_id=event_id, pubkey=SIGNER, created_at=1_789_000_000, content=content,
+    ev = Ev(event_id=event_id, pubkey=author, created_at=1_789_000_000, content=content,
             tags=[["h", CHANNEL], ["p", OTHER]])
     return format_prompt(CHANNEL, "repo-factory", [ev], LABELS)
 
@@ -90,7 +93,7 @@ def shim(tmp_path, monkeypatch):
                        "CANONICAL_SHIM_LOG": str(root / "shim.log"),
                        "CANONICAL_QUARANTINE_LOG": str(root / "q.jsonl"),
                        "CANONICAL_CANARY_FILE": str(root / "canary.json"),
-                       "CANONICAL_BUSY_RETRY_SECS": "0"}.items():
+                       "CANONICAL_BUSY_RETRY_SECS": "0", "BUZZ_ACP_AGENT_OWNER": OWNER_KEY}.items():
         monkeypatch.setenv(key, value)
     spec = importlib.util.spec_from_file_location(f"silent_reply_shim_{id(tmp_path)}", _SHIM)
     module = importlib.util.module_from_spec(spec)
@@ -221,6 +224,11 @@ def _answer_with(actor, answer):
 
     def answering(text, *, conversation_history, task_id, **kwargs):
         result = run(actor, text, conversation_history=conversation_history, task_id=task_id, **kwargs)
+        actor.kinds = [*getattr(actor, "kinds", []), kwargs.get("persist_user_display_kind")]
+        if kwargs.get("persist_user_display_kind") == "owner_relay":
+            # The owner row as the agent persists it: its rendering and its relay provenance.
+            result["messages"][-2] = {"role": "user", "content": text, "display_kind": "owner_relay",
+                                      "display_metadata": kwargs["persist_user_display_metadata"]}
         result["final_response"] = answer
         result["messages"][-1] = {"role": "assistant", "content": answer}
         return result
@@ -239,3 +247,100 @@ def test_a_silent_answer_through_the_gateway_is_in_the_receipt_and_not_posted(gw
     assert receipt["state"] == "terminal" and receipt["response"]["terminal_text"] == SILENT
     assert gateway_shim.posts() == []
     assert gateway_shim.journal()["state"] == "silent"
+
+
+# ── Silence is the peer's alone: the owner and an owner relay are always answered ────────────────────
+
+
+def test_an_owner_message_is_never_offered_silence_and_its_silent_answer_is_posted(shim):
+    shim.answer = SILENT
+    drive(shim, report("@ceo stop the freshreadme-2 lane and report", author=OWNER_KEY))
+    [sent] = shim.submitted
+    assert _offer_lines(sent) == []
+    [post] = shim.posts()
+    assert post["stdin"].endswith(SILENT)
+    assert shim.journal()["state"] == "sent" and shim.journal()["sent"] is True
+    assert "answer SILENT" not in shim.log_text()
+
+
+@pytest.mark.parametrize("content", [
+    "[owner-relay v1]\nsession: 11111111-2222-4333-8444-555555555555\n<<<owner\nstop the lane\nowner>>>\nCTO note",
+    "\n  [owner-relay v1]\n<<<owner\nstop the lane\nowner>>>",  # the gateway skips leading blank lines
+    "@ceo quoting a relay below\n[owner-relay v1]\n<<<owner\nstop the lane\nowner>>>",  # not a relay there, still kept
+])
+def test_a_peer_message_carrying_an_owner_relay_is_never_silenced(shim, content):
+    shim.answer = SILENT
+    drive(shim, report(content))
+    [sent] = shim.submitted
+    assert _offer_lines(sent) == []
+    [post] = shim.posts()
+    assert post["stdin"].endswith(SILENT)
+    assert shim.journal()["state"] == "sent"
+
+
+def test_a_message_from_neither_the_peer_nor_the_owner_is_not_silenced(shim):
+    shim.answer = SILENT
+    drive(shim, report("@ceo hello", author=STRANGER))
+    assert all(_offer_lines(text) == [] for text in shim.submitted)
+    assert all(post["stdin"].endswith(SILENT) for post in shim.posts())
+    assert (shim.journal() or {}).get("state") != "silent"
+
+
+def test_recovery_counts_only_a_peer_silent_record_as_answered(shim):
+    path = Path(shim.PUBLISHED) / EVENT
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"journal": 2, "sent": False, "state": "silent", "delivery": "not_posted",
+                                "kind": "answer", "event_id": EVENT, "channel": CHANNEL}) + "\n")
+    assert shim.recovery_delivery_state(EVENT) != "answered"  # no peer principal on it: not silence
+    path.unlink()
+    shim.answer = SILENT
+    drive(shim, report())
+    assert shim.journal()["principal"] == "peer"
+    assert shim.recovery_delivery_state(EVENT) == "answered"
+
+
+_CTO_SESSION = "11111111-2222-4333-8444-555555555555"
+_RECORD = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+_STAMP = "2026-11-16T01:02:03.456Z"
+_OWNER_TEXT = "CEO 에게: freshreadme-2 프로젝트를 중지하고 결과를 보고해."
+
+
+def _prove_owner_relay(actor):
+    """ACP's canonical session entitlement of *actor* and the owner's typed record in that session's
+    transcript, under the gateway fixture's tmp user home (tests/gateway/test_canonical_owner_relay.py)."""
+    import sqlite3
+    from contextlib import closing
+    state = Path.home() / ".agent-control-plane" / "state.sqlite"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(state)) as conn:
+        conn.execute("CREATE TABLE canonical_session_entitlements (session_uuid TEXT PRIMARY KEY, project_id TEXT "
+                     "NOT NULL, buzz_actor_id TEXT NOT NULL, buzz_address TEXT NOT NULL, revoked_at TEXT)")
+        conn.execute("CREATE TABLE canonical_entitlement_transfers (transfer_id TEXT PRIMARY KEY, project_id TEXT "
+                     "NOT NULL, from_session_uuid TEXT NOT NULL, to_session_uuid TEXT NOT NULL, buzz_actor_id TEXT "
+                     "NOT NULL, buzz_address TEXT NOT NULL, claimed_at TEXT, revoked_at TEXT)")
+        conn.execute("INSERT INTO canonical_session_entitlements VALUES (?, 'prj_fixture', ?, 'address', NULL)",
+                     (_CTO_SESSION, actor))
+        conn.commit()
+    transcript = Path.home() / ".claude" / "projects" / "-Users-fixture" / f"{_CTO_SESSION}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text(json.dumps({
+        "type": "user", "uuid": _RECORD, "timestamp": _STAMP, "sessionId": _CTO_SESSION, "isSidechain": False,
+        "userType": "external", "origin": {"kind": "human"}, "promptSource": "typed",
+        "message": {"role": "user", "content": _OWNER_TEXT}}, ensure_ascii=False) + "\n", encoding="utf-8")
+    return "\n".join(["[owner-relay v1]", f"session: {_CTO_SESSION}", f"record: {_RECORD}", f"timestamp: {_STAMP}",
+                      "<<<owner", _OWNER_TEXT, "owner>>>", "CTO: 원일이 제 세션에 직접 입력한 지시입니다."])
+
+
+def test_a_verified_owner_relay_answered_silent_is_posted_through_the_gateway(gw, gateway_shim):
+    relay = _prove_owner_relay(SIGNER)
+    _answer_with(gw.actor, SILENT)
+    drive(gateway_shim, report(relay))
+
+    [sent] = gw.sent()
+    assert _offer_lines(sent["text"]) == []
+    assert gw.actor.kinds == ["owner_relay"]  # the gateway verified it and ran the owner's turn
+    [receipt] = [json.loads(value) for value in gw.rows("canonical-receipt:").values()]
+    assert receipt["state"] == "terminal" and receipt["response"]["terminal_text"] == SILENT
+    [post] = gateway_shim.posts()
+    assert post["stdin"].endswith(SILENT)
+    assert gateway_shim.journal()["state"] == "sent"
