@@ -11,6 +11,18 @@ from pathlib import Path
 
 import pytest
 
+from tests.hermes_home_pin import pinned_hermes_home, tmp_root
+
+_PINNED_ROOT = tmp_root("hermes-shim-relay-")  # removed at exit by this process only
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _pin_the_module_home():
+    """HOME and the Hermes home name a fresh tmp dir while this module's tests run (tests/bridge/conftest.py)."""
+    with pinned_hermes_home(_PINNED_ROOT):
+        yield
+
+
 _SHIM = Path(os.environ.get("SHIM_PATH") or
              Path(__file__).resolve().parents[2] / "bridge" / "canonical" / "acp-canonical-shim.py")
 

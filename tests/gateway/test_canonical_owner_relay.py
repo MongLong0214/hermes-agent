@@ -217,3 +217,124 @@ def test_the_owner_turn_keeps_the_conversation_before_it(ingress, send):
         ("user", "earlier owner message"), ("assistant", "earlier answer")]
     relay_row = next(row for row in rows[2:] if row.get("display_kind") == "owner_relay")
     assert _OWNER_TEXT in relay_row["content"]
+
+
+# ── Review r1: provenance, identity, point of use, exactness, single use, approvals ─────────────────────
+
+@pytest.mark.parametrize("shape", [
+    "another_sessions_record", "no_provenance", "peer_with_human_turn", "scheduled_with_human_origin",
+    "meta_with_human_origin", "sidechain"])
+def test_a_record_whose_provenance_does_not_prove_the_owner_typed_it_in_that_session_is_refused(
+        ingress, send, shape):
+    """Every provenance marker present must say the owner typed it, at least one must be present, and the
+    record must belong to the entitled session itself, whatever file it sits in."""
+    _entitle()
+    record = _owner_record()
+    if shape == "another_sessions_record":
+        record["sessionId"] = _OTHER_SESSION
+    elif shape == "no_provenance":
+        record.pop("origin")
+        record.pop("promptSource")
+    elif shape == "peer_with_human_turn":
+        record.update(origin={"kind": "peer", "from": "uds:/peer"}, turnOrigin="human")
+    elif shape == "scheduled_with_human_origin":
+        record.update(promptSource="scheduled")
+    elif shape == "meta_with_human_origin":
+        record.update(isMeta=True)
+    else:
+        record.update(isSidechain=True)
+    _transcript(record)
+    _refused(ingress, send, _relay(), "record_not_owner_input")
+
+
+def _revoke():
+    with closing(sqlite3.connect(_home() / ".agent-control-plane" / "state.sqlite")) as conn:
+        conn.execute("UPDATE canonical_session_entitlements SET revoked_at = ?", (_STAMP,))
+        conn.commit()
+
+
+def test_an_entitlement_revoked_while_the_event_waits_for_the_turn_lease_is_refused(ingress, send, monkeypatch):
+    """The CTO's entitlement is read again at the point of use, under the turn lease: revoked, nothing runs."""
+    _entitle()
+    _transcript(_owner_record())
+    acquire = ingress.runner._turn_leases.acquire
+
+    async def revoking(*args, **kwargs):
+        _revoke()
+        return await acquire(*args, **kwargs)
+    monkeypatch.setattr(ingress.runner._turn_leases, "acquire", revoking)
+    _refused(ingress, send, _relay(), "actor_not_canonical_cto")
+
+
+def test_an_entitlement_revoked_after_the_claim_still_runs_nothing(ingress, send, monkeypatch):
+    """Revoked between the claim and the turn's start, the step that starts the owner turn refuses it."""
+    _entitle()
+    _transcript(_owner_record())
+    load = ingress.runner.async_session_store.load_transcript
+
+    async def revoking(session_id):
+        _revoke()
+        return await load(session_id)
+    monkeypatch.setattr(ingress.runner.async_session_store, "load_transcript", revoking)
+    seen = _watch(ingress)
+
+    async def exercise():
+        status, _body = await send(text=_relay())
+        assert status == 409  # past the claim: a terminal outcome, never a run
+    asyncio.run(exercise())
+    assert seen == [] and ingress.actor.calls == []
+
+
+def test_a_conflicting_event_never_consumes_the_record_another_event_then_relays(ingress, send):
+    _entitle()
+    second, text2 = "cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee", "CEO: publish the second project"
+    _transcript(_owner_record(), _owner_record(text2, uuid=second))
+
+    async def exercise():
+        assert (await send(text=_relay()))[0] == 200
+        conflict = await send(text=_relay(text2, record=second))  # the same event id, another payload
+        assert conflict[1]["error"]["code"] == "canonical_event_conflict"
+        assert (await send(text=_relay(text2, record=second), event_id="event-2"))[0] == 200
+    asyncio.run(exercise())
+    assert len(ingress.actor.calls) == 2
+
+
+@pytest.mark.parametrize("original", [".", "CEO: publish A."])
+def test_a_quote_cut_out_of_a_longer_record_grants_nothing(ingress, send, original):
+    _entitle()
+    _transcript(_owner_record("CEO: publish A. CTO: delete B."))
+    _refused(ingress, send, _relay(original), "text_mismatch")
+
+
+def test_a_part_the_owner_marked_whole_is_the_only_text_the_turn_gets_as_the_owners(ingress, send):
+    _entitle()
+    _transcript(_owner_record("CTO, 이건 CEO 에게 전달해.\n<<<owner\nCEO: publish A.\nowner>>>\n그리고 B 는 지워."))
+
+    async def exercise():
+        assert (await send(text=_relay("CEO: publish A.", record=None, stamp=None)))[0] == 200
+    asyncio.run(exercise())
+    [model_input] = ingress.actor.model_inputs
+    nonce = ingress.actor.turn_kwargs[0]["persist_user_display_metadata"]["owner_relay"]["nonce"]
+    assert f"<<<owner-instruction:{nonce}>>>\nCEO: publish A.\n<<<end-owner-instruction:{nonce}>>>" in model_input
+    assert "B 는 지워" not in model_input and "CTO, 이건" not in model_input
+
+
+def test_an_action_needing_approval_in_a_relayed_owner_turn_is_refused_never_put_to_the_owner(
+        ingress, send, monkeypatch):
+    """Under manual approvals, an action that would ask the owner is refused outright in the relayed turn:
+    a definitive result for the thread, no pending approval. The owner's own turns still ask."""
+    from tools import approval, approval_context
+    _entitle()
+    _transcript(_owner_record())
+    monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+    decisions = []
+    ingress.actor.during_turn = lambda: decisions.append(
+        approval.request_tool_approval("terminal", "requires permission", rule_key="relay-permission"))
+    try:
+        assert asyncio.run(send(text=_relay()))[0] == 200
+        [decision] = decisions
+        assert decision["approved"] is False and decision.get("status") != "approval_required"
+        assert decision["message"].startswith("BLOCKED:") and "Do not ask the owner" in decision["message"]
+        assert approval._pending.get(ingress.entry.session_key) is None
+    finally:
+        approval.unregister_gateway_notify(ingress.entry.session_key)

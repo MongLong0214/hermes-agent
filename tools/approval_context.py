@@ -54,6 +54,24 @@ def is_peer_turn() -> bool:
     return _turn_principal_ctx.get() == "peer"
 
 
+# True while an owner turn runs from an owner instruction a canonical CTO relayed (gateway/owner_relay.py):
+# the owner's authority and settings, but nobody to ask. An action the owner would have to approve is
+# refused outright (tools.approval._human_decision), reported in the thread, never put to the owner.
+_relayed_owner_ctx: contextvars.ContextVar[bool] = contextvars.ContextVar("relayed_owner_turn", default=False)
+
+
+def set_relayed_owner_turn(flag: bool) -> contextvars.Token:
+    return _relayed_owner_ctx.set(bool(flag))
+
+
+def reset_relayed_owner_turn(token: contextvars.Token) -> None:
+    _relayed_owner_ctx.reset(token)
+
+
+def is_relayed_owner_turn() -> bool:
+    return _relayed_owner_ctx.get()
+
+
 def get_turn_principal() -> str:
     """The current turn's principal for provenance/observability: "owner" for an ordinary turn
     (the ContextVar default, None, means nobody called set_turn_principal), or the bound value

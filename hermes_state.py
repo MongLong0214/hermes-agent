@@ -1692,6 +1692,37 @@ class SessionDB(
             self._conn.commit()
             return cursor.rowcount == 1
 
+    def claim_meta_all_once(
+        self,
+        items: "list[tuple[str, str]]",
+        *,
+        proven_db_path: Path,
+        proven_db_identity: Optional[Tuple[int, int]],
+    ) -> bool:
+        """Insert every ``state_meta[key] = value`` of *items* in one transaction, or none of them when any
+        key already exists: :meth:`claim_meta_once` for claims that must be taken together. Same caller
+        proof as :meth:`claim_meta_once`."""
+        with self._lock:
+            self._require_proven_meta_write_handle(
+                proven_db_path=proven_db_path,
+                proven_db_identity=proven_db_identity,
+            )
+            assert self._conn is not None
+            # A savepoint is a transaction whatever the connection's isolation level (autocommit too).
+            self._conn.execute("SAVEPOINT claim_meta_all_once")
+            try:
+                for key, value in items:
+                    self._conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)", (key, value))
+            except BaseException as exc:
+                self._conn.execute("ROLLBACK TO claim_meta_all_once")
+                self._conn.execute("RELEASE claim_meta_all_once")
+                if isinstance(exc, sqlite3.IntegrityError):
+                    return False
+                raise
+            self._conn.execute("RELEASE claim_meta_all_once")
+            self._conn.commit()
+            return True
+
     def compare_and_set_meta(
         self,
         key: str,

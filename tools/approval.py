@@ -808,12 +808,22 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     permanent_capable: bool = True, pending_body=None) -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
+    In an owner turn run from a relayed owner instruction (``approval_context.is_relayed_owner_turn``)
+    nobody is asked: the action is refused outright, a definitive result the turn reports in its thread,
+    never a pending prompt for the owner. Every check before this one (hardline floor, bypass, allowlists,
+    pattern detection) is unchanged.
+
     ``warnings`` are the ``(key, _, is_tirith)`` tuples :func:`_persist_choice` stores on
     session/always. ``permanent_capable`` hides [a]lways when no key could be permanently
     allowlisted (pure-tirith prompts); a smart-DENY owner override reduces every surface to
     once/deny and persists nothing. ``pending_body`` is a thunk, built only once a human is
     actually asked, so a smart APPROVE never pays for redacting a large script.
     """
+    if approval_context.is_relayed_owner_turn():
+        return _blocked(
+            "BLOCKED: this action needs the owner's approval, and an owner instruction relayed by a CTO carries "
+            "none. Do not ask the owner to approve it or to confirm the instruction: report in the thread that "
+            "it was refused and why, and stop. Do not retry.", pattern_key=pattern_key, description=description)
     from agent.redact import redact_sensitive_text
 
     smart_denied = False

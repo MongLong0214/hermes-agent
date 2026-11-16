@@ -1005,19 +1005,26 @@ class CanonicalReceiptCoordinator:
 
     async def _owner_relay(self, binding: CanonicalSurfaceBinding, event: CanonicalIngressEvent,
                            key: str) -> Any:
-        """``(VerifiedRelay, metadata, rendering)`` when *event* relays an owner instruction proven against
-        the relaying CTO's transcript (gateway/owner_relay.py); None for an ordinary peer message. Raises
-        ``OwnerRelayRefused`` for a relay that proves nothing, logged with its reason, never its text."""
-        from gateway.owner_relay import OwnerRelayRefused, new_metadata, parse_relay, render_owner_turn, verify_relay
+        """``(VerifiedRelay, metadata, rendering, revalidate)`` when *event* relays an owner instruction proven
+        against the relaying CTO's transcript (gateway/owner_relay.py); None for an ordinary peer message.
+        ``revalidate()`` re-reads, at the point of use, that the relaying actor is still the canonical CTO of
+        that session (roster room and ACP entitlement), raising once it is not. Raises ``OwnerRelayRefused``
+        for a relay that proves nothing, logged with its reason, never its text."""
+        from gateway.owner_relay import (
+            OwnerRelayRefused, new_metadata, parse_relay, render_owner_turn, require_still_entitled, verify_relay)
+
+        def room_of(channel_id):
+            snapshot = binding.roster_snapshot()
+            room = snapshot.active(channel_id) if snapshot is not None else None
+            if snapshot is not None and channel_id in snapshot.channels and room is None:
+                raise OwnerRelayRefused("actor_not_canonical_cto")
+            return room
         try:
             claim = parse_relay(event.text)
             if claim is None:
                 return None
-            snapshot = binding.roster_snapshot()
-            room = snapshot.active(event.channel_id) if snapshot is not None else None
-            if snapshot is not None and event.channel_id in snapshot.channels and room is None:
-                raise OwnerRelayRefused("actor_not_canonical_cto")
-            verified = await asyncio.to_thread(verify_relay, claim, author_id=event.author_id, room=room)
+            verified = await asyncio.to_thread(verify_relay, claim, author_id=event.author_id,
+                                               room=room_of(event.channel_id))
         except OwnerRelayRefused as refused:
             logger.warning("Owner relay refused: reason=%s binding=%r event_id=%r", refused.reason,
                            binding.name[:96], event.event_id[:96])
@@ -1026,7 +1033,9 @@ class CanonicalReceiptCoordinator:
                                 channel_id=event.channel_id, event_id=event.event_id, receipt=key)
         logger.info("Owner relay verified: binding=%r event_id=%r session=%s record=%s", binding.name[:96],
                     event.event_id[:96], verified.session, verified.record)
-        return verified, metadata, render_owner_turn(verified, metadata)
+        def revalidate() -> None:
+            require_still_entitled(verified, author_id=event.author_id, room=room_of(event.channel_id))
+        return verified, metadata, render_owner_turn(verified, metadata), revalidate
 
     async def submit(
         self, binding: CanonicalSurfaceBinding, event: CanonicalIngressEvent
@@ -1119,8 +1128,17 @@ class CanonicalReceiptCoordinator:
                 if (db.latest_conversation_role(proof.session_id) == "user"
                         and not db.open_user_tail_is_delivery_only(proof.session_id)):
                     raise ValueError("canonical_history_unanswered")
+                if relay is not None:
+                    # At the point of use, under the lease: still the canonical CTO of that session.
+                    await asyncio.to_thread(relay[3])
             except ValueError as refusal:
-                return self._recorded_or_refuse(binding, event, key, fingerprint, str(refusal), proof)
+                refused = refusal if getattr(refusal, "reason", None) else None
+                try:
+                    return self._recorded_or_refuse(binding, event, key, fingerprint, str(refusal), proof)
+                except ValueError as exc:
+                    if refused is not None and str(exc) == str(refused):
+                        raise refused from None
+                    raise
             run_generation = self._runner._begin_session_run_generation(proof.session_key)
             turn = self._runner._session_state(proof.session_key).turn
             turn.agent = actor
@@ -1135,17 +1153,24 @@ class CanonicalReceiptCoordinator:
             # claim's owner, so a terminal is this event's answer only when this claim wrote it.
             claim = self._encode({"v": 1, "state": "claimed", "fingerprint": fingerprint, "owner": owner})
             if relay is not None:
-                # One transcript record is relayed once: a second event citing it is refused, unclaimed.
+                # One transcript record is relayed once. Its token is claimed atomically with this event's
+                # claim and receipt: an event that conflicts with a recorded one (or replays it) consumes
+                # nothing, and a second event citing the record is refused, unclaimed.
                 from gateway.owner_relay import OwnerRelayRefused, record_key
                 record = record_key(relay[0])
-                if not db.claim_meta_once(record, key, **proven) and db.get_meta(record) != key:
+                claimed = db.claim_meta_all_once(
+                    [(self._beside(_CLAIM_NAMESPACE, key), claim), (key, pending), (record, key)], **proven)
+                if (not claimed and db.get_meta(self._beside(_CLAIM_NAMESPACE, key)) is None
+                        and db.get_meta(key) is None and db.get_meta(record) is not None):
                     try:
                         return self._recorded_or_refuse(binding, event, key, fingerprint,
                                                         "canonical_owner_relay_unverified", proof)
                     except ValueError as exc:
                         raise OwnerRelayRefused("already_relayed") from exc
-            if not (db.claim_meta_once(self._beside(_CLAIM_NAMESPACE, key), claim, **proven)
-                    and db.claim_meta_once(key, pending, **proven)):
+            else:
+                claimed = (db.claim_meta_once(self._beside(_CLAIM_NAMESPACE, key), claim, **proven)
+                           and db.claim_meta_once(key, pending, **proven))
+            if not claimed:
                 with _unconfirmed_once_claimed():
                     records = self._read_records(db, key, proof.db_path.parent)
                     # get_meta has no generation fence, so its result is usable only after this recheck.

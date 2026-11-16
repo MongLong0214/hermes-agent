@@ -3736,7 +3736,7 @@ class GatewayRunner(
             from gateway.owner_relay import opening_row_is_this_relay
 
             if relay is not None:
-                _verified, relay_meta, peer_prompt = relay
+                relay_meta, peer_prompt, relay_revalidate = relay[1], relay[2], relay[3]
                 if (relay_meta.get("binding"), relay_meta.get("relayed_by"), relay_meta.get("channel_id"),
                         relay_meta.get("event_id")) != (
                         getattr(binding, "name", None), getattr(event, "author_id", None),
@@ -3788,7 +3788,14 @@ class GatewayRunner(
                     # approval gates. Both are restored only once the turn has actually returned.
                     # A proven owner relay runs as the owner's turn: no peer principal, no grant.
                     owner_turn = relay is not None
+                    if owner_turn:
+                        # At the point of use, in the step that starts the owner turn on this worker
+                        # thread: still the canonical CTO of the relay's session, or nothing runs.
+                        relay_revalidate()
                     principal_token = set_turn_principal(None if owner_turn else "peer")
+                    # A relayed owner turn has nobody to ask: an action needing approval is refused outright.
+                    from tools.approval_context import reset_relayed_owner_turn, set_relayed_owner_turn
+                    relayed_token = set_relayed_owner_turn(owner_turn)
                     # The only grant a peer tool batch can run under: this verified binding, this
                     # actor, while the fence above still holds (agent.canonical_peer_tools).
                     # Its sends land in the caller's observation: a failed turn records that scope.
@@ -3842,6 +3849,7 @@ class GatewayRunner(
                         agent.skip_background_review = prior_skip_review
                         if grant_token is not None:
                             reset_grant(grant_token)
+                        reset_relayed_owner_turn(relayed_token)
                         reset_turn_principal(principal_token)
 
                 result = await run_owned_turn(
