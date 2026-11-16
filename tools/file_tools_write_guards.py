@@ -271,6 +271,13 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
         "etc.).")
     timed_out = blocked.format(why="approval prompt timed out without a user response. Silence is not consent.")
     denied = blocked.format(why="was denied by the user.")
+    try:
+        from tools.approval_context import RELAYED_OWNER_REFUSAL, is_relayed_owner_turn
+        if is_relayed_owner_turn():
+            # A relayed owner turn asks nobody: refused outright, never a prompt for the owner.
+            return f"BLOCKED: write to protected agent-instruction file(s) ({targets}) {RELAYED_OWNER_REFUSAL}"
+    except ImportError:
+        return blocked.format(why=_APPROVAL_UNAVAILABLE)
 
     try:
         import tools.approval as _approval

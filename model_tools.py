@@ -896,6 +896,8 @@ def handle_function_call(
     bridge catalog to this session's grant (None = unrestricted).
     """
     from agent.canonical_peer_tools import prepared_call
+    from tools.approval_context import record_relayed_owner_tool
+    record_relayed_owner_tool(function_name)  # a relayed owner turn's receipt counts it as attempted
     if prepared_call(tool_call_id) is None:  # a prepared peer call was coerced once, at preparation
         function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):

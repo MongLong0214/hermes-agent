@@ -141,6 +141,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     the leader's ``session``/``always``/``deny``/timeout; a ``once`` covers only
     the leader, so the follower falls through to a fresh prompt."""
     from tools import approval as _approval
+    from tools.approval_context import is_relayed_owner_turn
+    if is_relayed_owner_turn():
+        # Every consent path's last gate: a relayed owner turn enqueues nothing and notifies nobody.
+        return {"resolved": False, "choice": None, "cancelled": "relayed_owner_turn"}
     from agent.terminal_approval_batch import approval_published, preparing_terminal_approval, register_prepared_approval
 
     primary_key = approval_data.get("pattern_key", "")

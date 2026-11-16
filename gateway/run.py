@@ -3794,8 +3794,16 @@ class GatewayRunner(
                         relay_revalidate()
                     principal_token = set_turn_principal(None if owner_turn else "peer")
                     # A relayed owner turn has nobody to ask: an action needing approval is refused outright.
-                    from tools.approval_context import reset_relayed_owner_turn, set_relayed_owner_turn
+                    from tools.approval_context import (
+                        reset_relayed_owner_effects, reset_relayed_owner_turn, set_relayed_owner_effects,
+                        set_relayed_owner_turn)
                     relayed_token = set_relayed_owner_turn(owner_turn)
+                    # The owner tools it dispatches are its receipt's side effects; none recorded is never
+                    # proof of none (CanonicalTurnObservation.effects_proven).
+                    if owner_turn and observation is not None:
+                        observation.effects_proven = False
+                    effects_token = set_relayed_owner_effects(
+                        observation.attempted if owner_turn and observation is not None else None)
                     # The only grant a peer tool batch can run under: this verified binding, this
                     # actor, while the fence above still holds (agent.canonical_peer_tools).
                     # Its sends land in the caller's observation: a failed turn records that scope.
@@ -3849,6 +3857,7 @@ class GatewayRunner(
                         agent.skip_background_review = prior_skip_review
                         if grant_token is not None:
                             reset_grant(grant_token)
+                        reset_relayed_owner_effects(effects_token)
                         reset_relayed_owner_turn(relayed_token)
                         reset_turn_principal(principal_token)
 

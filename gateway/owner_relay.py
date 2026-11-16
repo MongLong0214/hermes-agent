@@ -27,8 +27,8 @@ an owner instruction only when ALL of these hold (:func:`verify_relay`), read wh
 * that session's transcript (``~/.claude/projects/*/<session>.jsonl``) holds the cited record: a
   ``type: "user"`` record of that very session (its ``sessionId``) whose provenance positively and
   consistently says the owner typed it (never a tool result, a meta or scheduled prompt, a peer agent's
-  message or a sidechain; no provenance proves nothing), whose whole text, or a whole part it marks
-  between ``<<<owner`` and ``owner>>>``, is the original exactly, at the cited timestamp;
+  message or a sidechain; no provenance proves nothing), whose whole text is the original exactly
+  (trimmed; never a part of a longer message), at the cited timestamp;
 * the record was not relayed by an earlier event (single use, claimed beside the event's receipt).
 
 Anything else is refused before the turn runs, with a reason the relaying CTO is told (never the owner
@@ -88,11 +88,11 @@ class RelayClaim:
 @dataclass(frozen=True)
 class VerifiedRelay:
     """A relay proven to carry an owner instruction: the original as relayed, which is the transcript
-    record's whole user text or a whole part the record marks (``owner_text``, the only text the turn
-    receives as the owner's), that record, and the CTO's note (peer text, no authority)."""
+    record's whole user text (``owner_text``, the only text the turn receives as the owner's), that
+    record, and the CTO's note (peer text, no authority)."""
 
     original: str
-    owner_text: str  # the authoritative instruction: the relayed original, the record's whole text or marked part
+    owner_text: str  # the authoritative instruction: the relayed original, which is the record's whole text
     session: str
     record: str
     timestamp: str
@@ -245,22 +245,6 @@ def _records(path: Path, needle: Optional[str]) -> Iterator[dict]:
         raise OwnerRelayRefused("transcript_unavailable") from None
 
 
-def _whole_parts(text: str) -> list:
-    """The instruction(s) a record's text is: the whole text, trimmed, and every part the owner marked
-    in it as a whole (lines ``<<<owner`` ... ``owner>>>``, the relay's own delimiters)."""
-    lines = text.split("\n")
-    parts, index = [text.strip()], 0
-    while index < len(lines):
-        if lines[index].strip() == _OPEN:
-            end = next((i for i in range(index + 1, len(lines)) if lines[i].strip() == _CLOSE), None)
-            if end is None:
-                break
-            parts.append("\n".join(lines[index + 1:end]).strip())
-            index = end
-        index += 1
-    return [part for part in parts if part]
-
-
 def entitled_actor_session(author_id: str, room: Optional[Mapping[str, Any]] = None,
                            state_path: Optional[Path] = None) -> str:
     """The Claude session the relaying Buzz actor *author_id* is the canonical CTO of now: it is the
@@ -281,9 +265,9 @@ def verify_relay(claim: RelayClaim, *, author_id: str, room: Optional[Mapping[st
     docstring), recovering any reference it left out. *room*: the routing roster's room of the event,
     when the roster lists it. Raises :class:`OwnerRelayRefused`.
 
-    The original must be the record's whole user text (trimmed), or a whole part the record itself marks
-    (``<<<owner`` ... ``owner>>>``): never a substring, so a quote cut out of a longer message cannot
-    claim authority. A reference left out is recovered only by that same exact match."""
+    The original must be the record's whole user text (trimmed): never a substring or a part of it, so
+    nothing cut out of a longer message (whatever it marks, whatever the rest of it says about that part)
+    can claim authority. A reference left out is recovered only by that same whole-text equality."""
     session = entitled_actor_session(author_id, room, state_path)
     if claim.session is not None and claim.session != session:
         raise OwnerRelayRefused("session_not_bound")
@@ -302,7 +286,7 @@ def verify_relay(claim: RelayClaim, *, author_id: str, room: Optional[Mapping[st
             if claim.record is not None:
                 raise OwnerRelayRefused("record_not_owner_input")
             continue
-        if claim.original not in _whole_parts(text):
+        if claim.original != text.strip():
             if claim.record is not None:
                 raise OwnerRelayRefused("text_mismatch")
             continue

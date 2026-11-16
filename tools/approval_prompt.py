@@ -291,8 +291,9 @@ def request_elicitation_consent(message: str, description: str, *,
     treats them as "user did not approve" rather than retrying or hanging.
     Returns ``"accept" | "decline" | "cancel"``."""
     from tools import approval as _a
-    if _ctx.is_peer_turn():
-        # A canonical peer turn asks nobody: no prompt reaches the owner on a peer's behalf.
+    if _ctx.is_peer_turn() or _ctx.is_relayed_owner_turn():
+        # A canonical peer turn, or an owner turn run from a relayed instruction, asks nobody: no prompt
+        # reaches the owner, and the request is declined outright.
         return "decline"
     try:
         session_key = _ctx.get_current_session_key()

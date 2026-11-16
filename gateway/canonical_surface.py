@@ -521,6 +521,10 @@ class CanonicalTurnObservation:
     # ``bound_refused_answer`` proved it is this event's, this claim's and this turn's. It is kept,
     # never delivered and never promoted to the event's answer; None leaves the turn's terminal failure.
     bound_answer: Any = None
+    # Whether a finished turn that recorded no send proves no side effects. A peer turn's sends all go
+    # through its grant; a relayed owner turn runs the owner's tools, which not every effect is recorded
+    # through, so it never reports ``none``.
+    effects_proven: bool = True
 
     def failure(self, code: str, **detail: Any) -> dict:
         """``side_effects``: ``attempted`` (with the sends, ``settled`` once the actor finished so the
@@ -530,7 +534,7 @@ class CanonicalTurnObservation:
             return {"code": code, "side_effects": "attempted", "settled": self.actor_finished,
                     "attempted_count": len(self.attempted), "attempted": list(self.attempted[:_MAX_LISTED_SENDS]),
                     **detail}
-        settled = self.actor_started and self.actor_finished
+        settled = self.actor_started and self.actor_finished and self.effects_proven
         return {"code": code, "side_effects": "none" if settled else "unknown", **detail}
 
 
