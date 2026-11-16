@@ -1040,7 +1040,8 @@ class CanonicalReceiptCoordinator:
         that session (roster room and ACP entitlement), raising once it is not. Raises ``OwnerRelayRefused``
         for a relay that proves nothing, logged with its reason, never its text."""
         from gateway.owner_relay import (
-            OwnerRelayRefused, new_metadata, parse_relay, render_owner_turn, require_still_entitled, verify_relay)
+            OwnerRelayRefused, event_content, new_metadata, parse_relay, render_owner_turn, require_still_entitled,
+            verify_relay)
 
         def room_of(channel_id):
             snapshot = binding.roster_snapshot()
@@ -1049,7 +1050,9 @@ class CanonicalReceiptCoordinator:
                 raise OwnerRelayRefused("actor_not_canonical_cto")
             return room
         try:
-            claim = parse_relay(event.text)
+            # The bridge frames the event's content; the relay opens that content, not the text.
+            claim = parse_relay(event_content(event.text, event_id=event.event_id, channel_id=event.channel_id,
+                                              author_id=event.author_id))
             if claim is None:
                 return None
             verified = await asyncio.to_thread(verify_relay, claim, author_id=event.author_id,

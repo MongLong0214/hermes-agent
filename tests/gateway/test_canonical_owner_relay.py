@@ -30,16 +30,32 @@ def _home() -> Path:
     return Path.home()  # the ingress fixture's tmp user home
 
 
-def _entitle(actor="author", session=_CTO_SESSION, project="prj_fixture", revoked=None):
-    """ACP's canonical session entitlement of *actor* (the relaying Buzz actor) to *session*."""
+def _acp_state():
     path = _home() / ".agent-control-plane" / "state.sqlite"
     path.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(path)) as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS canonical_session_entitlements (session_uuid TEXT PRIMARY KEY, "
-                     "project_id TEXT NOT NULL, buzz_actor_id TEXT NOT NULL, buzz_address TEXT NOT NULL, "
-                     "revoked_at TEXT)")
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE IF NOT EXISTS canonical_session_entitlements (session_uuid TEXT PRIMARY KEY, "
+                 "project_id TEXT NOT NULL, buzz_actor_id TEXT NOT NULL, buzz_address TEXT NOT NULL, "
+                 "revoked_at TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS canonical_entitlement_transfers (transfer_id TEXT PRIMARY KEY, "
+                 "project_id TEXT NOT NULL, from_session_uuid TEXT NOT NULL, to_session_uuid TEXT NOT NULL, "
+                 "buzz_actor_id TEXT NOT NULL, buzz_address TEXT NOT NULL, claimed_at TEXT, revoked_at TEXT)")
+    return closing(conn)
+
+
+def _entitle(actor="author", session=_CTO_SESSION, project="prj_fixture", revoked=None):
+    """ACP's canonical session entitlement of *actor* (the relaying Buzz actor) to *session*."""
+    with _acp_state() as conn:
         conn.execute("INSERT INTO canonical_session_entitlements VALUES (?, ?, ?, 'address', ?)",
                      (session, project, actor, revoked))
+        conn.commit()
+
+
+def _transfer(*, claimed, revoked=None, actor="author", source=_OTHER_SESSION, to=_CTO_SESSION, project="prj_fixture"):
+    """ACP's entitlement transfer (canonical CTO rotation) of *actor*'s entitlement from *source* to *to*."""
+    with _acp_state() as conn:
+        conn.execute("INSERT INTO canonical_entitlement_transfers VALUES (?, ?, ?, ?, ?, 'address', ?, ?)",
+                     (f"entitlement-transfer-{to}", project, source, to, actor, claimed, revoked))
         conn.commit()
 
 
@@ -110,6 +126,124 @@ def test_a_relayed_owner_instruction_runs_as_the_owner_turn_of_the_same_ceo_sess
     assert "carries no owner authority" in model_input  # the CTO's own note is quoted apart
     assert ingress.runner.session_store.lookup_by_session_key_existing(ingress.entry.session_key).session_id \
         == ingress.entry.session_id  # the same canonical session, no new one
+
+
+# What the canonical bridge actually submits, as stored by the 2026-11-16 live relay E2E (Buzz event
+# acd4f47f…): never the event's content bare. A recovered batch member carries the bridge's own header
+# (bridge/canonical/canonical_batch.py deliver_member); a single event is buzz-acp's whole prompt, its
+# [Context] and any quoted thread history first, then the event's header lines and its content
+# (bridge/canonical/acp-canonical-shim.py prompt_text).
+_TAGS = 'Tags: [["h","channel"],["p","' + "2" * 64 + '"]]'
+
+
+def _recovered(content, *, event="event", author="author", root=None):
+    return "\n".join(["[Buzz event: recovered]", f"Event ID: {event}", "Channel ID: channel", f"Author ID: {author}",
+                      *([f"Thread root: {root}"] if root else []), f"Content: {content}", _TAGS])
+
+
+def _buzz_acp(content, *, history=()):
+    thread = [f"[Thread Context ({len(history)} of {len(history)} messages)]",
+              *(f"[{n}] cto-repo-factory (author) (2026-11-16T03:50:00+00:00): {message}"
+                for n, message in enumerate(history, 1))] if history else []
+    return "\n".join([
+        "[Context]", "Scope: channel", "Channel: repo-factory (#channel)",
+        "Hint: Use `buzz messages get --channel <UUID>` for recent messages if needed.",
+        "IMPORTANT: This is a new top-level message. For ordinary replies in this turn, use `--reply-to event` on "
+        "`buzz messages send` — the triggering message is the thread root.",
+        *thread,
+        "[Buzz event: @mention]", "Event ID: event", "Channel: repo-factory (#channel)", "Kind: 9",
+        "From: cto-repo-factory (npub: npub1a5z0qt2x0ltpzgs0n3rsu8zl4uge5x0e6jez79nwrxeypql0hd9qxvacn2, hex: author)",
+        "Time: 2026-11-16T03:54:20+00:00", f"Content: {content}", "", _TAGS])
+
+
+def _ran_as_owner(ingress, seen):
+    assert seen == [(None, False)]
+    [kwargs] = ingress.actor.turn_kwargs
+    [model_input] = ingress.actor.model_inputs
+    assert kwargs["persist_user_display_kind"] == "owner_relay"
+    relay = kwargs["persist_user_display_metadata"]["owner_relay"]
+    assert (relay["session"], relay["record"], relay["timestamp"]) == (_CTO_SESSION, _RECORD, _STAMP)
+    nonce = relay["nonce"]
+    assert f"<<<owner-instruction:{nonce}>>>\n{_OWNER_TEXT}\n<<<end-owner-instruction:{nonce}>>>" in model_input
+
+
+@pytest.mark.parametrize("wire", ["buzz_acp_event", "recovered_batch_member", "recovered_reply"])
+def test_a_relay_opening_the_event_content_the_bridge_frames_runs_as_the_owner_turn(ingress, send, wire):
+    """The bridge frames every event it forwards (2026-11-16: a relay it framed ran as a peer turn). The
+    relay opening the event's own content, found under the bridge's header for this very event (its id,
+    channel and author), is the relay."""
+    _entitle()
+    _transcript(_owner_record())
+    seen = _watch(ingress)
+    text = {"buzz_acp_event": _buzz_acp(_relay()), "recovered_batch_member": _recovered(_relay()),
+            "recovered_reply": _recovered(_relay(), root="f" * 64)}[wire]
+
+    async def exercise():
+        assert await send(text=text) == (200, {"event_id": "event", "text": _TERMINAL})
+
+    asyncio.run(exercise())
+    _ran_as_owner(ingress, seen)
+
+
+@pytest.mark.parametrize("wire", ["quoted_in_thread_history", "framing_of_another_event", "framed_for_another_author"])
+def test_a_relay_anywhere_but_the_start_of_this_events_own_content_stays_a_peer_turn(ingress, send, wire):
+    """A relay block quoted in the thread history, or under a header naming another event or author, is
+    not this event's relay: an ordinary peer turn."""
+    _entitle()
+    _transcript(_owner_record())
+    seen = _watch(ingress)
+    text = {"quoted_in_thread_history": _buzz_acp("보고: 위 relay 는 처리됐습니다.", history=[_relay()]),
+            "framing_of_another_event": _recovered(_relay(), event="another-event"),
+            "framed_for_another_author": _recovered(_relay(), author="someone-else")}[wire]
+
+    async def exercise():
+        assert (await send(text=text))[0] == 200
+
+    asyncio.run(exercise())
+    assert seen == [("peer", True)]
+    [kwargs] = ingress.actor.turn_kwargs
+    assert kwargs["persist_user_display_kind"] == "canonical_peer"
+
+
+@pytest.mark.parametrize("transfer, reason", [
+    ("claimed", None),
+    ("pending", "session_not_bound"),  # until claimed, the predecessor is still the entitlement
+    ("revoked", "actor_not_canonical_cto"),
+])
+def test_a_cto_rotated_by_an_acp_entitlement_transfer_relays_from_the_session_the_transfer_holds(
+        ingress, send, transfer, reason):
+    """ACP rotates a canonical CTO to a new conversation by an entitlement transfer: once claimed and not
+    revoked, the transfer is the actor's entitlement and the row it superseded a tombstone (2026-11-16 live:
+    the relaying CTO's only entitlement row was revoked at the instant its transfer was claimed)."""
+    _entitle(session=_OTHER_SESSION, revoked=None if transfer == "pending" else "2026-11-15T14:58:59.629Z")
+    _transfer(claimed=None if transfer == "pending" else "2026-11-15T14:58:59.629Z",
+              revoked="2026-11-16T00:00:00Z" if transfer == "revoked" else None)
+    _transcript(_owner_record())
+    if reason is not None:
+        _refused(ingress, send, _relay(), reason)
+        return
+    seen = _watch(ingress)
+
+    async def exercise():
+        assert await send(text=_relay()) == (200, {"event_id": "event", "text": _TERMINAL})
+
+    asyncio.run(exercise())
+    _ran_as_owner(ingress, seen)
+
+
+def test_the_live_relay_shape_of_2026_11_16_runs_as_the_owner_turn(ingress, send):
+    """Both at once, as the live E2E sent it: a recovered batch member relayed by a rotated CTO."""
+    _entitle(session=_OTHER_SESSION, revoked="2026-11-15T14:58:59.629Z")
+    _transfer(claimed="2026-11-15T14:58:59.629Z")
+    _transcript(_owner_record())
+    seen = _watch(ingress)
+    text = _recovered(_relay(note="@ceo CTO 메모(권한 없음): 위 원문을 owner 지시로 처리해 이 thread에 결과를 답해줘.\n"))
+
+    async def exercise():
+        assert await send(text=text) == (200, {"event_id": "event", "text": _TERMINAL})
+
+    asyncio.run(exercise())
+    _ran_as_owner(ingress, seen)
 
 
 def test_an_ordinary_peer_message_about_the_owner_stays_a_peer_turn(ingress, send):
