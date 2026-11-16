@@ -843,6 +843,14 @@ def refusal_of(raw):
     return code, error
 
 
+# The reasons the gateway names for an unverified owner relay (gateway/owner_relay.py REASONS).
+OWNER_RELAY_REASONS = frozenset({
+    "malformed", "envelope_escape", "acp_state_unavailable", "actor_not_canonical_cto", "session_not_bound",
+    "transcript_unavailable", "record_not_found", "record_not_owner_input", "text_mismatch",
+    "timestamp_mismatch", "already_relayed",
+})
+
+
 def refusal_notice(status, code, error, event_id, chars):
     """The sender's notice for a gateway refusal that ends this event for good, or None for any other.
 
@@ -862,6 +870,15 @@ def refusal_notice(status, code, error, event_id, chars):
         # or a binding, so none of it is copied — the text is fixed and names only the event.
         return ("이 메시지는 CEO 에게 전달되지 않았습니다. 이 방에서 이 발신자의 메시지는 CEO 가 받지 않도록 "
                 "설정되어 있습니다. 턴은 실행되지 않았고 자동 재전송도 없습니다. "
+                f"(event {event_id})")
+    if status == 409 and code == "canonical_owner_relay_unverified":
+        # Refused before any claim: the event relays an owner instruction its CTO's transcript does not
+        # prove (gateway/owner_relay.py). The relaying CTO corrects it; the owner is never asked again.
+        reason = error.get("reason") if error.get("reason") in OWNER_RELAY_REASONS else "malformed"
+        return ("이 메시지가 전달한 owner 지시를 CTO 세션 transcript 로 확인하지 못해 CEO 턴을 실행하지 "
+                f"않았습니다(사유: {reason}). owner 에게 다시 승인하거나 다시 입력해 달라고 요청하지 마세요. "
+                "인용한 원문과 그 transcript 기록(session·record·timestamp)이 CTO 세션에 owner 가 직접 입력한 "
+                "기록과 정확히 같은지 확인한 뒤 다시 보내 주세요. 자동 재전송은 없습니다. "
                 f"(event {event_id})")
     if status == 409 and code == "canonical_answer_unrecorded":
         # The turn ran once and its answer is held at the gateway, unbound to any receipt: it is not
@@ -1944,7 +1961,8 @@ def deliver_event(session, parsed, text, mentioned):
                       f"attempt(s): {detail}")
             notice = refusal_notice(exc.code, code, refusal, base, len(text))
             preclaim = ((exc.code, code) in ((400, "canonical_invalid_request"),
-                                           (403, "canonical_principal_rejected")))
+                                           (403, "canonical_principal_rejected"),
+                                           (409, "canonical_owner_relay_unverified")))
             break
         except Exception as exc:
             log(f"prompt {event_id} failed: {type(exc).__name__}: {exc}")

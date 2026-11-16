@@ -85,11 +85,14 @@ _PRE_CLAIM_CODES = frozenset({
     "canonical_runtime_refused",
     "canonical_envelope_escape",
     "canonical_history_unanswered",
+    # A relayed owner instruction its CTO's transcript does not prove (gateway/owner_relay.py): the body
+    # names the reason, from a closed vocabulary, so the relaying CTO can correct it; the owner is never asked.
+    "canonical_owner_relay_unverified",
 })
 
 
-def _refusal(code: str, status: int, message: str = "Canonical request rejected.") -> "web.Response":
-    return web.json_response({"error": {"code": code, "message": message}}, status=status)
+def _refusal(code: str, status: int, message: str = "Canonical request rejected.", **extra: Any) -> "web.Response":
+    return web.json_response({"error": {"code": code, "message": message, **extra}}, status=status)
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
@@ -162,7 +165,11 @@ async def handle_canonical_surface_identity(self, request: "web.Request") -> "we
     })
 
 
-def _refusal_for(code: str) -> "web.Response":
+def _refusal_for(code: str, reason: Any = None) -> "web.Response":
+    if code == "canonical_owner_relay_unverified":
+        from gateway.owner_relay import REASONS
+        return _refusal(code, 409, "Relayed owner instruction not verified; no turn was run.",
+                        reason=reason if reason in REASONS else "malformed")
     if code == "canonical_roster_unavailable":
         return _refusal(code, 503, "Routing roster unavailable; no turn was admitted.")
     if code == "canonical_principal_rejected":
@@ -208,7 +215,7 @@ async def handle_canonical_surface_event(self, request: "web.Request") -> "web.R
             logger.warning("Canonical event %r answered canonical_event_uncertain: stage=%s cause=%s",
                            event.event_id[:96], code[:96], str(cause)[:96] if isinstance(cause, ValueError)
                            else type(cause).__name__ if cause is not None else None)
-        return _refusal_for(code)
+        return _refusal_for(code, getattr(exc, "reason", None))
     except Exception:
         # The coordinator exposes no claim boundary, so an unexpected failure cannot prove the
         # turn did not run; report uncertainty, never detail, and never invite a re-execution.

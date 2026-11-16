@@ -3614,7 +3614,7 @@ class GatewayRunner(
         expected_actor: Any = None, expected_session_db: Any = None,
         expected_db_path: Any = None, expected_db_identity: Any = None,
         expected_run_generation: int | None = None,
-        held_lease: Any = None, peer: Any = None, observation: Any = None,
+        held_lease: Any = None, peer: Any = None, relay: Any = None, observation: Any = None,
     ) -> Any:
         """Run one exact cached actor without creating, routing, or delivering anything.
 
@@ -3622,7 +3622,13 @@ class GatewayRunner(
         coordinator minted for this event. The model gets only its rendering, the body is stored
         clean beside that metadata, and the turn's principal denies approvals, the background review
         and every tool but the configured CEO tools its grant allows (agent.canonical_peer_tools),
-        whatever the owner's own settings are."""
+        whatever the owner's own settings are.
+
+        With ``relay`` (``(VerifiedRelay, metadata, rendering)``, gateway/owner_relay.py: an owner
+        instruction a canonical CTO relayed, proven against its transcript) the same turn runs as the
+        *owner's* instead, on the same session and actor: the model gets the relay's rendering, the row
+        stores it with the relay's provenance (``display_kind`` ``owner_relay``), and the turn runs under
+        the owner's own tools and settings, not a peer grant. Its answer still goes only to the request."""
         from gateway.canonical_surface import (
             bound_actor_db,
             cached_actor,
@@ -3725,12 +3731,24 @@ class GatewayRunner(
             )
             from tools.approval_context import reset_turn_principal, set_turn_principal
 
-            peer = validate_peer_metadata(peer)
-            if (peer["binding"], peer["author_id"], peer["channel_id"], peer["event_id"]) != (
-                    getattr(binding, "name", None), getattr(event, "author_id", None),
-                    getattr(event, "channel_id", None), getattr(event, "event_id", None)):
-                raise ValueError("canonical_peer_provenance_invalid")
-            peer_prompt = render_peer_turn(peer, event.text)
+            from gateway.owner_relay import DISPLAY_KIND as RELAY_KIND
+            from gateway.owner_relay import METADATA_KEY as RELAY_KEY
+            from gateway.owner_relay import opening_row_is_this_relay
+
+            if relay is not None:
+                _verified, relay_meta, peer_prompt = relay
+                if (relay_meta.get("binding"), relay_meta.get("relayed_by"), relay_meta.get("channel_id"),
+                        relay_meta.get("event_id")) != (
+                        getattr(binding, "name", None), getattr(event, "author_id", None),
+                        getattr(event, "channel_id", None), getattr(event, "event_id", None)):
+                    raise ValueError("canonical_peer_provenance_invalid")
+            else:
+                peer = validate_peer_metadata(peer)
+                if (peer["binding"], peer["author_id"], peer["channel_id"], peer["event_id"]) != (
+                        getattr(binding, "name", None), getattr(event, "author_id", None),
+                        getattr(event, "channel_id", None), getattr(event, "event_id", None)):
+                    raise ValueError("canonical_peer_provenance_invalid")
+                peer_prompt = render_peer_turn(peer, event.text)
 
             admitted = CanonicalBindingProof(
                 entry=entry, session_key=binding.session_key, session_id=session_id,
@@ -3768,24 +3786,28 @@ class GatewayRunner(
                     # Set on the worker thread that runs the turn: the agent attribute reaches the
                     # tool dispatchers and the Codex runtime guard, the context variable the
                     # approval gates. Both are restored only once the turn has actually returned.
-                    principal_token = set_turn_principal("peer")
+                    # A proven owner relay runs as the owner's turn: no peer principal, no grant.
+                    owner_turn = relay is not None
+                    principal_token = set_turn_principal(None if owner_turn else "peer")
                     # The only grant a peer tool batch can run under: this verified binding, this
                     # actor, while the fence above still holds (agent.canonical_peer_tools).
                     # Its sends land in the caller's observation: a failed turn records that scope.
-                    grant_token = bind_grant(PeerToolGrant(
+                    grant_token = None if owner_turn else bind_grant(PeerToolGrant(
                         binding.name, agent, require_peer_fence,
                         attempted=observation.attempted if observation is not None else []))
                     prior_principal = getattr(agent, "_turn_principal", None)
                     prior_skip_review = getattr(agent, "skip_background_review", False)
-                    agent._turn_principal = "peer"
+                    agent._turn_principal = None if owner_turn else "peer"
                     agent.skip_background_review = True
                     # MCP call provenance names this turn's real session the way an owner turn's
-                    # does (route, key, session id). No user identity is bound, since the peer is
-                    # not the owner; the live cron value is carried over as bound (delegation depth
-                    # has its own context), never reset to fall back on the process environment.
+                    # does (route, key, session id). No user identity is bound for a peer, since the
+                    # peer is not the owner (an owner relay binds the binding's owner identity); the
+                    # live cron value is carried over as bound (delegation depth has its own
+                    # context), never reset to fall back on the process environment.
                     session_tokens = set_session_vars(
                         platform=str(getattr(getattr(origin, "platform", None), "value", "") or ""),
                         chat_id=str(getattr(origin, "chat_id", "") or ""),
+                        user_id=str(getattr(origin, "user_id", "") or "") if owner_turn else "",
                         session_key=entry.session_key,
                         parent_chat_id=str(getattr(origin, "parent_chat_id", "") or ""),
                         cron_session=current_cron_session())
@@ -3793,6 +3815,13 @@ class GatewayRunner(
                         if observation is not None:
                             observation.actor_started = True
                         with scoped_current_session_id(session_id):
+                            if owner_turn:
+                                return agent.run_conversation(
+                                    peer_prompt, conversation_history=agent_history, task_id=session_id,
+                                    persist_user_message=peer_prompt,
+                                    persist_user_display_kind=RELAY_KIND,
+                                    persist_user_display_metadata={RELAY_KEY: relay_meta},
+                                )
                             return agent.run_conversation(
                                 peer_prompt, conversation_history=agent_history, task_id=session_id,
                                 persist_user_message=event.text,
@@ -3811,7 +3840,8 @@ class GatewayRunner(
                         clear_session_vars(session_tokens)
                         agent._turn_principal = prior_principal
                         agent.skip_background_review = prior_skip_review
-                        reset_grant(grant_token)
+                        if grant_token is not None:
+                            reset_grant(grant_token)
                         reset_turn_principal(principal_token)
 
                 result = await run_owned_turn(
@@ -3839,7 +3869,7 @@ class GatewayRunner(
                     # and this turn's is handed to the receipt coordinator, to be kept, not delivered.
                     if observation is not None:
                         try:
-                            observation.bound_answer = bound_refused_answer(
+                            observation.bound_answer = None if relay is not None else bound_refused_answer(
                                 result, peer=peer, body=event.text, rendered=peer_prompt,
                                 history_boundary=boundary, expected_session_id=session_id)
                         except Exception:
@@ -3848,6 +3878,11 @@ class GatewayRunner(
                 # A completed turn belongs to this event only when it opened with this claim's own
                 # row and carries no other peer row. Internal recovery/continuation rows do not
                 # change that provenance; use the same helper as the refused-answer keep.
+                if relay is not None:
+                    # The owner turn's own opening row, and no peer or other relay row after it.
+                    if not opening_row_is_this_relay(result.get("messages"), boundary, relay_meta, peer_prompt):
+                        raise ValueError("canonical_turn_refused")
+                    return selected
                 try:
                     facts = turn_provenance(
                         result.get("messages"), history_boundary=boundary, peer=peer, body=event.text,
