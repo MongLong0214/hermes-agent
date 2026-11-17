@@ -1241,31 +1241,35 @@ def _reopens_owed_slot(name, body, resolved):
     return True
 
 
-def _settle_abandoned(name, body, digests, channel, target, owed, resolved):
+def _settle_abandoned(name):
     """An owed answer's journal says ``pending: true`` and nothing is finishing it: its shim died (or its retry
     never started) after an exit 0 send whose read-back failed. A retry thread alive anywhere holds the journal's
-    retry lock, and then nothing is touched. Otherwise, with this very body, the thread is read, never resent:
-    found, the post is ``confirmed`` (or ``acknowledged``, without the turn's declaration) and pending is
-    cleared; not found or unreadable, pending is cleared and the reply stays ``unconfirmed`` (nobody is left to
-    finish it). True only when the thread shows the post."""
+    retry lock, and then nothing is touched. Otherwise the thread is read for the OLD post (its own body digest
+    and target, whatever answer is being published now), never resent: found, it is ``confirmed`` (or
+    ``acknowledged``, when it was not the turn's declaration) and pending is cleared; not found or unreadable,
+    pending is cleared and it stays ``unconfirmed`` (nobody is left to finish it). The answer being published now
+    is then the next publication of the still-owed event."""
+    if publication_record(name).get("pending") is not True:
+        return False
     lock = _retry_lock(name)
     if lock is None:
         return False
     try:
         prior = publication_record(name)
-        if (prior.get("kind") != "answer" or prior.get("pending") is not True or owed not in ANSWER_OWED
-                or prior.get("body_sha256") != _sha256(body)):
+        if (prior.get("kind") != "answer" or prior.get("pending") is not True
+                or prior.get("disposition") not in ANSWER_OWED or not isinstance(prior.get("body_sha256"), str)):
             return False
-        posted = _read_back(channel, target, digests) == "posted"
+        owed, resolved = prior["disposition"], prior.get("resolved") is True
+        posted = _read_back(prior.get("channel"), prior.get("reply_to"), {prior["body_sha256"]}) == "posted"
         at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         if posted:
             _rewrite_publication(name, dict(
                 prior, sent=True, state="sent", delivery="posted", disposition=owed, recovered=True, pending=False,
                 reason="found in the thread after the shim that sent it ended", at=at,
-                reply_state=_reply_state(True, resolved), **({"resolved": True} if resolved else {})))
+                reply_state=_reply_state(True, resolved)))
             log(f"prompt {name[:12]}… pending owed reply found in the thread after its shim ended; not posted again")
         else:
-            _rewrite_publication(name, dict(prior, sent=False, delivery="failed", disposition=owed, pending=False,
+            _rewrite_publication(name, dict(prior, sent=False, delivery="failed", pending=False,
                                             reply_state="unconfirmed", at=at))
             log(f"prompt {name[:12]}… pending owed reply not shown by the thread and its shim is gone: unconfirmed; "
                 "not posted again")
@@ -1283,9 +1287,7 @@ def _settle_claimed(name, body, digests, channel, target, owed, resolved):
     is ``confirmed`` (or ``acknowledged``, without the turn's declaration); not found, ``unconfirmed``. A
     reply already ``acknowledged`` becomes ``confirmed`` when this answer is the turn's declaration."""
     prior = publication_record(name)
-    if prior.get("kind") == "answer" and prior.get("pending") is True:
-        return _settle_abandoned(name, body, digests, channel, target, owed, resolved)
-    if prior.get("kind") != "answer":
+    if prior.get("kind") != "answer" or prior.get("pending") is True:  # not an answer, or a live retry owns it
         return False
     legacy = "disposition" not in prior
     if owed not in ANSWER_OWED:
@@ -1392,6 +1394,8 @@ def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_t
     digests = {_sha256(body), _sha256(f"@{handle} {body}")}
     owes = owed in ANSWER_OWED and kind == "answer"
     fd, why = _claim(name)
+    if fd is None and why == "exists" and kind == "answer":
+        _settle_abandoned(name)  # an old post left pending by a dead shim is settled first, whatever is published now
     if fd is None and why == "exists" and owes and _reopens_owed_slot(name, body, resolved):
         fd, why = _claim(name)
     if fd is None:

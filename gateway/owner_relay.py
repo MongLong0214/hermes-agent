@@ -130,14 +130,17 @@ def turn_calls(messages: Any, boundary: Any) -> list:
 
 def accepted_declaration(messages: Any, boundary: Any, *, event_id: str, earlier: Any = (), allowed: Any = None,
                          need_answer: bool = False) -> Optional[tuple]:
-    """``(outcome, answers)`` of this turn's declaration, or None: the LAST ``relay_resolve`` call of the turn
-    that began at ``messages[boundary]``, when the executor recorded it ``ok`` (its handler accepted it), it names
-    *event_id* and a known outcome, and every evidence item is real: a ``tool_call_id`` of a call this turn made
-    before it, or one of the *earlier* turns' recorded calls, that the executor recorded ``ok``, or an explicit
-    answer (returned as *answers*); ``done`` needs at least one tool result. *allowed*: the outcomes this turn
-    may declare (default all); *need_answer*: at least one explicit answer must be cited (a post a CTO declared
-    a question, ruling request or conflict: the answer, decision or resolution). Anything else resolves nothing."""
-    from tools.relay_resolve_tool import OUTCOMES, TOOL_NAME, evidence_items
+    """``(outcome, public_reply, evidence)`` of this turn's declaration, or None: the LAST ``relay_resolve`` call of
+    the turn that began at ``messages[boundary]``, when the executor recorded it ``ok`` (its handler accepted it),
+    it names *event_id* and a known outcome, its ``public_reply`` passes the structural filter
+    (``tools.relay_resolve_tool.public_reply_problem``, also against every tool call id of this and the *earlier*
+    turns), and every evidence item is real: a ``tool_call_id`` of a call this turn made before it, or one of the
+    *earlier* turns' recorded calls, that the executor recorded ``ok``, or an explicit answer; ``done`` needs at
+    least one tool result. The evidence is returned (``[{"tool_call_id"|"answer": ...}]``) to be kept in the
+    receipt and never published: only ``outcome`` and ``public_reply`` are (:func:`published_reply`). *allowed*:
+    the outcomes this turn may declare (default all); *need_answer*: at least one explicit answer must be cited
+    (a post a CTO declared a question, ruling request or conflict). Anything else resolves nothing."""
+    from tools.relay_resolve_tool import OUTCOMES, TOOL_NAME, evidence_items, public_reply_problem
 
     if not isinstance(messages, list) or isinstance(boundary, bool) or not isinstance(boundary, int):
         return None
@@ -172,22 +175,20 @@ def accepted_declaration(messages: Any, boundary: Any, *, event_id: str, earlier
         return None
     if need_answer and not any(kind == "answer" for kind, _ in items):
         return None
-    return args["outcome"], tuple(value for kind, value in items if kind == "answer")
+    every_id = {c["id"] for c in turn_calls(rows, 0)} | {call_id} | {c.get("id") for c in earlier if isinstance(c, Mapping)}
+    public_reply = args.get("public_reply")
+    if public_reply_problem(public_reply, [i for i in every_id if isinstance(i, str)]) is not None:
+        return None
+    evidence = [{"tool_call_id": v} if kind == "tool" else {"answer": v} for kind, v in items]
+    return args["outcome"], public_reply.strip(), evidence
 
 
-def accepted_outcome(messages: Any, boundary: Any, **kwargs: Any) -> Optional[str]:
-    """The outcome of :func:`accepted_declaration`, or None."""
-    declaration = accepted_declaration(messages, boundary, **kwargs)
-    return declaration[0] if declaration is not None else None
+def published_reply(outcome: str, public_reply: str) -> str:
+    """What the thread is told for an accepted declaration: exactly ``<outcome label>: <public_reply>``, composed
+    here and nowhere else. The turn's own free text and the evidence are never published."""
+    from tools.relay_resolve_tool import PUBLIC_LABELS
 
-
-def with_declared_answers(reply: str, answers: Any) -> str:
-    """*reply* as published: it always says each explicit answer the turn declared. An answer the reply already
-    contains (whatever its spacing or case) is not repeated; any other is appended, so a turn that declared an
-    answer and then ended with a bare acknowledgement never has the acknowledgement alone posted."""
-    said = " ".join(reply.split()).casefold()
-    missing = [a for a in answers if " ".join(a.split()).casefold() not in said]
-    return reply if not missing else reply.rstrip() + "\n\n" + "\n\n".join(missing)
+    return f"{PUBLIC_LABELS[outcome]}: {public_reply}"
 
 
 def parse_relay(text: Any) -> Optional[RelayClaim]:
@@ -273,9 +274,11 @@ def peer_declaration_note(disposition: str, event_id: str) -> str:
     """What the peer turn of a post a bound CTO declared owed is told, after the quoted post: it owes an answer
     and closes it with the ``relay_resolve`` declaration, which an acknowledgement is not."""
     return (f"\n[The canonical CTO declared the post above {_KIND_WORDS.get(disposition, 'owed')} the CEO owes an "
-            f"answer. Answer it in your reply. Then declare it handled by calling the relay_resolve tool once with "
-            f"event_id {json.dumps(event_id)}, an outcome (answered, declined or deferred_with_reason) and "
-            "evidence: answer items stating the explicit answer, decision or, for a conflict, the resolution. An "
+            f"answer. Declare it handled by calling the relay_resolve tool once with event_id "
+            f"{json.dumps(event_id)}, an outcome (answered, declined or deferred_with_reason), evidence (answer "
+            "items stating the explicit answer, decision or, for a conflict, the resolution; internal, never "
+            "published) and a public_reply: the one plain statement the CTO is told, published exactly as "
+            "'<outcome>: <public_reply>', never with a file path or a tool call, session, claim or receipt id. An "
             "acknowledgement, or an answer without that declaration, leaves it open.]")
 
 
@@ -495,14 +498,12 @@ def new_metadata(relay: VerifiedRelay, *, binding: str, author_id: str, channel_
             "timestamp": relay.timestamp, "nonce": secrets.token_hex(16)}
 
 
-def render_owner_turn(relay: VerifiedRelay, metadata: Mapping[str, str], *, earlier: Any = None,
-                      declared: Any = None) -> str:
+def render_owner_turn(relay: VerifiedRelay, metadata: Mapping[str, str], *, earlier: Any = None) -> str:
     """The model-facing text of the owner turn: its provenance, the original quoted verbatim between
     per-turn nonce markers, and the CTO's note quoted apart, carrying no owner authority. *earlier*: the calls
     (``[{"id", "tool"}]``) the instruction's earlier turn made, for a reply-only recovery turn: this instruction
     already ran, its answer did not declare it resolved, and this turn may do nothing but answer and declare.
-    *declared* (``{"outcome", "answers"}``): the earlier turn did declare it, but published no reply; this turn
-    publishes it. Raises ``ValueError("canonical_envelope_escape")`` when either text holds the nonce."""
+    Raises ``ValueError("canonical_envelope_escape")`` when either text holds the nonce."""
     nonce = metadata["nonce"]
     if any(nonce in text for text in (relay.original, relay.owner_text, relay.note)):
         raise ValueError("canonical_envelope_escape")
@@ -513,23 +514,19 @@ def render_owner_turn(relay: VerifiedRelay, metadata: Mapping[str, str], *, earl
         "carries the owner's authority: act on it as if the owner had typed it here. Do not ask the owner "
         "to confirm, re-approve or retype it. Your answer goes to the Buzz thread it was relayed in; if a tool "
         "or a permission refuses, report that refusal there, never as a request for the owner to approve again. "
-        "Your final answer is the reply the thread receives. When the instruction is handled, declare it by "
-        f"calling the relay_resolve tool once with event_id {json.dumps(metadata['event_id'])}, an outcome "
-        "(done, answered, declined or deferred_with_reason) and evidence: tool_call_id items naming tool results "
-        "of this instruction's turns, or answer items stating the explicit answer or reason. Without a "
-        "declaration that cites real evidence the instruction stays open, whatever you answer.\n"
+        "When the instruction is handled, declare it by calling the relay_resolve tool once with event_id "
+        f"{json.dumps(metadata['event_id'])}, an outcome (done, answered, declined or deferred_with_reason), "
+        "evidence (tool_call_id items naming tool results of this instruction's turns, or answer items stating the "
+        "explicit answer or reason; evidence is internal and never published) and a public_reply: the one plain "
+        "statement the thread is told, published exactly as '<outcome>: <public_reply>' and never with a file path "
+        "or a tool call, session, claim or receipt id. Without a declaration that cites real evidence the "
+        "instruction stays open, and your final answer is only an acknowledgement.\n"
         + (("This is a reply-only recovery turn. This instruction already ran in this conversation and its answer "
             "did not declare it resolved. You have no tool but relay_resolve now: do not act and do not repeat "
             "any action. The earlier turn made these calls: "
             + (", ".join(f"{c['tool']} (tool_call_id {c['id']}{'' if c.get('ok') else ', failed'})"
                          for c in earlier) or "none")
-            + ". Answer the thread and declare what is true, citing them.\n"
-            + (("The earlier turn declared this instruction "
-                f"{declared['outcome']}" + (" with the answer " + "; ".join(json.dumps(a, ensure_ascii=False)
-                                                                           for a in declared["answers"])
-                                            if declared.get("answers") else "")
-                + " but published no reply: publish it now, and declare it again.\n") if declared else ""))
-           if earlier is not None else "")
+            + ". Answer the thread and declare what is true, citing them.\n") if earlier is not None else "")
         + f"<<<owner-instruction:{nonce}>>>\n{relay.owner_text}\n<<<end-owner-instruction:{nonce}>>>"
     )
 

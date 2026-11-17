@@ -53,7 +53,8 @@ DISPOSITION_OWNER_RELAY = "owner_relay"
 _ACP_KIND_DISPOSITIONS = {"question": "question", "ruling_request": "ruling", "conflict": "conflict"}
 _DISPOSITIONS = frozenset({DISPOSITION_OWNER_RELAY, *_ACP_KIND_DISPOSITIONS.values()})
 _MAX_RECORDED_CALLS = 64
-_DECLARED_OUTCOMES = frozenset({"done", "answered", "declined", "deferred_with_reason"})
+# The receipt keeps the declaration's evidence (internal: never published), bounded.
+_MAX_KEPT_EVIDENCE, _MAX_EVIDENCE_CHARS = 32, 500
 # A relayed owner instruction whose answer did not declare it resolved is not a terminal: its redelivery runs a
 # new owner turn, at most this many in all (the first included), the last answer standing.
 _MAX_OWED_TURNS = 3
@@ -143,11 +144,12 @@ class CanonicalTurnResult:
 
     binding_name: str
     terminal_text: str
-    # A relayed owner turn's declaration (gateway.owner_relay.accepted_declaration: its outcome and the explicit
-    # answers it cited) and the tool calls it made.
+    # A turn's declaration (gateway.owner_relay.accepted_declaration: its outcome, the ``public_reply`` the thread
+    # is told, and its evidence, which is internal) and the tool calls it made.
     outcome: str | None = None
     calls: tuple = ()
-    answers: tuple = ()
+    public_reply: str | None = None
+    evidence: tuple = ()
 
 
 class RequestLocalReplySink(Protocol):
@@ -266,6 +268,13 @@ class CanonicalSurfaceBinding:
                     return room["peer"]["pubkey"], channel
             raise ValueError("canonical_principal_rejected")
         return primary
+
+
+def _kept_evidence(evidence: Any) -> tuple:
+    """The declaration's evidence as the receipt keeps it (internal, bounded): at most 32 items of at most 500
+    characters each."""
+    return tuple({key: value[:_MAX_EVIDENCE_CHARS] for key, value in item.items()}
+                 for item in tuple(evidence)[:_MAX_KEPT_EVIDENCE])
 
 
 def bound_cto_actor(binding: Any, author_id: Any, channel_id: Any) -> bool:
@@ -526,17 +535,16 @@ class CanonicalReceiptResult:
     terminal_text: str | None = None
     failure: dict | None = None
     disposition: str | None = None
-    # The turn declared the instruction handled with real evidence (``relay_resolve``, accepted by
-    # gateway.owner_relay.accepted_declaration) AND published a reply that says what it declared; only with a
-    # disposition. ``outcome`` is the declared outcome. ``declared``: a declaration whose turn published no reply
-    # (it ended silent): it resolves nothing, and its recovery turn is given it. ``calls``: the tool calls the
-    # instruction's turns made
-    # (``({"id", "tool", "ok"}, ...)``), kept so a recovery turn is given them and never repeats them; None when
-    # nothing records them (a receipt from before the record), which is never read as "none".
+    # The turn declared the instruction handled with real evidence and a public_reply that passed the structural
+    # filter (``relay_resolve``, accepted by gateway.owner_relay.accepted_declaration); only with a disposition.
+    # What it publishes is exactly ``<outcome label>: <public_reply>``, composed by the gateway. ``outcome`` is the
+    # declared outcome. ``evidence`` is internal, kept here and never published. ``calls``: the tool calls the
+    # instruction's turns made (``({"id", "tool", "ok"}, ...)``), kept so a recovery turn is given them and never
+    # repeats them; None when nothing records them (a receipt from before the record), never read as "none".
     resolved: bool = False
     outcome: str | None = None
     calls: tuple | None = None
-    declared: dict | None = None
+    evidence: tuple | None = None
 
 
 def _log_record_state(level: int, what: str, *, stage: str, binding: Any, event: Any, key: str,
@@ -1010,14 +1018,8 @@ class CanonicalReceiptCoordinator:
                                             and all(isinstance(c, dict) and isinstance(c.get("id"), str)
                                                     and isinstance(c.get("tool"), str)
                                                     and isinstance(c.get("ok"), bool) for c in recorded)) else None
-                declared = response.get("declared")
-                declared = declared if (
-                    isinstance(declared, dict) and declared.get("outcome") in _DECLARED_OUTCOMES
-                    and isinstance(declared.get("answers"), list)
-                    and all(isinstance(a, str) for a in declared["answers"])) else None
                 return CanonicalReceiptResult("terminal", response["terminal_text"], None, disposition, resolved,
-                                              response.get("outcome") if resolved else None, calls,
-                                              declared if disposition is not None and not resolved else None)
+                                              response.get("outcome") if resolved else None, calls)
         except ValueError as exc:
             if str(exc) == "canonical_receipt_conflict":
                 raise
@@ -1345,8 +1347,7 @@ class CanonicalReceiptCoordinator:
                         # run nothing but its declaration, and its evidence may cite that work.
                         from gateway.owner_relay import render_owner_turn
                         earlier = list(answer.calls)
-                        relay = (relay[0], relay[1], render_owner_turn(relay[0], relay[1], earlier=earlier,
-                                                                       declared=answer.declared), relay[3])
+                        relay = (relay[0], relay[1], render_owner_turn(relay[0], relay[1], earlier=earlier), relay[3])
                         logger.info("Owner relay not declared resolved: reply-only turn %d for binding=%r event_id=%r",
                                     turns + 1, binding.name[:96], event.event_id[:96])
                 if not claimed:
@@ -1366,7 +1367,7 @@ class CanonicalReceiptCoordinator:
                     **({"disposition": answer.disposition} if answer.disposition else {}),
                     **({"resolved": True, "outcome": answer.outcome} if answer.resolved else {}),
                     **({"calls": list(answer.calls)} if answer.calls is not None else {}),
-                    **({"declared": answer.declared} if answer.declared else {})}})
+                    **({"evidence": list(answer.evidence)} if answer.evidence else {})}})
 
             def terminal_of(answer: CanonicalReceiptResult) -> str:
                 # Bound to this claim (its owner) and to this one write (a nonce no one holds before it
@@ -1524,19 +1525,16 @@ class CanonicalReceiptCoordinator:
                                                                              proof))
                         return kept
                 else:
-                    # A declaration counts only with a published reply, and the published reply always says the
-                    # explicit answers it declared: the turn's own reply is kept, and any declared answer it does
-                    # not contain is appended. A declared but silent turn publishes nothing and resolves nothing.
+                    # An accepted declaration publishes exactly ``<outcome label>: <public_reply>``, composed here:
+                    # never the turn's own free text (whatever it ended with, an ACK or silence) and never the
+                    # evidence, which is internal and only kept in the receipt. Without one, the turn's own reply is
+                    # what is published, and the event stays owed.
                     published = False
                     if isinstance(result, CanonicalTurnResult) and result.outcome is not None and (
                             relay is not None or peer_kind is not None):
-                        from gateway.owner_relay import with_declared_answers
-                        from gateway.response_filters import is_intentional_silence_response
-                        published = bool(result.terminal_text.strip()) and not is_intentional_silence_response(
-                            result.terminal_text)
-                        if published:
-                            result = replace(result, terminal_text=with_declared_answers(
-                                result.terminal_text, result.answers))
+                        from gateway.owner_relay import published_reply
+                        published = True
+                        result = replace(result, terminal_text=published_reply(result.outcome, result.public_reply))
                     answer = _result_answer(result, observation)
                     if relay is not None and answer.terminal_text is not None:
                         # The disposition is the gateway's own judgement of the event (its verified relay),
@@ -1546,8 +1544,7 @@ class CanonicalReceiptCoordinator:
                         answer = replace(
                             answer, disposition=DISPOSITION_OWNER_RELAY, resolved=published,
                             outcome=result.outcome if published else None,
-                            declared=({"outcome": result.outcome, "answers": list(result.answers)}
-                                      if result.outcome is not None and not published else None),
+                            evidence=_kept_evidence(result.evidence) if published else None,
                             calls=tuple(calls) if len(calls) <= _MAX_RECORDED_CALLS else None)
                     elif peer_kind is not None and answer.terminal_text is not None:
                         # A bound CTO declared this post a question, ruling request or conflict: it closes
@@ -1555,7 +1552,8 @@ class CanonicalReceiptCoordinator:
                         # resolution as evidence, accepted for this event) and a reply that says it, never
                         # with an acknowledgement or silence.
                         answer = replace(answer, disposition=peer_kind, resolved=published,
-                                         outcome=result.outcome if published else None)
+                                         outcome=result.outcome if published else None,
+                                         evidence=_kept_evidence(result.evidence) if published else None)
                     whole = result.terminal_text if isinstance(result, CanonicalTurnResult) else None
                 answer = record_or_keep(answer, whole)
             # The terminal (or the kept answer) is durable and a replay answers it, so this answer is

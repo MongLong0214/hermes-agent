@@ -30,7 +30,8 @@ def scope():
     reset_scope(token)
 
 
-GOOD = {"event_id": "event-1", "outcome": "done", "evidence": [{"tool_call_id": "call-1"}]}
+GOOD = {"event_id": "event-1", "outcome": "done", "evidence": [{"tool_call_id": "call-1"}],
+        "public_reply": "The project is stopped."}
 
 
 def test_the_tool_declares_one_event_resolved_from_inside_its_relayed_owner_turn(scope):
@@ -55,6 +56,9 @@ def test_a_resolve_for_another_event_is_refused(scope):
     {"evidence": [{"note": "x"}]}, {"evidence": [{"tool_call_id": ""}]}, {"evidence": [{"answer": "   "}]},
     {"evidence": [{"tool_call_id": "c", "answer": "both"}]}, {"evidence": ["call-1"]},
     {"evidence": [{"tool_call_id": 7}]},
+    {"public_reply": None}, {"public_reply": ""}, {"public_reply": "   "}, {"public_reply": 7},
+    {"public_reply": "x" * 2_001},
+    {"public_reply": "See /Users/isaac/.hermes/export.json"}, {"public_reply": "call_a1b2c3d4e5f6 passed"},
 ])
 def test_a_declaration_without_a_known_outcome_and_well_formed_evidence_is_refused(scope, change):
     refused = _call({**GOOD, **change})
@@ -65,6 +69,50 @@ def test_evidence_is_a_closed_list_of_tool_results_and_explicit_answers():
     assert evidence_items([{"tool_call_id": " call-1 "}, {"answer": " stopped "}]) == [
         ("tool", "call-1"), ("answer", "stopped")]
     assert evidence_items([]) is None and evidence_items([{"tool_call_id": "a"}] * 65) is None
+
+
+def test_the_tool_has_a_required_public_reply_and_says_what_is_published():
+    from tools.relay_resolve_tool import SCHEMA
+
+    assert "public_reply" in SCHEMA["parameters"]["required"]
+    assert SCHEMA["parameters"]["properties"]["public_reply"]["type"] == "string"
+    assert "<outcome>: <public_reply>" in SCHEMA["description"] and "internal" in SCHEMA["description"]
+
+
+@pytest.mark.parametrize("text", [
+    "Saved to /Users/isaac/.hermes/private/customer-export.json", "Saved to /tmp/x/y", "at /etc/hosts",
+    "Saved to ~/private/out.txt", "Saved to C:\\Users\\isaac\\out.txt", "(/Users/isaac/a)",
+    "see call_a1b2c3d4e5f6", "see call_ABCdef0123456789abcdefgh", "see fc_0123456789abcdef01234567",
+    "see toolu_0123456789abcdef", "see acp_call_3",
+    "session 20261117_064935_ab12cd", "session 20261117_064935_ab12cd34",
+    "session 7b622a35-9409-4df4-bfe7-1e140ed238ba",
+    "receipt canonical-receipt:v2:" + "ab" * 32, "claim canonical-claim:v1:" + "ab" * 32,
+    "kept canonical-answer-kept:v1:" + "ab" * 32, "ledger owner-relay-record:v1:session:record",
+    "owner " + "cd" * 16, "event " + "ef" * 32, "digest sha256:" + "ab" * 32,
+])
+def test_public_reply_problem_refuses_a_path_or_an_id_this_codebase_issues(text):
+    from tools.relay_resolve_tool import public_reply_problem
+
+    assert public_reply_problem(text) is not None
+
+
+@pytest.mark.parametrize("text", [
+    "The project is stopped; see https://example.com/runs/42 for the report.", "Handled and/or deferred 1/2.",
+    "Use /stop to cancel", "Version 2.1/2.2 shipped", "call me back after the freeze", "call_back is a word",
+    "프로젝트를 중지했고 보고서는 스레드에 있습니다.", "Fixed in 3 of 20260101 files", "ticket ab-12 closed",
+])
+def test_public_reply_problem_lets_prose_through(text):
+    from tools.relay_resolve_tool import public_reply_problem
+
+    assert public_reply_problem(text) is None
+
+
+def test_public_reply_problem_refuses_the_ids_of_the_turn_it_is_given():
+    from tools.relay_resolve_tool import public_reply_problem
+
+    assert public_reply_problem("Result of call-1 was ok", known_ids=["call-1"]) is not None
+    assert public_reply_problem("Result of call-10 was ok", known_ids=["call-1"]) is None  # a whole id, not a prefix
+    assert public_reply_problem("It is done", known_ids=["call-1", "xy"]) is None
 
 
 def test_the_tool_is_in_no_turns_tool_selection():
@@ -111,7 +159,8 @@ def _peer(resolve_event):
 
 
 def _resolve_call(event_id, call_id="call-r"):
-    args = {"event_id": event_id, "outcome": "answered", "evidence": [{"answer": "머지하세요"}]}
+    args = {"event_id": event_id, "outcome": "answered", "evidence": [{"answer": "머지하세요"}],
+            "public_reply": "머지하세요."}
     return SimpleNamespace(function=SimpleNamespace(name=TOOL_NAME, arguments=json.dumps(args)), id=call_id), args
 
 

@@ -55,13 +55,15 @@ def test_a_bound_ctos_declared_kind_is_closed_only_by_the_peer_turns_structured_
     """The CEO's answer alone does not close a declared question, ruling request or conflict: the peer turn
     declares it with ``relay_resolve`` (an answer, decline or deferral, with the explicit answer, decision or
     resolution as evidence), accepted only for this event."""
-    _scripted(ingress, monkeypatch, (_ANSWER, _resolve("answered", [{"answer": "머지하세요"}])))
+    _scripted(ingress, monkeypatch, (_ANSWER, _resolve("answered", [{"answer": "머지하세요"}],
+                                                       public_reply="머지하세요. 근거는 CI green.")))
     text = _tagged(kind)
     notes = []
     ingress.actor.during_turn = lambda: notes.append(getattr(ingress.actor, "_gateway_turn_context_notes", ""))
 
     async def exercise():
-        expected = (200, {"event_id": "event", "text": _ANSWER, "disposition": disposition, "silent": False,
+        expected = (200, {"event_id": "event", "text": "answered: 머지하세요. 근거는 CI green.",
+                          "disposition": disposition, "silent": False,
                           "resolved": True})
         assert await send(text=text) == expected
         assert await send(text=text) == expected  # a replay reports it too, and runs nothing
@@ -79,16 +81,35 @@ def test_a_bound_ctos_declared_kind_is_closed_only_by_the_peer_turns_structured_
 
 
 @pytest.mark.parametrize("kind, disposition", _KINDS)
-def test_a_declared_answer_is_always_in_the_published_reply_of_a_declared_kind(
-        ingress, send, monkeypatch, kind, disposition):
-    """The turn declared an explicit answer and ended "ACK": the published reply carries the answer."""
-    answer = "Do not merge; the change still loses messages."
-    _scripted(ingress, monkeypatch, ("ACK", _resolve("answered", [{"answer": answer}])))
+@pytest.mark.parametrize("outcome, label", [("answered", "answered"), ("declined", "declined"),
+                                            ("deferred_with_reason", "deferred")])
+def test_the_published_reply_of_a_declared_kind_is_the_label_and_the_public_reply_only(
+        ingress, send, monkeypatch, kind, disposition, outcome, label):
+    """The turn ended "ACK" and its evidence holds private text: the thread receives ``<label>: <public_reply>``
+    and nothing of the turn's free text or evidence."""
+    private = "Do not merge; /Users/isaac/.hermes/private/notes.md says the change loses messages."
+    _scripted(ingress, monkeypatch, ("ACK", _resolve(outcome, [{"answer": private}],
+                                                     public_reply="Do not merge; it still loses messages.")))
 
     async def exercise():
-        assert await send(text=_tagged(kind)) == (200, {
-            "event_id": "event", "text": f"ACK\n\n{answer}", "disposition": disposition, "silent": False,
-            "resolved": True})
+        status, body = await send(text=_tagged(kind))
+        assert (status, body) == (200, {
+            "event_id": "event", "text": f"{label}: Do not merge; it still loses messages.",
+            "disposition": disposition, "silent": False, "resolved": True})
+        assert private not in json.dumps(body, ensure_ascii=False)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("kind, disposition", _KINDS)
+def test_a_declared_kinds_public_reply_with_a_path_or_id_is_refused_and_stays_owed(
+        ingress, send, monkeypatch, kind, disposition):
+    _scripted(ingress, monkeypatch, ("ACK", _resolve("answered", [{"answer": "머지하세요"}],
+                                                     public_reply="See /Users/isaac/.hermes/x.json")))
+
+    async def exercise():
+        assert await send(text=_tagged(kind)) == (
+            200, {"event_id": "event", "text": "ACK", "disposition": disposition, "silent": False})
 
     asyncio.run(exercise())
 
@@ -133,9 +154,9 @@ def test_a_declaration_that_cites_no_explicit_answer_or_names_another_event_leav
 
 
 @pytest.mark.parametrize("kind", ["question", "ruling_request", "conflict"])
-def test_a_declared_kind_answered_with_silence_is_owed_never_resolved(ingress, send, monkeypatch, kind):
+def test_a_declared_kind_with_no_declaration_and_silence_is_owed_never_resolved(ingress, send, monkeypatch, kind):
     disposition = {"question": "question", "ruling_request": "ruling", "conflict": "conflict"}[kind]
-    _scripted(ingress, monkeypatch, ("[SILENT]", _resolve("answered", [{"answer": "머지하세요"}])))
+    _scripted(ingress, monkeypatch, ("[SILENT]",))
 
     async def exercise():
         assert await send(text=_tagged(kind)) == (

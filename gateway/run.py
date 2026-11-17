@@ -3939,7 +3939,9 @@ class GatewayRunner(
                                                        earlier=earlier_calls or ())
                     return _replace(
                         selected, calls=tuple(turn_calls(result.get("messages"), boundary)),
-                        outcome=declaration[0] if declaration else None, answers=declaration[1] if declaration else ())
+                        outcome=declaration[0] if declaration else None,
+                        public_reply=declaration[1] if declaration else None,
+                        evidence=tuple(declaration[2]) if declaration else ())
                 try:
                     facts = turn_provenance(
                         result.get("messages"), history_boundary=boundary, peer=peer, body=event.text,
@@ -3955,7 +3957,8 @@ class GatewayRunner(
                     declaration = accepted_declaration(result.get("messages"), boundary, event_id=event.event_id,
                                                        allowed=PEER_OUTCOMES, need_answer=True)
                     return _replace(selected, outcome=declaration[0] if declaration else None,
-                                    answers=declaration[1] if declaration else ())
+                                    public_reply=declaration[1] if declaration else None,
+                                    evidence=tuple(declaration[2]) if declaration else ())
                 return selected
             finally:
                 for name, value in outward_callbacks.items():

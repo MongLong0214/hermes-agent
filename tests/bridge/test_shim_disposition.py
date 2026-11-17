@@ -320,11 +320,14 @@ def test_publish_reply_itself_reopens_an_unconfirmed_owed_slot_but_not_a_pending
     # Confirmed is final.
     assert shim.publish_reply(EVENT_A, CHANNEL, "third answer", owed="owner_relay", resolved=True) is False
     assert len(posts(shim, EVENT_A)) == 1
-    # A retry still pending on the claim is never raced.
+    # A retry still alive on the claim (it holds the journal's retry lock) is never raced.
     _journal(shim, EVENT_B, sent=False, state="timeout", delivery="failed", pending=True,
              disposition="owner_relay", reply_state="unconfirmed", body_sha256=_body_sha("first"))
+    live = shim._retry_lock(EVENT_B)
     assert shim.publish_reply(EVENT_B, CHANNEL, "second", owed="owner_relay", resolved=True) is False
     assert [c for c in calls(shim, EVENT_B) if c["cmd"] == "send"] == []
+    assert record(shim, EVENT_B)["pending"] is True and not [c for c in calls(shim, EVENT_B) if c["cmd"] == "thread"]
+    shim._release_retry_lock(EVENT_B, live)
 
 
 def test_a_base_journal_that_posted_silence_for_an_event_now_owed_is_reopened_and_told_once(shim):
@@ -501,9 +504,11 @@ def _rows(text, kwargs, history, final_text, calls):
     return [*history, *rows, {"role": "assistant", "content": final_text}]
 
 
-def _resolve(outcome="done", evidence=None, call_id="resolve-1"):
+def _resolve(outcome="done", evidence=None, call_id="resolve-1", public_reply="All done."):
     args = {"event_id": GW_EVENT, "outcome": outcome,
             "evidence": [{"tool_call_id": "call-1"}] if evidence is None else evidence}
+    if public_reply is not None:
+        args["public_reply"] = public_reply
     return ("relay_resolve", args, json.dumps({"declared": True, "event_id": GW_EVENT, "outcome": outcome}), call_id,
             "ok")
 
@@ -566,7 +571,8 @@ def test_an_acknowledged_owner_relay_gets_a_reply_only_recovery_turn_and_its_dec
     acknowledges. The event's redelivery runs a reply-only turn (the work is not run again), whose declared
     answer is posted, read back and confirmed."""
     real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("ACK", _work()),
-                      ("중지했고 결과를 보고합니다.", _resolve("done", [{"tool_call_id": "call-1"}])))
+                      ("중지했고 결과를 보고합니다.", _resolve("done", [{"tool_call_id": "call-1"}],
+                                                     public_reply="중지했고 결과를 보고합니다.")))
     gw_drive(gw_shim, real.prompt)
     assert len(gw.runs) == 1 and real.thread() == ["@cto-repo-factory ACK"]
     assert real.settled()["reply_state"] == "acknowledged"
@@ -574,7 +580,7 @@ def test_an_acknowledged_owner_relay_gets_a_reply_only_recovery_turn_and_its_dec
 
     gw_drive(gw_shim, real.prompt, rpc_id=2)  # buzz-acp redelivers the event
     assert len(gw.runs) == 2  # the gateway ran a recovery turn instead of replaying the ACK
-    assert real.thread() == ["@cto-repo-factory ACK", "@cto-repo-factory 중지했고 결과를 보고합니다."]
+    assert real.thread() == ["@cto-repo-factory ACK", "@cto-repo-factory done: 중지했고 결과를 보고합니다."]
     done = real.settled()
     assert (done["reply_state"], done["resolved"], done["sent"], done["disposition"]) == (
         "confirmed", True, True, "owner_relay")
@@ -617,10 +623,11 @@ def test_a_declared_question_ruling_or_conflict_runs_judgement_reply_readback_an
     """CEO C, closed as B: the CTO declares the kind; the CEO's reply is read back from the thread, and the
     peer turn's structured declaration (an explicit answer as evidence) closes it."""
     real = _real_path(gw, gw_shim, monkeypatch, tmp_path,
-                      ("머지하세요. 근거는 아래와 같습니다.", _resolve("answered", [{"answer": "머지하세요"}])),
+                      ("머지하세요. 근거는 아래와 같습니다.", _resolve("answered", [{"answer": "머지하세요"}],
+                                                       public_reply="머지하세요. 근거는 아래와 같습니다.")),
                       relay=False, kind=kind)
     gw_drive(gw_shim, real.prompt)
-    assert len(gw.runs) == 1 and real.thread() == ["@cto-repo-factory 머지하세요. 근거는 아래와 같습니다."]
+    assert len(gw.runs) == 1 and real.thread() == ["@cto-repo-factory answered: 머지하세요. 근거는 아래와 같습니다."]
     done = real.settled()
     disposition = {"question": "question", "ruling_request": "ruling", "conflict": "conflict"}[kind]
     assert (done["disposition"], done["reply_state"], done["resolved"], done["sent"]) == (
@@ -688,19 +695,51 @@ def test_a_reopened_legacy_silence_posts_the_owed_notice_and_never_re_executes(g
     assert gw_shim.recovery_delivery_state(GW_EVENT) == "owed"
 
 
-@pytest.mark.parametrize("kind", ["question", "ruling_request", "conflict"])
-def test_ack_only_reply_with_private_answer_evidence(gw, gw_shim, monkeypatch, tmp_path, kind):
-    """Review: the turn declared an explicit answer in its evidence and ended "ACK"; only "ACK" was posted and
-    the event was confirmed. What is posted and read back now contains the declared answer, so a posted bare ACK
-    never confirms."""
-    answer = "Do not merge; the change still loses messages."
-    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("ACK", _resolve("answered", [{"answer": answer}])),
-                      relay=False, kind=kind)
+@pytest.mark.parametrize("evidence", [
+    "Private tool output: customer export contains INTERNAL-CUSTOMER-7741.",
+    "Evidence file: /Users/isaac/.hermes/private/customer-export.json",
+    "Session 7b622a35-9409-4df4-bfe7-1e140ed238ba; claim private-claim-7741",
+])
+def test_private_evidence_is_not_published(gw, gw_shim, monkeypatch, tmp_path, evidence):
+    """Review (public safety): evidence reached the thread. It is internal: only ``<outcome>: <public_reply>``
+    is posted, and the thread never holds the planted evidence, the tool output or the turn's own free text."""
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path,
+                      ("The review is complete. " + evidence, _work(out=evidence),
+                       _resolve("answered", [{"answer": evidence}], public_reply="The review is complete.")))
     gw_drive(gw_shim, real.prompt)
-    assert real.thread() == [f"@cto-repo-factory ACK\n\n{answer}"]  # never the bare ACK
+    assert real.thread() == ["@cto-repo-factory answered: The review is complete."]
+    assert evidence not in "\n".join(real.thread())
     done = real.settled()
     assert (done["reply_state"], done["resolved"], done["sent"]) == ("confirmed", True, True)
     assert gw_shim.recovery_delivery_state(GW_EVENT) == "answered"
+
+
+@pytest.mark.parametrize("public_reply", ["Saved to /Users/isaac/.hermes/private/customer-export.json",
+                                          "session 7b622a35-9409-4df4-bfe7-1e140ed238ba", "call_a1b2c3d4e5f6 passed"])
+def test_a_public_reply_carrying_a_path_or_id_is_refused_and_stays_owed_on_the_real_path(
+        gw, gw_shim, monkeypatch, tmp_path, public_reply):
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path,
+                      ("ACK", _work(), _resolve("done", public_reply=public_reply)))
+    gw_drive(gw_shim, real.prompt)
+    assert real.thread() == ["@cto-repo-factory ACK"] and public_reply not in "\n".join(real.thread())
+    assert real.settled()["reply_state"] == "acknowledged"
+    assert gw_shim.recovery_delivery_state(GW_EVENT) == "owed"
+
+
+def test_done_declaration_does_not_confirm_bare_ack(gw, gw_shim, monkeypatch, tmp_path):
+    """A tool-only ``done`` ending "ACK": the thread gets the gateway's own ``done: <public_reply>``, never the
+    bare ACK. With no declaration, "ACK" is posted and stays owed."""
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("ACK", _work(), _resolve("done")))
+    gw_drive(gw_shim, real.prompt)
+    assert real.thread() == ["@cto-repo-factory done: All done."]
+    assert real.settled()["reply_state"] == "confirmed" and gw_shim.recovery_delivery_state(GW_EVENT) == "answered"
+
+
+def test_an_ack_with_no_declaration_stays_owed_on_the_real_path(gw, gw_shim, monkeypatch, tmp_path):
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("ACK", _work()))
+    gw_drive(gw_shim, real.prompt)
+    assert real.thread() == ["@cto-repo-factory ACK"]
+    assert real.settled()["reply_state"] == "acknowledged" and gw_shim.recovery_delivery_state(GW_EVENT) == "owed"
 
 
 @pytest.mark.parametrize("result", [
@@ -719,20 +758,49 @@ def test_failed_tool_result_cannot_close_on_the_real_path(gw, gw_shim, monkeypat
 
 
 def test_resolved_silent_owner_can_recover_reply(gw, gw_shim, monkeypatch, tmp_path):
-    """Review: a declared but silent owner turn was recorded resolved, so no recovery turn ran. It stays owed,
-    and the redelivery's reply-only turn publishes the reply and closes it."""
-    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("[SILENT]", _work(), _resolve("done")),
-                      ("The project is stopped.", _resolve("done")))
+    """A declared turn that ended silent publishes its public_reply and closes: the free text is never read."""
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path,
+                      ("[SILENT]", _work(), _resolve("done", public_reply="The project is stopped.")))
     gw_drive(gw_shim, real.prompt)
-    assert len(gw.runs) == 1 and gw_shim.recovery_delivery_state(GW_EVENT) == "owed"
-    [notice] = real.thread()
-    assert "SILENT" not in notice
-    gw_drive(gw_shim, real.prompt, rpc_id=2)
+    assert len(gw.runs) == 1 and real.thread() == ["@cto-repo-factory done: The project is stopped."]
+    assert real.settled()["reply_state"] == "confirmed" and gw_shim.recovery_delivery_state(GW_EVENT) == "answered"
+
+
+def test_pending_old_ack_is_settled_after_reply_recovery(gw, gw_shim, monkeypatch, tmp_path):
+    """Review: an exit 0 ACK whose read-back failed left ``pending: true``; the recovery answer's body differs, so
+    a fresh shim refused settlement, read nothing and stayed stuck. It first settles the old pending post by
+    reading the thread (found: acknowledged, pending cleared; never resent), then publishes the new reply, once."""
+    import importlib.util
+
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("ACK", _work()),
+                      ("The project is stopped.", _resolve("done", public_reply="The project is stopped.")))
+    gw_drive(gw_shim, real.prompt)
+    assert real.thread() == ["@cto-repo-factory ACK"]
+    # The exact journal state an exit 0 send leaves when the process dies before its retry starts.
+    journal = dict(real.journal(), pending=True, sent=False, delivery="failed", reply_state="unconfirmed")
+    (Path(gw_shim.PUBLISHED) / GW_EVENT).write_text(json.dumps(journal) + "\n")
+    spec = importlib.util.spec_from_file_location("review_restart", gw_shim.__file__)
+    restarted = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(restarted)
+    restarted.FORWARD = "live"
+    restarted.write = lambda payload: None
+    reads, original_read = [], restarted._read_back
+
+    def read(*args):
+        reads.append(args)
+        return original_read(*args)
+
+    restarted._read_back = read
+    gw_drive(restarted, real.prompt, rpc_id=2)  # redelivered: the recovery turn answers, its body is not the ACK
+    assert reads, "the old pending post was never looked for in the thread"
     assert len(gw.runs) == 2
-    assert real.thread()[1:] == ["@cto-repo-factory The project is stopped."]
-    done = json.loads((Path(gw_shim.PUBLISHED) / (GW_EVENT + ".answer")).read_text().splitlines()[0])
-    assert (done["reply_state"], done["resolved"]) == ("confirmed", True)  # the reply took the slot the notice left open
-    assert gw_shim.recovery_delivery_state(GW_EVENT) == "answered"
+    assert real.thread() == ["@cto-repo-factory ACK", "@cto-repo-factory done: The project is stopped."]  # old not resent
+    done = real.journal()
+    assert (done["reply_state"], done["resolved"], done.get("pending")) == ("confirmed", True, None)
+    assert [c for c in real.thread() if c.endswith("ACK")] == ["@cto-repo-factory ACK"]
+    assert restarted.recovery_delivery_state(GW_EVENT) == "answered"
+    gw_drive(restarted, real.prompt, rpc_id=3)
+    assert len(real.thread()) == 2  # the new reply is published once
 
 
 def test_exit_zero_pending_readback_can_settle_after_restart(shim, monkeypatch):

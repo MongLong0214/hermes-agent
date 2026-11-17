@@ -192,10 +192,21 @@ def _work(call_id="call-1", name="run_cancel", out='{"ok": true}', outcome="ok")
     return (name, {"run_id": "r1"}, out, call_id, outcome)
 
 
-def _resolve(outcome="done", evidence=None, *, event_id="event", call_id="resolve-1", ok=True):
+_LABELS = {"done": "done", "answered": "answered", "declined": "declined", "deferred_with_reason": "deferred"}
+
+
+def _published(outcome, public_reply="All done."):
+    """The reply the gateway publishes for an accepted declaration, and nothing else."""
+    return f"{_LABELS[outcome]}: {public_reply}"
+
+
+def _resolve(outcome="done", evidence=None, *, event_id="event", call_id="resolve-1", ok=True,
+             public_reply="All done."):
     """The turn's ``relay_resolve`` call, and the result its handler gave (recorded failed when refused)."""
     args = {"event_id": event_id, "outcome": outcome,
             "evidence": [{"tool_call_id": "call-1"}] if evidence is None else evidence}
+    if public_reply is not None:
+        args["public_reply"] = public_reply
     out = json.dumps({"declared": True, "event_id": event_id, "outcome": outcome} if ok else {"error": "refused"})
     return ("relay_resolve", args, out, call_id, "ok" if ok else "failed")
 
@@ -238,17 +249,21 @@ def test_a_declaration_citing_what_the_turn_did_or_decided_resolves_the_relayed_
         ingress, send, monkeypatch, outcome, evidence):
     _entitle()
     _transcript(_owner_record())
-    reply = "정리했습니다." + "".join(f" {item['answer']}" for item in evidence if "answer" in item)
-    _scripted(ingress, monkeypatch, (reply, _work(), _resolve(outcome, evidence)))
+    public = "프로젝트를 중지했습니다."
+    published = _published(outcome, public)
+    _scripted(ingress, monkeypatch, ("정리했습니다. 자세한 건 내부 기록에 있습니다.", _work(),
+                                     _resolve(outcome, evidence, public_reply=public)))
 
     async def exercise():
-        assert await send(text=_relay()) == (200, _owed(reply, resolved=True))
-        assert await send(text=_relay()) == (200, _owed(reply, resolved=True))  # a terminal: replayed
+        assert await send(text=_relay()) == (200, _owed(published, resolved=True))
+        assert await send(text=_relay()) == (200, _owed(published, resolved=True))  # a terminal: replayed
         assert len(ingress.actor.calls) == 1
 
     asyncio.run(exercise())
     [receipt] = ingress.receipts()
     assert receipt["response"]["outcome"] == outcome and receipt["response"]["resolved"] is True
+    # The evidence is internal: kept in the receipt, never in the reply.
+    assert receipt["response"]["evidence"] == evidence
     assert receipt["response"]["calls"] == [{"id": "call-1", "tool": "run_cancel", "ok": True}]  # what the turn did
     [model_input] = ingress.actor.model_inputs
     assert "relay_resolve" in model_input and "deferred_with_reason" in model_input  # the turn is told the tool
@@ -261,6 +276,17 @@ def test_a_declaration_citing_what_the_turn_did_or_decided_resolves_the_relayed_
     ("evidence_of_another_turns_tool_result", ("ACK", _work(), _resolve("done", [{"tool_call_id": "call-9"}]))),
     ("done_cites_only_an_answer", ("ACK", _resolve("done", [{"answer": "ok"}]))),
     ("blank_answer", ("ACK", _resolve("answered", [{"answer": "  "}]))),
+    # public_reply is required, and what is published is only ever it: a structural filter refuses private text.
+    ("no_public_reply", ("ACK", _work(), _resolve("done", public_reply=None))),
+    ("empty_public_reply", ("ACK", _work(), _resolve("done", public_reply="   "))),
+    ("public_reply_with_a_path", ("ACK", _work(), _resolve("done", public_reply="See /Users/isaac/.hermes/export.json"))),
+    ("public_reply_with_a_home_path", ("ACK", _work(), _resolve("done", public_reply="Saved to ~/private/out.txt"))),
+    ("public_reply_with_a_tool_call_id_of_this_turn", ("ACK", _work(), _resolve("done", public_reply="Result of call-1: ok"))),
+    ("public_reply_with_a_generated_tool_call_id", ("ACK", _work(), _resolve("done", public_reply="call_a1b2c3d4e5f6 passed"))),
+    ("public_reply_with_a_session_id", ("ACK", _work(), _resolve("done", public_reply="session 20261117_064935_ab12cd"))),
+    ("public_reply_with_a_receipt_key", ("ACK", _work(), _resolve(
+        "done", public_reply="receipt canonical-receipt:v2:" + "ab" * 32))),
+    ("public_reply_with_a_claim_owner_token", ("ACK", _work(), _resolve("done", public_reply="claim " + "cd" * 16))),
     ("unknown_outcome", ("ACK", _work(), _resolve("finished"))),
     ("cites_a_tool_result_that_failed", ("ACK", _work(outcome="failed"), _resolve("done"))),
     ("cites_a_call_the_executor_refused", ("ACK", _work(outcome="refused"), _resolve("done"))),
@@ -313,16 +339,17 @@ def test_a_redelivery_runs_a_reply_only_recovery_turn_that_cites_the_earlier_tur
     _entitle()
     _transcript(_owner_record())
     _scripted(ingress, monkeypatch, ("ACK", _work()),
-              ("중지했고 결과는 아래와 같습니다.", _resolve("done", [{"tool_call_id": "call-1"}])))
+              ("중지했고 결과는 아래와 같습니다.", _resolve("done", [{"tool_call_id": "call-1"}],
+                                                 public_reply="중지했고 결과는 아래와 같습니다.")))
     seen = []
     ingress.actor.during_turn = lambda: seen.append((is_reply_only_turn(), current_scope()))
 
     async def exercise():
         assert await send(text=_relay()) == (200, _owed("ACK"))
         assert len(ingress.actor.calls) == 1
-        assert await send(text=_relay()) == (200, _owed("중지했고 결과는 아래와 같습니다.", resolved=True))
+        assert await send(text=_relay()) == (200, _owed("done: 중지했고 결과는 아래와 같습니다.", resolved=True))
         assert len(ingress.actor.calls) == 2
-        assert await send(text=_relay()) == (200, _owed("중지했고 결과는 아래와 같습니다.", resolved=True))
+        assert await send(text=_relay()) == (200, _owed("done: 중지했고 결과는 아래와 같습니다.", resolved=True))
         assert len(ingress.actor.calls) == 2  # resolved: replayed
 
     asyncio.run(exercise())
@@ -335,29 +362,90 @@ def test_a_redelivery_runs_a_reply_only_recovery_turn_that_cites_the_earlier_tur
     assert receipt["response"]["outcome"] == "done"
 
 
-@pytest.mark.parametrize("outcome", ["answered", "declined", "deferred_with_reason"])
-@pytest.mark.parametrize("final, text", [
-    ("ACK", "ACK\n\n프로젝트는 중지됐고 결과는 CI 로그에 있습니다."),
-    ("확인", "확인\n\n프로젝트는 중지됐고 결과는 CI 로그에 있습니다."),
-    ("프로젝트는   중지됐고 결과는\nCI 로그에 있습니다. 감사합니다.",  # already says it, whatever the spacing
-     "프로젝트는   중지됐고 결과는\nCI 로그에 있습니다. 감사합니다."),
-])
-def test_a_declared_answer_is_always_in_the_published_reply(ingress, send, monkeypatch, outcome, final, text):
-    """Review: the evidence answer was not tied to the reply. A turn that declared an explicit answer and then
-    ended "ACK" had only "ACK" posted, and was confirmed. The published reply now always contains the declared
-    answer: when the turn's own reply does not say it, it is appended."""
+@pytest.mark.parametrize("outcome, label", [("done", "done"), ("answered", "answered"), ("declined", "declined"),
+                                            ("deferred_with_reason", "deferred")])
+@pytest.mark.parametrize("final", ["ACK", "[SILENT]", "자세히: /Users/isaac/.hermes/private/customer-export.json"])
+def test_private_evidence_is_not_published(ingress, send, monkeypatch, outcome, label, final):
+    """Review (public safety): publishing the declaration's evidence leaked private tool output, local paths and
+    session or claim ids to the thread. Evidence is internal and stays in the receipt. What is published is
+    exactly ``<outcome label>: <public_reply>``, composed by the gateway; the turn's own free text (here an ACK,
+    silence, or a private path) is never what the thread receives once the turn declared."""
     _entitle()
     _transcript(_owner_record())
-    answer = "프로젝트는 중지됐고 결과는 CI 로그에 있습니다."
-    _scripted(ingress, monkeypatch, (final, _resolve(outcome, [{"answer": answer}])))
+    private = ["Private tool output: customer export contains INTERNAL-CUSTOMER-7741.",
+               "Evidence file: /Users/isaac/.hermes/private/customer-export.json",
+               "Session 7b622a35-9409-4df4-bfe7-1e140ed238ba; claim private-claim-7741"]
+    evidence = [{"tool_call_id": "call-1"}, *({"answer": text} for text in private)]
+    _scripted(ingress, monkeypatch, (final, _work(out=private[0]),
+                                     _resolve(outcome, evidence, public_reply="The review is complete.")))
 
     async def exercise():
-        assert await send(text=_relay()) == (200, _owed(text, resolved=True))
-        assert await send(text=_relay()) == (200, _owed(text, resolved=True))  # replayed as published
+        status, body = await send(text=_relay())
+        assert (status, body) == (200, _owed(f"{label}: The review is complete.", resolved=True))
+        assert not any(text in json.dumps(body, ensure_ascii=False) for text in private)
 
     asyncio.run(exercise())
     [receipt] = ingress.receipts()
-    assert receipt["response"]["terminal_text"] == text
+    assert receipt["response"]["terminal_text"] == f"{label}: The review is complete."
+    assert [item["answer"] for item in receipt["response"]["evidence"] if "answer" in item] == private  # kept
+
+
+@pytest.mark.parametrize("public_reply", [
+    "Saved to /Users/isaac/.hermes/private/customer-export.json",       # an absolute path
+    "Saved to ~/private/out.txt", "Saved to C:\\Users\\isaac\\out.txt",
+    "Result of call-1 was ok",                                          # this turn's own tool call id
+    "see call_a1b2c3d4e5f6", "see fc_0123456789abcdef01234567", "see toolu_0123456789abcdef", "see acp_call_3",
+    "session 20261117_064935_ab12cd",                                   # a Hermes session id
+    "session 7b622a35-9409-4df4-bfe7-1e140ed238ba",                     # a relay session or record uuid
+    "receipt canonical-receipt:v2:" + "ab" * 32, "claim canonical-claim:v1:" + "ab" * 32,
+    "ledger owner-relay-record:v1:s:r", "claim owner " + "cd" * 16, "event " + "ef" * 32,
+    "digest sha256:" + "ab" * 32,
+])
+def test_a_public_reply_carrying_a_path_or_id_is_refused_and_stays_owed(ingress, send, monkeypatch, public_reply):
+    """The gateway's filter refuses a public_reply holding an absolute path or an id this codebase issues: the
+    declaration resolves nothing, the event stays owed, and the public_reply is not published (the turn's own
+    reply is, acknowledged, as for any turn that declared nothing)."""
+    _entitle()
+    _transcript(_owner_record())
+    _scripted(ingress, monkeypatch, ("ACK", _work(), _resolve("done", public_reply=public_reply)))
+
+    async def exercise():
+        assert await send(text=_relay()) == (200, _owed("ACK"))
+
+    asyncio.run(exercise())
+    [receipt] = ingress.receipts()
+    assert "resolved" not in receipt["response"] and public_reply not in json.dumps(receipt["response"])
+
+
+@pytest.mark.parametrize("public_reply", [
+    "The project is stopped; see https://example.com/runs/42 for the report.", "Handled and/or deferred 1/2.",
+    "Use /stop to cancel", "Version 2.1/2.2 shipped", "call me back after the freeze", "call_back is a word",
+    "프로젝트를 중지했고 보고서는 스레드에 있습니다.",
+])
+def test_a_public_reply_that_is_plain_prose_is_published(ingress, send, monkeypatch, public_reply):
+    """The filter is structural: the id and path formats the code issues, not words."""
+    _entitle()
+    _transcript(_owner_record())
+    _scripted(ingress, monkeypatch, ("ACK", _work(), _resolve("done", public_reply=public_reply)))
+
+    async def exercise():
+        assert await send(text=_relay()) == (200, _owed(f"done: {public_reply}", resolved=True))
+
+    asyncio.run(exercise())
+
+
+def test_no_declaration_and_a_bare_ack_stays_owed_and_a_done_declaration_publishes_done(ingress, send, monkeypatch):
+    """CEO: a tool-only ``done`` with the final text "ACK" is no confirmed bare ACK: the thread is told, by the
+    gateway's composition, that it is done. No declaration with "ACK" stays owed."""
+    _entitle()
+    _transcript(_owner_record())
+    _scripted(ingress, monkeypatch, ("ACK", _work()), ("ACK", _resolve("done", public_reply="Project stopped.")))
+
+    async def exercise():
+        assert await send(text=_relay()) == (200, _owed("ACK"))  # undeclared: the free text, owed
+        assert await send(text=_relay()) == (200, _owed("done: Project stopped.", resolved=True))
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("text, outcome, closes", [
@@ -377,7 +465,8 @@ def test_failed_tool_result_cannot_close(ingress, send, monkeypatch, text, outco
     _scripted(ingress, monkeypatch, ("The operation is done.", _work(out=text, outcome=outcome), _resolve("done")))
 
     async def exercise():
-        assert await send(text=_relay()) == (200, _owed("The operation is done.", **({"resolved": True} if closes else {})))
+        assert await send(text=_relay()) == (
+            200, _owed("done: All done." if closes else "The operation is done.", **({"resolved": True} if closes else {})))
 
     asyncio.run(exercise())
 
@@ -412,28 +501,19 @@ def test_refused_recovery_call_is_not_real_evidence(ingress, send, monkeypatch):
 
 
 def test_resolved_silent_owner_can_recover_reply(ingress, send, monkeypatch):
-    """Review: ``resolved: true`` was recorded though the owner turn ended silent, so no reply-only recovery
-    ran and the event stayed owed forever. Resolved counts only with a published reply: a declared but silent
-    turn stays owed, keeps its declaration, and its redelivery's reply-only turn is given it and publishes."""
+    """A turn that declared and then ended silent no longer leaves the event owed: what is published is the
+    declaration's public_reply, composed by the gateway, whatever the turn ended with."""
     _entitle()
     _transcript(_owner_record())
-    _scripted(ingress, monkeypatch, ("[SILENT]", _work(), _resolve("done")),
-              ("The project is stopped.", _resolve("done")))
+    _scripted(ingress, monkeypatch, ("[SILENT]", _work(), _resolve("done", public_reply="The project is stopped.")))
 
     async def exercise():
-        assert await send(text=_relay()) == (
-            200, {"event_id": "event", "text": "[SILENT]", "disposition": "owner_relay", "silent": True})
-        [receipt] = ingress.receipts()
-        assert "resolved" not in receipt["response"] and "outcome" not in receipt["response"]
-        assert receipt["response"]["declared"] == {"outcome": "done", "answers": []}
-        assert await send(text=_relay()) == (200, _owed("The project is stopped.", resolved=True))
-        assert len(ingress.actor.calls) == 2
-        assert await send(text=_relay()) == (200, _owed("The project is stopped.", resolved=True))  # replayed
-        assert len(ingress.actor.calls) == 2
+        assert await send(text=_relay()) == (200, _owed("done: The project is stopped.", resolved=True))
+        assert len(ingress.actor.calls) == 1
 
     asyncio.run(exercise())
-    second = ingress.actor.model_inputs[1]
-    assert "reply-only" in second and "declared" in second and "published no reply" in second
+    [receipt] = ingress.receipts()
+    assert receipt["response"]["terminal_text"] == "done: The project is stopped."
 
 
 def test_relay_resolve_survives_the_real_turn_starts_tools_freeze_and_is_not_carried_into_other_turns(
