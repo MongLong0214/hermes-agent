@@ -16,6 +16,14 @@ a declaration is ever accepted.
 
 A recovery turn for an owed event is reply-only (:func:`set_reply_only`): it may answer and declare, and the
 executor refuses every other call, so recovering a reply never repeats the work.
+
+What a declaration proves, and what it does not. An owed event closes on the structured declaration plus the
+thread's read-back of the published reply, and on nothing else: a bare acknowledgement, the silence marker or an
+answer with no declaration never closes it. The closure is a *reply* closure only. Whether the public_reply
+actually answers the instruction is NOT guaranteed: no length, sentence or synonym check judges it, so a thin or
+off-topic answer closes the event as readily as a good one. A correction finds the reply by the instruction's
+event id (the thread's reply is tagged to it, and the shim's journal keeps that id and the reply's digest), and
+nothing runs again. Nothing here marks the work done, an acceptance passed or the owner's approval given.
 """
 
 from __future__ import annotations
@@ -39,25 +47,16 @@ _MAX_EVIDENCE = 64
 PUBLIC_LABELS = {"done": "done", "answered": "answered", "declined": "declined", "deferred_with_reason": "deferred"}
 _MAX_PUBLIC_REPLY = 2_000
 
-# A public_reply may not carry what the codebase keeps private. One strict rule for paths, not a list of roots:
-# a backslash pair, a drive letter before a colon and a slash or backslash, ``file:`` and ``~/`` are refused outright;
-# so is ANY other "/" that is not part of an http(s) URL or a standalone ``/word`` command (letters only, at most 16,
-# whitespace or the start before it, whitespace, the end or punctuation then whitespace or the end after it).
-# ``a/b``, ``and/or`` and ``TCP/IP`` are refused too, and so is a single-word path such as ``/export.json``.
-_PATH = re.compile(r"\\\\|[A-Za-z]:[/\\]|\bfile:|~/", re.IGNORECASE)
+# A public_reply may not carry what the codebase keeps private. One strict rule for paths, no list of roots and no
+# exception: EVERY "/" outside an http(s) URL is refused, and so is EVERY backslash, and ``file:``. ``/stop``,
+# ``/root``, ``a/b``, ``and/or``, ``TCP/IP``, ``C:/x`` and ``~/x`` are all refused, and a URL passes.
 _URL = re.compile(r"\bhttps?://[^\W_][^\s\\]*", re.IGNORECASE)
-_COMMAND = re.compile(r"(?<!\S)/[^\W\d_]{1,16}(?=[.,;:!?)\]}'\"]*(?:\s|\Z))")
-
-
-_MASK = "\x00"
+_FILE_URI = re.compile(r"\bfile:", re.IGNORECASE)
 
 
 def _holds_path(text: str) -> bool:
-    # A masked URL or command leaves a mark that is neither a space nor a slash, so whatever stands against it is
-    # not a standalone command, and any slash still left is a path. The URL goes first: its own "s:/" is no drive.
-    rest = _URL.sub(_MASK, text)
-    return bool(_PATH.search(rest)) or "/" in _COMMAND.sub(_MASK, rest)
-
+    rest = _URL.sub(" ", text)  # a URL's own slashes are not a path; whatever is left is judged
+    return "/" in rest or "\\" in rest or bool(_FILE_URI.search(rest))
 
 
 _ID = re.compile(
@@ -103,16 +102,16 @@ def reply_only_refuses(names: Iterable[str]) -> bool:
 
 
 def public_reply_problem(text: Any, known_ids: Iterable[str] = ()) -> Optional[str]:
-    """Why *text* may not be published, or None. Refused: nothing, over 2,000 characters, a path (a backslash pair, a
-    drive path, ``file:``, ``~/``, or any "/" outside an http(s) URL and a standalone ``/word`` command), an id of
-    a shape this codebase issues (a tool call, a session, a receipt, a claim or a ledger key, a claim owner or
-    event id), or any of *known_ids* (the tool call ids of the turns concerned) as a whole id."""
+    """Why *text* may not be published, or None. Refused: nothing, over 2,000 characters, a path (any "/" outside
+    an http(s) URL, any backslash, or ``file:``), an id of a shape this codebase issues (a tool call, a session, a
+    receipt, a claim or a ledger key, a claim owner or event id), or any of *known_ids* (the tool call ids of the
+    turns concerned) as a whole id. It judges the shape of what is published, never whether it answers anything."""
     if not isinstance(text, str) or not text.strip():
         return "it is empty"
     if len(text) > _MAX_PUBLIC_REPLY:
         return f"it is over {_MAX_PUBLIC_REPLY} characters"
     if _holds_path(text):
-        return "it holds a file path or a slash"
+        return "it holds a path (a slash outside an http(s) URL, a backslash or file:)"
     if _ID.search(text):
         return "it holds an id (tool call, session, receipt or claim)"
     for known in known_ids:
@@ -147,9 +146,9 @@ SCHEMA = {
         "results), answered (the instruction asked a question), declined (you will not do it) or "
         "deferred_with_reason (it waits on something). What the thread is told is exactly '<outcome>: "
         "<public_reply>' (outcome as done, answered, declined or deferred): public_reply IS the answer, the "
-        "decision or the reason, one plain statement for the CTO, with no slash except in an http(s) URL or a "
-        "standalone /command, no backslash pair, drive path, file: or ~/, and no tool call, session, claim or receipt id; one that has any is refused and the instruction "
-        "stays open. evidence is internal, never published, and cites tool calls only: tool_call_id items naming "
+        "decision or the reason, one plain statement for the CTO, with no slash except in an http(s) URL, no "
+        "backslash, no file: and no tool call, session, claim or receipt id; one that has any is refused and the "
+        "instruction stays open. evidence is internal, never published, and cites tool calls only: tool_call_id items naming "
         "tool results of this instruction's turns, required for done and optional otherwise; prose in evidence "
         "is never the answer."),
     "parameters": {

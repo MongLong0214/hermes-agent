@@ -286,6 +286,9 @@ def test_a_declaration_citing_what_the_turn_did_or_decided_resolves_the_relayed_
     ("public_reply_with_a_path_after_a_colon", ("ACK", _work(), _resolve(
         "done", public_reply="Output:/Users/isaac/private/export.json"))),
     ("public_reply_with_a_spaced_path", ("ACK", _work(), _resolve("done", public_reply="Saved to /Customer Exports/private.json"))),
+    ("public_reply_with_a_slash_command", ("ACK", _work(), _resolve("done", public_reply="Use /stop to cancel"))),
+    ("public_reply_with_a_bare_root", ("ACK", _work(), _resolve("done", public_reply="Saved to /root"))),
+    ("public_reply_with_a_backslash", ("ACK", _work(), _resolve("done", public_reply="Saved to Users\\isaac\\x"))),
     ("public_reply_with_a_slash_in_prose", ("ACK", _work(), _resolve("done", public_reply="Handled and/or deferred."))),
     ("public_reply_with_a_root_named_file", ("ACK", _work(), _resolve("done", public_reply="Saved at /private-report.json"))),
     # public_reply is required, and what is published is only ever it: a structural filter refuses private text.
@@ -441,6 +444,7 @@ def test_a_declared_public_answer_is_published_exactly(ingress, send, monkeypatc
     "Saved to ~/private/out.txt", "Saved to C:\\Users\\isaac\\out.txt",
     "Output:/Users/isaac/private/export.json", "Output:/x", "Saved to /Customer Exports/private.json",
     "Saved to /customer_export", "Handled and/or deferred 1/2.", "Version 2.1/2.2 shipped",
+    "Use /stop to cancel", "Saved to /root", "Saved to /srv", "Run /status", "Users\\isaac\\x",
     "Result of call-1 was ok",                                          # this turn's own tool call id
     "see call_a1b2c3d4e5f6", "see fc_0123456789abcdef01234567", "see toolu_0123456789abcdef", "see acp_call_3",
     "session 20261117_064935_ab12cd",                                   # a Hermes session id
@@ -467,7 +471,7 @@ def test_a_public_reply_carrying_a_path_or_id_is_refused_and_stays_owed(ingress,
 
 @pytest.mark.parametrize("public_reply", [
     "The project is stopped; see https://example.com/runs/42 for the report.",
-    "Use /stop to cancel", "call me back after the freeze", "call_back is a word",
+    "call me back after the freeze", "call_back is a word", "see https://example.com/a/b.",
     "프로젝트를 중지했고 보고서는 스레드에 있습니다.",
 ])
 def test_a_public_reply_that_is_plain_prose_is_published(ingress, send, monkeypatch, public_reply):
@@ -546,6 +550,51 @@ def test_refused_recovery_call_is_not_real_evidence(ingress, send, monkeypatch):
 
     asyncio.run(exercise())
     assert len(ingress.actor.calls) == 2
+
+
+# What a declared closure must never write: a claim that the work is done and accepted, or the owner approved.
+CLOSURE_OVERREACH = r"accept|approv|verif|passed|merge|sign.?off|complete|work"
+
+
+def _json_keys(value):
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            yield key
+            yield from _json_keys(inner)
+    elif isinstance(value, list):
+        for inner in value:
+            yield from _json_keys(inner)
+
+
+def test_a_declared_closure_is_recorded_only_as_a_reply_closure(ingress, send, monkeypatch):
+    """CEO ruling A: closure is the structured declaration plus the thread's read-back, and it closes the reply
+    only. Whatever the declaration says (``done`` included), the gateway's durable rows hold the reply and its
+    declared outcome: no field or state that says the work is done, an acceptance passed or the owner approved."""
+    import re
+
+    _entitle()
+    _transcript(_owner_record())
+    _scripted(ingress, monkeypatch, ("ACK", _work(), _resolve("done", public_reply="Project stopped.")))
+
+    async def exercise():
+        assert await send(text=_relay()) == (200, _owed("done: Project stopped.", resolved=True))
+
+    asyncio.run(exercise())
+    [receipt] = ingress.receipts()
+    assert receipt["state"] == "terminal" and receipt["response"]["resolved"] is True
+    db = ingress.runner.session_store._db.db_path
+    with closing(sqlite3.connect(Path(db).resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        rows = conn.execute("SELECT key, value FROM state_meta WHERE key LIKE 'canonical-%' "
+                            "OR key LIKE 'owner-relay-%'").fetchall()
+    assert rows
+    keys = set()
+    for _key, value in rows:
+        try:
+            keys.update(_json_keys(json.loads(value)))
+        except ValueError:
+            pass  # the ledger row's value is the receipt key it points at, not a record
+    assert {"resolved", "outcome", "terminal_text"} <= keys  # it looked at the closure, not at nothing
+    assert not [key for key in keys if re.search(CLOSURE_OVERREACH, key, re.IGNORECASE)]
 
 
 def test_resolved_silent_owner_can_recover_reply(ingress, send, monkeypatch):

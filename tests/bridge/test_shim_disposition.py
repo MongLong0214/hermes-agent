@@ -562,7 +562,48 @@ def _real_path(gw, gw_shim, monkeypatch, tmp_path, *turns, relay=True, kind=None
     if kind is not None:
         head, _, tags = prompt.rpartition("\nTags: ")
         prompt = head + "\nTags: " + json.dumps(json.loads(tags) + [["acp-kind", kind]], separators=(",", ":"))
-    return SimpleNamespace(prompt=prompt, thread=thread, settled=settled, journal=journal)
+    def events():
+        path = state / "relay.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    return SimpleNamespace(prompt=prompt, thread=thread, settled=settled, journal=journal, events=events)
+
+
+def test_a_declared_closure_marks_nothing_but_the_reply_in_the_shim_journal(gw, gw_shim, monkeypatch, tmp_path):
+    """CEO ruling A, the shim's side: a posted and read-back ``done`` closes the owed reply (``confirmed``,
+    ``resolved``) and the journal holds no field that says the work is done, accepted or approved."""
+    import re
+
+    from tests.gateway.test_canonical_owner_relay import CLOSURE_OVERREACH
+
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path,
+                      ("ACK", _work(), _resolve("done", [{"tool_call_id": "call-1"}], public_reply="Project stopped.")))
+    gw_drive(gw_shim, real.prompt)
+    closed = real.settled()
+    assert (closed["reply_state"], closed["resolved"], closed["sent"]) == ("confirmed", True, True)
+    assert gw_shim.recovery_delivery_state(GW_EVENT) == "answered"
+    assert not [key for key in closed if re.search(CLOSURE_OVERREACH, key, re.IGNORECASE)]
+
+
+def test_a_thin_answer_that_closes_an_event_keeps_its_link_to_the_reply_and_runs_nothing_again(
+        gw, gw_shim, monkeypatch, tmp_path):
+    """CEO ruling A: closure does not judge that the answer is enough, so a one-word answer closes the event.
+    What stays is the way back to it: the reply is posted in the thread as a reply to the original event (the
+    reply event's own id is the thread's), and the journal keeps the original event id, channel and reply
+    digest. A redelivery or a later look at the event replays the terminal: no turn, no work, no second post."""
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("ACK", _work(), _resolve("answered", [], public_reply="ok")))
+    gw_drive(gw_shim, real.prompt)
+    closed = real.settled()
+    assert real.thread() == ["@cto-repo-factory answered: ok"]
+    assert (closed["reply_state"], closed["resolved"]) == ("confirmed", True)  # the thin answer closed it
+    [reply] = real.events()
+    assert reply["id"] and reply["id"] != GW_EVENT
+    assert ["e", GW_EVENT, "", "reply"] in reply["tags"]  # the thread links the reply to the original event
+    assert closed["event_id"] == closed["reply_to"] == GW_EVENT and closed["channel"] == GW_CHANNEL
+    assert closed["body_sha256"] == hashlib.sha256(reply["content"].encode()).hexdigest()
+
+    gw_drive(gw_shim, real.prompt, rpc_id=2)  # the event is delivered again
+    assert len(gw.runs) == 1 and real.events() == [reply] and real.journal() == closed
 
 
 def test_an_acknowledged_owner_relay_gets_a_reply_only_recovery_turn_and_its_declared_answer_confirms(
@@ -717,7 +758,8 @@ def test_private_evidence_is_not_published(gw, gw_shim, monkeypatch, tmp_path, e
 @pytest.mark.parametrize("public_reply", ["Saved to /Users/isaac/.hermes/private/customer-export.json",
                                           "session 7b622a35-9409-4df4-bfe7-1e140ed238ba", "call_a1b2c3d4e5f6 passed",
                                           "Output:/Users/isaac/private/export.json",
-                                          "Saved to /Customer Exports/private.json"])
+                                          "Saved to /Customer Exports/private.json", "Saved to /root", "Use /stop",
+                                          "Users\\isaac\\x"])
 def test_a_public_reply_carrying_a_path_or_id_is_refused_and_stays_owed_on_the_real_path(
         gw, gw_shim, monkeypatch, tmp_path, public_reply):
     real = _real_path(gw, gw_shim, monkeypatch, tmp_path,

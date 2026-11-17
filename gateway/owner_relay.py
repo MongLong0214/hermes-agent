@@ -275,8 +275,8 @@ def peer_declaration_note(disposition: str, event_id: str) -> str:
             f"answer. Declare it handled by calling the relay_resolve tool once with event_id "
             f"{json.dumps(event_id)}, an outcome (answered, declined or deferred_with_reason) and a public_reply: "
             "the answer, decision or, for a conflict, the resolution, as the one plain statement the CTO is told, "
-            "published exactly as '<outcome>: <public_reply>', never with a file path or a tool call, session, "
-            "claim or receipt id. An acknowledgement, or an answer without that declaration, leaves it open.]")
+            "published exactly as '<outcome>: <public_reply>', never with a slash outside an http(s) URL, a "
+            "backslash, or a tool call, session, claim or receipt id. An acknowledgement, or an answer without that declaration, leaves it open.]")
 
 
 def event_acp_kind(text: Any, *, event_id: str, channel_id: str, author_id: str) -> Optional[str]:
@@ -516,8 +516,8 @@ def render_owner_turn(relay: VerifiedRelay, metadata: Mapping[str, str], *, earl
         "evidence (tool_call_id items naming tool results of this instruction's turns: required for done, internal "
         "and never published) and a public_reply: the one plain statement the thread is told, published exactly as "
         "'<outcome>: <public_reply>', so for answered, declined or deferred it IS your answer, decision or reason; "
-        "never with a file path or a tool call, session, claim or receipt id. Without a declaration the instruction "
-        "stays open, and your final answer is only an acknowledgement.\n"
+        "never with a slash outside an http(s) URL, a backslash, or a tool call, session, claim or receipt id. "
+        "Without a declaration the instruction stays open, and your final answer is only an acknowledgement.\n"
         + (("This is a reply-only recovery turn. This instruction already ran in this conversation and its answer "
             "did not declare it resolved. You have no tool but relay_resolve now: do not act and do not repeat "
             "any action. The earlier turn made these calls: "
