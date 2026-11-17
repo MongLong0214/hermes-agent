@@ -59,13 +59,13 @@ if [ -z "${BUZZ_PRIVATE_KEY:-}" ]; then
       _prev="$_a"
     done
 
+    # 맵 파일은 캐시일 뿐 권위가 아니다. 호출마다 로스터에서 다시 만들고, 만들지 못하면
+    # (로스터를 못 읽음, 별칭이 모호함, 스크립트 없음) 남아 있는 옛 항목을 쓰지 않고 거부한다.
+    # 폐기·미등록 방은 새 맵에 없으므로 같은 경로로 거부된다.
     MAP="$B/channel-cto.map"
-    _resolve() { [ -n "$CH" ] && [ -r "$MAP" ] && awk -v c="$CH" '$1==c {print $2; exit}' "$MAP"; }
-    RESOLVED="$(_resolve)"
-    if [ -z "$RESOLVED" ] && [ -n "$CH" ] && [ -x "$B/buzz-identity-map.sh" ]; then
-      # 처음 보는 채널이다. 맵을 다시 만들어 한 번만 재시도한다.
-      "$B/buzz-identity-map.sh" >/dev/null 2>&1
-      RESOLVED="$(_resolve)"
+    RESOLVED=""
+    if [ -n "$CH" ] && [ -x "$B/buzz-identity-map.sh" ] && "$B/buzz-identity-map.sh" >/dev/null 2>&1; then
+      RESOLVED="$(awk -v c="$CH" '$1==c {print $2; exit}' "$MAP" 2>/dev/null)"
     fi
 
     if [ -n "$RESOLVED" ]; then
@@ -99,8 +99,13 @@ fi
 # 에이전트 셸(CLAUDECODE)은 어떤 경로로도 CEO 키로 서명하지 못한다. 위 블록은 BUZZ_PRIVATE_KEY 가
 # 이미 있으면 통째로 건너뛰고 buzz 는 --private-key 도 받으므로, 최종 키를 여기서 한 번 더 본다.
 # 개인키가 아니라 공개키로 비교한다 — 16진 표기(대소문자)나 별칭이 달라도 같은 키면 같은 공개키다.
-# 공개키를 계산하지 못하거나 keys/ceo.pub 가 없으면 CEO 가 아님을 증명하지 못한 것이므로 거부한다.
+# 키는 64자리 16진 또는 bech32 nsec 이다. 공개키를 계산하지 못하거나(디코드 실패 포함)
+# keys/ceo.pub 가 없으면 CEO 가 아님을 증명하지 못한 것이므로 거부한다.
 # CEO 경로(CLAUDECODE 없음)는 건드리지 않는다.
+#
+# 한계: 이것은 에이전트 셸의 실수(2026-08-25 사고)를 막는 가드이지 같은 계정의 고의 우회를
+# 막는 장치가 아니다. 같은 uid 의 프로세스는 CLAUDECODE 를 지우거나 keys/ceo.priv 를 읽어
+# 원본 buzz 를 직접 부를 수 있고, 키 파일이 그 uid 에 읽히는 한 래퍼는 이를 막지 못한다.
 _refuse_ceo_key() {
   printf '%s' "$1" | python3 -I -c '
 import re, sys
@@ -117,9 +122,27 @@ def add(a, b):
     m = (3 * a[0] * a[0] * pow(2 * a[1], -1, P) if a == b else (b[1] - a[1]) * pow(b[0] - a[0], -1, P)) % P
     x = (m * m - a[0] - b[0]) % P
     return (x, (m * (a[0] - x) - a[1]) % P)
+def nsec(text):
+    text = text.lower() if text == text.upper() else text
+    chars = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+    hrp, _, rest = text.rpartition("1")
+    if hrp != "nsec" or len(rest) != 58 or any(c not in chars for c in rest):
+        raise ValueError
+    data = [chars.index(c) for c in rest]
+    c = 1
+    for v in [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp] + data:
+        top, c = c >> 25, ((c & 0x1FFFFFF) << 5) ^ v
+        for i in range(5):
+            c ^= (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)[i] if (top >> i) & 1 else 0
+    bits = "".join("%05d" % int(bin(v)[2:]) for v in data[:-6])
+    if c != 1 or len(bits) != 260 or bits[256:] != "0000":
+        raise ValueError
+    return "%064x" % int(bits[:256], 2)
 key = sys.stdin.read().strip()
 try:
     ceo_pub = (Path(sys.argv[1]) / "keys" / "ceo.pub").read_text().strip().lower()
+    if key[:5].lower() == "nsec1":
+        key = nsec(key)
     if not re.fullmatch("[0-9a-fA-F]{64}", key) or not re.fullmatch("[0-9a-f]{64}", ceo_pub):
         sys.exit(2)
     d, point, bit = int(key, 16), None, G

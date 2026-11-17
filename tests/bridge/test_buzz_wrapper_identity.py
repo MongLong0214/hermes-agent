@@ -15,6 +15,9 @@ WRAPPER = ROOT / 'bridge/bin/buzz'
 # Throwaway scalars 1 and 2, never a real key. CEO_PUB is x(1*G): the wrapper derives public keys.
 CEO_KEY, CTO_KEY = '0' * 63 + '1', '0' * 63 + '2'
 CEO_PUB = '79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798'
+# bech32 nsec of those scalars (encoder checked against the NIP-19 published vector).
+CEO_NSEC = 'nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsmhltgl'
+CTO_NSEC = 'nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpqptcfk2'
 # The retired CEO key name, spelled in two parts so a repo-wide search for it stays empty.
 RETIRED = 'ceo' + '2'
 UNKNOWN_ROOM = '30000000-0000-4000-8000-000000000003'
@@ -112,8 +115,43 @@ def test_a_cto_shell_cannot_sign_as_the_ceo_by_any_route(home, route):
         refused(run(home, *args, **env, BUZZ_IDENTITY='cto-local')[0])
 
 
+def test_a_cto_shell_may_use_a_valid_nsec_that_is_not_the_ceo(home):
+    assert run(home, 'feed', BUZZ_PRIVATE_KEY=CTO_NSEC, CLAUDECODE='1')[1]['key'] == CTO_NSEC
+    assert run(home, 'feed', '--private-key', CTO_NSEC, CLAUDECODE='1', BUZZ_IDENTITY='cto-local')[0].returncode == 0
+
+
+@pytest.mark.parametrize('key', [CEO_NSEC, CEO_NSEC.upper(), CTO_NSEC[:-1] + 'q', 'nsec1fake', 'npub1' + CTO_NSEC[5:]])
+def test_a_cto_shell_refuses_the_ceo_nsec_and_any_undecodable_key(home, key):
+    refused(run(home, 'feed', BUZZ_PRIVATE_KEY=key, CLAUDECODE='1')[0])
+    refused(run(home, 'feed', '--private-key=' + key, CLAUDECODE='1', BUZZ_IDENTITY='cto-local')[0])
+
+
 def test_a_cto_shell_with_a_key_it_cannot_check_is_refused(home):
-    # Not a 64-digit hex scalar, so it cannot be proven different from the CEO key.
-    refused(run(home, 'feed', BUZZ_PRIVATE_KEY='nsec1fake', CLAUDECODE='1')[0])
+    refused(run(home, 'feed', BUZZ_PRIVATE_KEY='not-a-key', CLAUDECODE='1')[0])
     (home / '.hermes/bridge/keys/ceo.pub').unlink()
     refused(run(home, 'feed', BUZZ_PRIVATE_KEY=CTO_KEY, CLAUDECODE='1')[0])
+
+
+def cached(home, text=None):
+    """Plant a channel map entry as an earlier run would have left it."""
+    (home / '.hermes/bridge/channel-cto.map').write_text(text or A + ' cto-local\n')
+
+
+@pytest.mark.parametrize('breakage', ['retired', 'unknown', 'unreadable', 'ambiguous', 'no-map-script'])
+def test_a_cached_channel_entry_is_revalidated_against_the_roster(home, breakage):
+    bridge = home / '.hermes/bridge'
+    assert run(home, 'send', '--channel', A, CLAUDECODE='1')[1]['key'] == CTO_KEY
+    cached(home)
+    channel = A
+    if breakage == 'retired':
+        replace(bridge / 'required-mentions.json', document(channels={A: room(CTO, 'retired')}))
+    elif breakage == 'unknown':
+        channel = UNKNOWN_ROOM
+        cached(home, UNKNOWN_ROOM + ' cto-local\n')
+    elif breakage == 'unreadable':
+        (bridge / 'required-mentions.json').write_text('{')
+    elif breakage == 'ambiguous':
+        (bridge / 'keys/cto-twin.pub').write_text(CTO)
+    else:
+        (bridge / 'buzz-identity-map.sh').unlink()
+    refused(run(home, 'send', '--channel', channel, CLAUDECODE='1')[0])
