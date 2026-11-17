@@ -13,7 +13,7 @@ import urllib.request
 
 import pytest
 from test_shim_publish_retry import (  # noqa: F401 - the shim fixture is this module's too
-    _SHIM, EVENT_A, EVENT_B, SIGNER, ask, body, calls, final, log_text, plan, posts, record, shim)
+    _SHIM, EVENT_A, EVENT_B, PEER, SIGNER, ask, body, calls, final, log_text, plan, posts, record, shim)
 
 
 class _Gateway(str):
@@ -103,6 +103,7 @@ def test_a_reply_to_another_event_does_not_complete_this_one(shim):
     done = final(shim, EVENT_A)
     assert (done["sent"], done["reply_state"]) == (False, "unconfirmed")
     assert posts(shim, EVENT_A) == []
+    assert sum(c["cmd"] == "send" for c in calls(shim, EVENT_A)) == 1  # an exit 0 send is never resent
 
 
 def test_the_disposition_is_read_only_from_the_gateways_answer_in_its_closed_vocabulary(shim, monkeypatch):
@@ -131,3 +132,68 @@ def test_the_disposition_is_read_only_from_the_gateways_answer_in_its_closed_voc
         assert (answer, answer.disposition, answer.silent) == ("[disposition: owner_relay] hi", None, False)
     plain = reply({"event_id": EVENT_A, "text": "ok"})
     assert (plain.disposition, plain.silent) == (None, False)
+
+
+@pytest.mark.parametrize("reply", ["ACK", "ack.", "확인했습니다", "👍", "👍🏽", "Ok!", "네", "접수했습니다.",
+                                   f"@{PEER} 알겠습니다", "  \u2705 "])
+def test_an_acknowledgement_is_posted_but_never_completes_an_owed_event(shim, reply):
+    """P1 (review r1): ACK-only is no completion. It is the CEO's own reply, posted and read back, and the
+    event stays owed: ``acknowledged``, never ``confirmed``. The set only decides completion."""
+    _gateway_answers(shim, reply, "owner_relay")
+    ask(shim, EVENT_A)
+    done = final(shim, EVENT_A)
+    assert (done["kind"], done["disposition"], done["reply_state"]) == ("answer", "owner_relay", "acknowledged")
+    assert len(posts(shim, EVENT_A)) == 1
+
+
+@pytest.mark.parametrize("reply", ["확인했습니다. 프로젝트를 중지했고 결과를 보고합니다.",
+                                   "ok, I stopped the project and the report follows",
+                                   "ACK 2 of 3: the review is still running", "👍 done: merged"])
+def test_a_substantive_answer_confirms_an_owed_event(shim, reply):
+    _gateway_answers(shim, reply, "ruling")
+    ask(shim, EVENT_A)
+    assert final(shim, EVENT_A)["reply_state"] == "confirmed"
+
+
+def test_an_acknowledgement_that_is_not_read_back_stays_unconfirmed(shim):
+    plan(shim, "send", EVENT_A, {"posts": True})
+    plan(shim, "thread", EVENT_A, {"exit": 1})
+    _gateway_answers(shim, "ACK", "owner_relay")
+    ask(shim, EVENT_A)
+    assert final(shim, EVENT_A)["reply_state"] == "unconfirmed"
+
+
+def test_a_stale_read_after_an_exit_0_send_never_posts_the_reply_twice(shim, monkeypatch):
+    """P2 (review r1): the send exited 0, so a read that does not show the post yet is a stale read, not an
+    absence: it is read again, never resent. The reply is one post."""
+    reads = []
+
+    def stale_then_fresh(channel, target, digests, _real=shim._read_back):
+        reads.append(target)
+        return "absent" if len(reads) < 4 else _real(channel, target, digests)
+
+    monkeypatch.setattr(shim, "_read_back", stale_then_fresh)
+    _gateway_answers(shim, f"answer for {EVENT_A}", "owner_relay")
+    ask(shim, EVENT_A)
+    done = final(shim, EVENT_A)
+    assert len(posts(shim, EVENT_A)) == 1 and sum(c["cmd"] == "send" for c in calls(shim, EVENT_A)) == 1
+    assert len(reads) >= 4  # it kept reading
+    assert (done["sent"], done["reply_state"], done.get("recovered")) == (True, "confirmed", True)
+
+
+def test_a_read_that_never_shows_an_exit_0_send_is_left_unconfirmed_not_resent(shim, monkeypatch):
+    monkeypatch.setattr(shim, "_read_back", lambda channel, target, digests: "absent")
+    _gateway_answers(shim, f"answer for {EVENT_A}", "owner_relay")
+    ask(shim, EVENT_A)
+    done = final(shim, EVENT_A)
+    assert len(posts(shim, EVENT_A)) == 1 and sum(c["cmd"] == "send" for c in calls(shim, EVENT_A)) == 1
+    assert (done["sent"], done["reply_state"]) == (False, "unconfirmed")
+
+
+def test_a_failed_send_is_still_resent_once_a_complete_read_shows_it_absent(shim):
+    plan(shim, "send", EVENT_A, {"exit": 2, "stderr": "relay closed the connection"}, {})
+    _gateway_answers(shim, f"answer for {EVENT_A}", "owner_relay")
+    ask(shim, EVENT_A)
+    done = final(shim, EVENT_A)
+    assert len(posts(shim, EVENT_A)) == 1 and sum(c["cmd"] == "send" for c in calls(shim, EVENT_A)) == 2
+    assert (done["sent"], done["reply_state"]) == (True, "confirmed")

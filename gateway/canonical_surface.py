@@ -823,6 +823,11 @@ class CanonicalReceiptCoordinator:
                                   observed="recorded_other" if claim_owner else "owner_unknown",
                                   delivery="not_delivered")
                 raise ValueError("canonical_receipt_conflict")
+            if answer.status == "terminal" and answer.terminal_text is not None and answer.disposition is None:
+                # A receipt written before dispositions were recorded has none, and none is never "ordinary":
+                # the event's own provenance is judged again, by the same relay grammar the live path opens.
+                if self._opens_owner_relay(event):
+                    answer = replace(answer, disposition=DISPOSITION_OWNER_RELAY)
             return answer
         if claimed is None:
             return None
@@ -830,6 +835,21 @@ class CanonicalReceiptCoordinator:
         _log_record_state(logging.WARNING, "receipt row missing", stage="claim.receipt_missing",
                           binding=binding, event=event, key=key, observed="absent", delivery="unknown")
         return CanonicalReceiptResult("uncertain")
+
+    @staticmethod
+    def _opens_owner_relay(event: Any) -> bool:
+        """Whether *event*'s own content opens an owner-relay block (``_owner_relay``'s first step, which no
+        receipt could be written for unless it parsed). Proof is not asked: it gates authority, and a reply is
+        owed whether or not the relay can still be proven; a block that breaks the grammar claims owner
+        authority all the same."""
+        from gateway.owner_relay import OwnerRelayRefused, event_content, parse_relay
+
+        try:
+            return parse_relay(event_content(
+                getattr(event, "text", None), event_id=getattr(event, "event_id", ""),
+                channel_id=getattr(event, "channel_id", ""), author_id=getattr(event, "author_id", ""))) is not None
+        except OwnerRelayRefused:
+            return True
 
     @staticmethod
     def _decode_claim(value: Any, fingerprint: str) -> str | None:

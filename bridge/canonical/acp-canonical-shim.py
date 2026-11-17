@@ -1100,6 +1100,27 @@ def _rewrite_publication(name, record):
             pass
 
 
+# Acknowledgement-only replies: they decide only whether an owed reply is complete (``acknowledged``, still owed),
+# never what anything is allowed to do. Compared whole, after the leading @mentions, punctuation, symbols and
+# emoji are dropped and the case folded, so a reply that says anything else is substantive.
+_ACKNOWLEDGEMENTS = frozenset({
+    "ack", "acknowledged", "ok", "okay", "k", "roger", "received", "noted", "got it", "copy", "yes", "yep",
+    "확인", "확인했습니다", "확인함", "접수", "접수했습니다", "수신", "수신했습니다", "알겠습니다", "알겠어요", "네", "넵", "예",
+})
+_LEADING_MENTIONS = re.compile(r"(?:@\S+\s*)+")
+
+
+def _acknowledgement_only(text):
+    """True when *text* is only an acknowledgement: nothing is left of it, or only a word of
+    ``_ACKNOWLEDGEMENTS``, once its leading mentions, punctuation, symbols, emoji and joiners are dropped."""
+    import unicodedata
+
+    stripped = _LEADING_MENTIONS.sub("", unicodedata.normalize("NFKC", text).strip(), count=1)
+    kept = "".join(" " if ch.isspace() else ch for ch in stripped
+                   if ch.isspace() or unicodedata.category(ch)[0] not in "PSMC")
+    return " ".join(kept.casefold().split()) in _ACKNOWLEDGEMENTS | {""}
+
+
 _RETRIES = []  # one daemon thread per answer whose post is still being retried; never joined
 _RETRIES_LOCK = threading.Lock()
 
@@ -1127,6 +1148,11 @@ def _retry_publication(name, record, body, digests, tag):
             if seen == "unknown":
                 log(f"prompt {tag}… {kind} read-back failed; not resending until a read-back shows no reply")
                 continue
+            if state == "sent":
+                # The send exited 0: the post is out, so a read that does not show it is a stale read, never
+                # an absence. It is read again; only a send that itself failed is ever sent again.
+                log(f"prompt {tag}… {kind} sent but not yet in the thread; reading again, not resending")
+                continue
             state, reason = _send_attempt(channel, target, body)
             attempts += 1
             if state not in retryable:
@@ -1143,7 +1169,7 @@ def _retry_publication(name, record, body, digests, tag):
     sent = state == "sent" and (found or not owes)
     _rewrite_publication(name, dict(record, sent=sent, state=state, delivery="posted" if sent else "failed",
                                     reason=str(reason)[:400], attempts=attempts, pending=False,
-                                    **({"reply_state": "confirmed" if sent else "unconfirmed"} if owes else {}),
+                                    **({"reply_state": _reply_state(sent, body)} if owes else {}),
                                     **({"recovered": True} if found else {}),
                                     at=time.strftime("%Y-%m-%dT%H:%M:%S%z")))
     if found:
@@ -1157,6 +1183,14 @@ def _retry_publication(name, record, body, digests, tag):
             f"{state}: {reason}")
     else:
         log(f"prompt {tag}… {kind} NOT posted (no retry) on attempt {attempts}: {state}: {reason}")
+
+
+def _reply_state(sent, body):
+    """An owed reply's journal state: ``confirmed`` only when the thread shows it and it says something,
+    ``acknowledged`` when the thread shows only an acknowledgement (still owed), else ``unconfirmed``."""
+    if not sent:
+        return "unconfirmed"
+    return "acknowledged" if _acknowledgement_only(body) else "confirmed"
 
 
 def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_to=None, preclaim=False,
@@ -1205,7 +1239,7 @@ def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_t
     sent = state == "sent" and (confirmed or not owes)
     retry = bool(kind == "answer" and attempts and target
                  and (state in RETRYABLE_SEND_STATES or (owes and state == "sent" and not confirmed)))
-    reply_state = (("confirmed" if sent else "unconfirmed") if owes else "owed" if owed in ANSWER_OWED else None)
+    reply_state = _reply_state(sent, body) if owes else "owed" if owed in ANSWER_OWED else None
     record = {"journal": 2, **({"preclaim": True} if preclaim else {}),
               **({"disposition": owed, "reply_state": reply_state} if reply_state else {}),
               "sent": sent, "state": state, "delivery": "posted" if sent else "failed",
