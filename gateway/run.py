@@ -3615,6 +3615,7 @@ class GatewayRunner(
         expected_db_path: Any = None, expected_db_identity: Any = None,
         expected_run_generation: int | None = None,
         held_lease: Any = None, peer: Any = None, relay: Any = None, observation: Any = None,
+        earlier_calls: Any = None,
     ) -> Any:
         """Run one exact cached actor without creating, routing, or delivering anything.
 
@@ -3628,7 +3629,12 @@ class GatewayRunner(
         instruction a canonical CTO relayed, proven against its transcript) the same turn runs as the
         *owner's* instead, on the same session and actor: the model gets the relay's rendering, the row
         stores it with the relay's provenance (``display_kind`` ``owner_relay``), and the turn runs under
-        the owner's own tools and settings, not a peer grant. Its answer still goes only to the request."""
+        the owner's own tools and settings, not a peer grant. Its answer still goes only to the request.
+
+        The owner turn alone has the ``relay_resolve`` declaration (tools/relay_resolve_tool.py), bound to this
+        event. ``earlier_calls`` (the calls an earlier turn of this event made, as its receipt recorded them)
+        makes it a reply-only recovery turn: it may run nothing but that declaration, so recovering the reply
+        never repeats the work. Its declaration is judged from its own rows (``accepted_outcome``)."""
         from gateway.canonical_surface import (
             bound_actor_db,
             cached_actor,
@@ -3826,6 +3832,15 @@ class GatewayRunner(
                         session_key=entry.session_key,
                         parent_chat_id=str(getattr(origin, "parent_chat_id", "") or ""),
                         cron_session=current_cron_session())
+                    from tools.relay_resolve_tool import bind_scope, reset_reply_only, reset_scope, set_reply_only
+                    scope_token = bind_scope(event.event_id) if owner_turn else None
+                    reply_only_token = set_reply_only(True) if owner_turn and earlier_calls is not None else None
+                    surface = (getattr(agent, "tools", None), getattr(agent, "valid_tool_names", None))
+                    if owner_turn:
+                        # The declaration is in this turn's tool surface and in no other's.
+                        from tools.relay_resolve_tool import SCHEMA as RESOLVE_SCHEMA
+                        agent.tools = [*(surface[0] or []), {"type": "function", "function": RESOLVE_SCHEMA}]
+                        agent.valid_tool_names = {*(surface[1] or ()), RESOLVE_SCHEMA["name"]}
                     try:
                         if observation is not None:
                             observation.actor_started = True
@@ -3860,6 +3875,12 @@ class GatewayRunner(
                         reset_relayed_owner_effects(effects_token)
                         reset_relayed_owner_turn(relayed_token)
                         reset_turn_principal(principal_token)
+                        if owner_turn:
+                            agent.tools, agent.valid_tool_names = surface
+                        if reply_only_token is not None:
+                            reset_reply_only(reply_only_token)
+                        if scope_token is not None:
+                            reset_scope(scope_token)
 
                 result = await run_owned_turn(
                     self, agent, run_peer_turn,
@@ -3899,7 +3920,12 @@ class GatewayRunner(
                     # The owner turn's own opening row, and no peer or other relay row after it.
                     if not opening_row_is_this_relay(result.get("messages"), boundary, relay_meta, peer_prompt):
                         raise ValueError("canonical_turn_refused")
-                    return selected
+                    from dataclasses import replace as _replace
+                    from gateway.owner_relay import accepted_outcome, turn_calls
+                    return _replace(
+                        selected, calls=tuple(turn_calls(result.get("messages"), boundary)),
+                        outcome=accepted_outcome(result.get("messages"), boundary, event_id=event.event_id,
+                                                 earlier=earlier_calls or ()))
                 try:
                     facts = turn_provenance(
                         result.get("messages"), history_boundary=boundary, peer=peer, body=event.text,

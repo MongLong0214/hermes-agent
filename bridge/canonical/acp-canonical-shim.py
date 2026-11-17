@@ -758,9 +758,10 @@ ANSWER_OWED = frozenset({"owner_relay", "question", "ruling", "conflict"})
 
 class Answer(str):
     """The gateway's answer text, with the disposition it recorded for the event and whether the answer is
-    the silence marker (``disposition`` None: the event is owed nothing) and whether the CEO turn declared the
-    event resolved (gateway/owner_relay.py RESOLVED_MARKER). Only that declaration completes an owed reply:
-    nothing in an answer's wording does."""
+    the silence marker (``disposition`` None: the event is owed nothing) and whether the gateway accepted the
+    turn's declaration that the event is resolved (``relay_resolve``, tools/relay_resolve_tool.py, judged by
+    gateway/owner_relay.py ``accepted_outcome``). Only that completes an owed reply: nothing in an answer's
+    wording does."""
 
     disposition = None
     silent = False
@@ -769,7 +770,7 @@ class Answer(str):
     def __new__(cls, text, disposition=None, silent=False, resolved=False):
         self = super().__new__(cls, text)
         self.disposition = disposition if isinstance(disposition, str) and disposition in ANSWER_OWED else None
-        self.silent = silent is True and self.disposition is not None
+        self.silent = silent is True
         self.resolved = resolved is True and self.disposition is not None
         return self
 
@@ -1266,6 +1267,27 @@ def reopen_base_silence(event_id, channel, answer):
     return cleared
 
 
+def close_silently(event_id, channel):
+    """An event the gateway judged owed nothing ended with the silence marker: a real no-action report. It closes
+    with no reply and no post (the marker is never posted as text); the journal says so (``silent``), and
+    recovery reads it answered. True when this call journaled it."""
+    name = outcome_key(event_id, channel)
+    fd, why = _claim(name)
+    if fd is None:
+        log(f"prompt {name[:12]}… no-action report already journaled once; nothing to post" if why == "exists"
+            else f"prompt {name[:12]}… no-action report not journaled: {why}")
+        return False
+    record = {"journal": 2, "sent": False, "state": "silent", "delivery": "none", "silent": True,
+              "disposition": None, "kind": "answer", "event_id": event_id, "ref": None, "channel": channel,
+              "roster_generation": getattr(_local, "roster_generation", None), "reply_to": event_id,
+              "reason": "no-action report ended silent; nothing posted", "attempts": 0,
+              "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    with os.fdopen(fd, "w") as marker:
+        marker.write(json.dumps(record) + "\n")
+    log(f"prompt {name[:12]}… no-action report ended silent: closed, nothing posted")
+    return True
+
+
 def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_to=None, preclaim=False,
                   owed=None, resolved=False):
     """Post *answer* once as the thread reply to *event_id*. True only when the wrapper sent it.
@@ -1548,7 +1570,7 @@ def recovery_delivery_state(event_id):
     # (``disposition`` null), or owed and ``confirmed`` (the thread showed it and the CEO turn declared the event
     # resolved). An answer with no disposition at all is a base shim's: nothing says the event was not owed, so
     # it is ``unverified`` and recovery fetches the original and asks the gateway again.
-    if any(r.get("kind") == "answer" and r.get("sent") is True and "disposition" in r
+    if any(r.get("kind") == "answer" and (r.get("sent") is True or r.get("silent") is True) and "disposition" in r
            and (r["disposition"] is None or r.get("reply_state") == "confirmed") for r in records):
         return "answered"
     with _INFLIGHT_LOCK:
@@ -2163,6 +2185,8 @@ def deliver_event(session, parsed, text, mentioned):
         # cleared from ``.answer``, it takes that slot, where the event's one terminal answer lives.
         publish_reply(base, channel, UNANSWERED_NOTICE.format(disposition=owed, event=base), kind="notice",
                       preclaim=cleared != ".answer", owed=owed)
+    elif answered and getattr(answer, "silent", False):
+        close_silently(base, channel)  # an event owed nothing: a no-action report closes with no post at all
     elif answered and answer and answer.strip():
         publish_reply(base, channel, answer, owed=owed, resolved=getattr(answer, "resolved", False))
     elif notice is not None:

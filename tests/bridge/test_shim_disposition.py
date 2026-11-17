@@ -61,12 +61,17 @@ def test_an_owed_inbound_ending_silent_is_never_complete_and_is_told_to_the_thre
     assert not (shim.tmp / "published" / (EVENT_A + ".answer")).exists()
 
 
-def test_a_no_action_report_may_still_go_silent(shim):
-    _gateway_answers(shim, "[SILENT]", disposition=None, silent=False)
+def test_a_no_action_report_that_ends_silent_closes_with_no_reply_and_no_post(shim):
+    """CEO 2026-11-17: a real no-action report (not owed) may be answered with nothing at all. It closes: no
+    post (the marker is never posted as text), no owed state, and recovery reads it answered."""
+    _gateway_answers(shim, "[SILENT]", disposition=None, silent=True)
     ask(shim, EVENT_A)
-    done = final(shim, EVENT_A)
-    assert (done["kind"], done.get("disposition"), done.get("reply_state")) == ("answer", None, None)
-    assert not any("owed" in json.dumps(p) for p in posts(shim, EVENT_A))
+    done = record(shim, EVENT_A)
+    assert (done["kind"], done["disposition"], done["silent"], done.get("reply_state")) == ("answer", None, True, None)
+    assert posts(shim, EVENT_A) == [] and [c for c in calls(shim, EVENT_A) if c["cmd"] == "send"] == []
+    assert shim.recovery_delivery_state(EVENT_A) == "answered"
+    ask(shim, EVENT_A, rpc_id=2)  # redelivered: closed, and still nothing is posted
+    assert posts(shim, EVENT_A) == [] and record(shim, EVENT_A) == done
 
 
 def test_an_owed_answer_completes_once_the_thread_shows_this_reply(shim):
@@ -146,6 +151,9 @@ def test_the_disposition_is_read_only_from_the_gateways_answer_in_its_closed_voc
 
     owed = reply({"event_id": EVENT_A, "text": "[SILENT]", "disposition": "owner_relay", "silent": True})
     assert (owed, owed.disposition, owed.silent, owed.resolved) == ("[SILENT]", "owner_relay", True, False)
+    report = reply({"event_id": EVENT_A, "text": "[SILENT]", "silent": True})
+    assert (report.disposition, report.silent, report.resolved) == (None, True, False)  # not owed, and silent
+    assert reply({"event_id": EVENT_A, "text": "x", "silent": "true"}).silent is False
     done = reply({"event_id": EVENT_A, "text": "done", "disposition": "owner_relay", "resolved": True})
     assert (done.disposition, done.resolved) == ("owner_relay", True)
     # A declaration of resolution without an owed disposition, or not exactly true, declares nothing.
@@ -465,38 +473,61 @@ def test_a_same_body_recheck_that_finds_nothing_posts_nothing_and_stays_unconfir
 
 @pytest.mark.parametrize("answer", ["", "   \n"])
 def test_an_owed_event_with_no_answer_text_is_not_posted_and_stays_owed(shim, answer):
-    """Review r3 (P2): a marker-only answer (nothing left once the gateway strips the declaration) is no
-    answer: it posts nothing of its own, and the thread is told the event is still owed."""
+    """An owed answer with no text is no answer: it posts nothing of its own, and the thread is told the event
+    is still owed."""
     _gateway_answers(shim, answer, "owner_relay")
     ask(shim, EVENT_A)
     done = final(shim, EVENT_A)
     assert (done["kind"], done["reply_state"]) == ("notice", "owed")
     [post] = posts(shim, EVENT_A)
-    assert "RESOLVED" not in post["content"] and EVENT_A in post["content"]
+    assert EVENT_A in post["content"]
     assert shim.recovery_delivery_state(EVENT_A) == "owed"
 
 
-def _real_path(gw, gw_shim, monkeypatch, tmp_path, *answers):
-    """The shim wired to the real coordinator and a relayed owner instruction its CTO is entitled to relay;
-    turn n of the cached actor answers ``answers[n]`` (the last repeats). Returns what a test reads."""
+def _rows(text, kwargs, history, final_text, calls):
+    """The rows a turn adds: its own opening row (with the provenance the gateway stamped), the tool calls it
+    made (each answered with its result) and its answer."""
+    user = {"role": "user", "content": text}
+    for key, name in (("display_kind", "persist_user_display_kind"),
+                      ("display_metadata", "persist_user_display_metadata")):
+        if kwargs.get(name):
+            user[key] = kwargs[name]
+    rows = [user]
+    for name, args, out, call_id in calls:
+        rows.append({"role": "assistant", "content": None, "tool_calls": [
+            {"id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]})
+        rows.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": out})
+    return [*history, *rows, {"role": "assistant", "content": final_text}]
+
+
+def _resolve(outcome="done", evidence=None, call_id="resolve-1"):
+    args = {"event_id": GW_EVENT, "outcome": outcome,
+            "evidence": [{"tool_call_id": "call-1"}] if evidence is None else evidence}
+    return ("relay_resolve", args, json.dumps({"declared": True, "event_id": GW_EVENT, "outcome": outcome}), call_id)
+
+
+def _work(call_id="call-1"):
+    return ("run_cancel", {"run_id": "r1"}, '{"ok": true}', call_id)
+
+
+def _real_path(gw, gw_shim, monkeypatch, tmp_path, *turns, relay=True, kind=None):
+    """The shim wired to the real coordinator. Turn n of the cached actor makes the tool calls of
+    ``turns[n][1:]`` and ends with ``turns[n][0]`` (the last repeats). *relay*: the event is a relayed owner
+    instruction its CTO is entitled to relay; else it is the CTO's own post, tagged *kind* when given."""
     import time
 
     from tests.gateway.test_canonical_owner_relay import _entitle, _owner_record, _relay, _transcript
 
-    _entitle(actor=GW_CTO)
-    _transcript(_owner_record())
+    if relay:
+        _entitle(actor=GW_CTO)
+        _transcript(_owner_record())
 
     def run_conversation(text, *, conversation_history, task_id, **kwargs):
         gw.runs.append(text)
-        final_text = answers[min(len(gw.runs), len(answers)) - 1]
-        user = {"role": "user", "content": text}
-        for key, name in (("display_kind", "persist_user_display_kind"),
-                          ("display_metadata", "persist_user_display_metadata")):
-            if kwargs.get(name):
-                user[key] = kwargs[name]
+        final_text, *calls = turns[min(len(gw.runs), len(turns)) - 1]
         gw.actor._persist_user_message_idx = len(conversation_history)
         return {"completed": True, "session_id": task_id, "final_response": final_text,
-                "messages": [*conversation_history, user, {"role": "assistant", "content": final_text}]}
+                "messages": _rows(text, kwargs, conversation_history, final_text, calls)}
 
     monkeypatch.setattr(gw.actor, "run_conversation", run_conversation)
     # A Buzz CLI that keeps its own thread, so the read-back sees exactly what landed.
@@ -520,22 +551,27 @@ def _real_path(gw, gw_shim, monkeypatch, tmp_path, *answers):
             time.sleep(0.02)
         return journal()
 
-    return SimpleNamespace(prompt=thread_prompt([gw_entry(1, 20)], _relay()), thread=thread, settled=settled)
+    prompt = thread_prompt([gw_entry(1, 20)], _relay() if relay else "@ceo 확인 부탁드립니다")
+    if kind is not None:
+        head, _, tags = prompt.rpartition("\nTags: ")
+        prompt = head + "\nTags: " + json.dumps(json.loads(tags) + [["acp-kind", kind]], separators=(",", ":"))
+    return SimpleNamespace(prompt=prompt, thread=thread, settled=settled, journal=journal)
 
 
-def test_an_acknowledged_owner_relay_runs_a_new_owner_turn_on_redelivery_and_its_declared_answer_confirms(
+def test_an_acknowledged_owner_relay_gets_a_reply_only_recovery_turn_and_its_declared_answer_confirms(
         gw, gw_shim, monkeypatch, tmp_path):
-    """Review r3 (P1), on the real path: the real coordinator, its HTTP handler and SQLite, and the shim.
-    The first turn only acknowledges; the event's redelivery runs a new owner turn on the same session; that
-    turn's declared answer is posted, read back and confirmed. No stub stands in for the gateway's replay."""
-    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, "ACK", "[RESOLVED]\n중지했고 결과를 보고합니다.")
+    """The real coordinator, its HTTP handler and SQLite, and the shim. The first turn does the work and only
+    acknowledges. The event's redelivery runs a reply-only turn (the work is not run again), whose declared
+    answer is posted, read back and confirmed."""
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("ACK", _work()),
+                      ("중지했고 결과를 보고합니다.", _resolve("done", [{"tool_call_id": "call-1"}])))
     gw_drive(gw_shim, real.prompt)
     assert len(gw.runs) == 1 and real.thread() == ["@cto-repo-factory ACK"]
     assert real.settled()["reply_state"] == "acknowledged"
     assert gw_shim.recovery_delivery_state(GW_EVENT) == "owed"
 
     gw_drive(gw_shim, real.prompt, rpc_id=2)  # buzz-acp redelivers the event
-    assert len(gw.runs) == 2  # the gateway ran a new owner turn instead of replaying the ACK
+    assert len(gw.runs) == 2  # the gateway ran a recovery turn instead of replaying the ACK
     assert real.thread() == ["@cto-repo-factory ACK", "@cto-repo-factory 중지했고 결과를 보고합니다."]
     done = real.settled()
     assert (done["reply_state"], done["resolved"], done["sent"], done["disposition"]) == (
@@ -544,22 +580,92 @@ def test_an_acknowledged_owner_relay_runs_a_new_owner_turn_on_redelivery_and_its
 
     gw_drive(gw_shim, real.prompt, rpc_id=3)  # resolved: a terminal, replayed, and nothing is posted again
     assert len(gw.runs) == 2 and len(real.thread()) == 2
-    assert "RESOLVED" not in " ".join(real.thread())
 
 
-def test_a_marker_only_owner_answer_posts_nothing_on_the_real_path_and_the_owed_event_runs_again(
+def test_a_bare_resolve_on_an_acknowledged_request_stays_owed_on_the_real_path(gw, gw_shim, monkeypatch, tmp_path):
+    """CEO counterexample (1): an explicit request answered "ACK" with a bare resolve (empty evidence, then
+    evidence of nothing the event's turns did) is posted and read back, and is still owed."""
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("ACK", _resolve("done", [])),
+                      ("ACK", _resolve("done", [{"tool_call_id": "call-from-another-event"}])))
+    gw_drive(gw_shim, real.prompt)
+    assert real.settled()["reply_state"] == "acknowledged"
+    gw_drive(gw_shim, real.prompt, rpc_id=2)
+    assert real.thread() == ["@cto-repo-factory ACK"]  # the same text is not posted twice
+    assert real.settled()["reply_state"] == "acknowledged"
+    assert gw_shim.recovery_delivery_state(GW_EVENT) == "owed"
+
+
+def test_a_no_action_report_closes_with_no_reply_and_no_channel_post_on_the_real_path(
         gw, gw_shim, monkeypatch, tmp_path):
-    """Review r3 (P2): ``[RESOLVED]`` alone posted as ``@cto… [RESOLVED]``, and a resolved empty reply was
-    possible. It is no answer: nothing of it is posted, the thread is told the event is owed, and the
-    redelivery's new turn answers."""
-    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, "[RESOLVED]\n[RESOLVED]", "[RESOLVED]\n[RESOLVED]\n끝냈습니다.")
+    """CEO counterexample (2): a CTO report that asks nothing (``acp-kind: report``) answered with nothing
+    posts nothing, and is closed."""
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("[SILENT]",), relay=False, kind="report")
+    gw_drive(gw_shim, real.prompt)
+    assert len(gw.runs) == 1 and real.thread() == []
+    done = real.journal()
+    assert (done["kind"], done["disposition"], done["silent"]) == ("answer", None, True)
+    assert gw_shim.recovery_delivery_state(GW_EVENT) == "answered"
+    gw_drive(gw_shim, real.prompt, rpc_id=2)
+    assert len(gw.runs) == 1 and real.thread() == []
+
+
+@pytest.mark.parametrize("kind", ["question", "ruling_request", "conflict"])
+def test_a_declared_question_ruling_or_conflict_runs_judgement_reply_readback_and_close(
+        gw, gw_shim, monkeypatch, tmp_path, kind):
+    """CEO C: the CTO declares the kind; the CEO's correlated reply is read back from the thread and closes it."""
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("머지하세요. 근거는 아래와 같습니다.",), relay=False, kind=kind)
+    gw_drive(gw_shim, real.prompt)
+    assert len(gw.runs) == 1 and real.thread() == ["@cto-repo-factory 머지하세요. 근거는 아래와 같습니다."]
+    done = real.settled()
+    disposition = {"question": "question", "ruling_request": "ruling", "conflict": "conflict"}[kind]
+    assert (done["disposition"], done["reply_state"], done["resolved"], done["sent"]) == (
+        disposition, "confirmed", True, True)
+    assert gw_shim.recovery_delivery_state(GW_EVENT) == "answered"
+    gw_drive(gw_shim, real.prompt, rpc_id=2)
+    assert len(gw.runs) == 1 and len(real.thread()) == 1
+
+
+def test_a_declared_question_the_ceo_answers_with_silence_stays_owed_and_visible(gw, gw_shim, monkeypatch, tmp_path):
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("[SILENT]",), relay=False, kind="question")
     gw_drive(gw_shim, real.prompt)
     [notice] = real.thread()
-    assert "RESOLVED" not in notice and GW_EVENT in notice
-    done = real.settled()
-    assert (done["kind"], done["reply_state"], done["disposition"]) == ("notice", "owed", "owner_relay")
-    gw_drive(gw_shim, real.prompt, rpc_id=2)  # redelivered: a new turn, and its answer is the reply
-    assert len(gw.runs) == 2
-    assert real.thread()[1:] == ["@cto-repo-factory 끝냈습니다."]
-    assert "RESOLVED" not in " ".join(real.thread())
-    assert gw_shim.recovery_delivery_state(GW_EVENT) == "answered"
+    assert "SILENT" not in notice and GW_EVENT in notice
+    assert real.settled()["reply_state"] == "owed"
+    assert gw_shim.recovery_delivery_state(GW_EVENT) == "owed"
+
+
+def test_an_unbound_actors_forged_kind_is_not_even_forwarded_to_a_turn(gw, gw_shim, monkeypatch, tmp_path):
+    """The bridge refuses an author the binding does not admit; the forged tag never reaches a judgement."""
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("x",), relay=False, kind="ruling_request")
+    forged = real.prompt.replace(f"hex: {GW_CTO})", "hex: " + "9" * 64 + ")")
+    gw_drive(gw_shim, forged)
+    assert gw.runs == [] and all("x" != post for post in real.thread())
+
+
+def test_a_reopened_legacy_silence_posts_the_owed_notice_and_never_re_executes(gw, gw_shim, monkeypatch, tmp_path):
+    """CEO A: the same rule for a base shim's ``[SILENT]`` journal. The gateway's receipt is the base's too (no
+    record of what its turn did), so nothing can be told about its work: no turn runs, the journal is reopened,
+    and the one owed notice is all that is posted."""
+    import contextlib
+    import sqlite3
+
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("[SILENT]", _work()))
+    gw_drive(gw_shim, real.prompt)
+    assert len(gw.runs) == 1 and len(real.thread()) == 1  # the first, owed notice
+    with contextlib.closing(sqlite3.connect(gw.home / "state.db", timeout=10)) as conn:  # the base's receipt
+        [(row, value)] = conn.execute("SELECT key, value FROM state_meta WHERE key LIKE 'canonical-receipt:%'")
+        record = json.loads(value)
+        del record["response"]["calls"]
+        conn.execute("UPDATE state_meta SET value = ? WHERE key = ?",
+                     (json.dumps(record, ensure_ascii=False, separators=(",", ":"), sort_keys=True), row))
+        conn.commit()
+    _journal(gw_shim, GW_EVENT, channel=GW_CHANNEL, body_sha256=hashlib.sha256(
+        b"@cto-repo-factory [SILENT]").hexdigest())  # the base's journal: the silence as the answer
+    assert gw_shim.recovery_delivery_state(GW_EVENT) == "unverified"
+
+    gw_drive(gw_shim, real.prompt, rpc_id=2)
+    assert len(gw.runs) == 1  # reopening posts a notice, it never re-executes
+    done = real.journal()
+    assert (done["kind"], done["disposition"], done["reply_state"]) == ("notice", "owner_relay", "owed")
+    assert len(real.thread()) == 2 and all("SILENT" not in post for post in real.thread())
+    assert gw_shim.recovery_delivery_state(GW_EVENT) == "owed"
