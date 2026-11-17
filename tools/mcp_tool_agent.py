@@ -183,8 +183,13 @@ def persist_agent_tool_names(agent) -> None:
     session_id = getattr(agent, "session_id", None)
     if not db or not session_id:
         return
+    from tools.relay_resolve_tool import TURN_SCOPED_TOOLS
+
     try:
-        db.update_session_tool_names(session_id, {"version": tool_pin_version(), "tools": _agent_tool_defs(agent)})
+        # A tool the gateway adds to one turn alone (``relay_resolve``) is never part of the pin: it would be
+        # carried into turns that were not given it.
+        db.update_session_tool_names(session_id, {"version": tool_pin_version(), "tools": [
+            d for d in _agent_tool_defs(agent) if _def_name(d) not in TURN_SCOPED_TOOLS]})
     except Exception:  # noqa: BLE001
         logger.debug("tool_names persist skipped", exc_info=True)
 
@@ -240,6 +245,8 @@ def restore_agent_tool_prefix(agent, saved) -> bool:
     pinned_defs = [d for d in map(_pinned_def, pinned) if d]
     carried = {_def_name(d) for d in pinned_defs if _def_name(d) not in fresh and _def_name(d) in registered_names}
     carried &= _config_permitted_names(agent) if carried else set()
+    from tools.relay_resolve_tool import TURN_SCOPED_TOOLS
+    carried -= TURN_SCOPED_TOOLS  # a turn's own tool, whatever an older pin holds
     merged = [d for d in pinned_defs if _def_name(d) in fresh or _def_name(d) in carried]
     pinned_names = {_def_name(d) for d in merged}
     merged.extend(t for t in fresh_defs if _def_name(t) not in pinned_names)

@@ -612,8 +612,11 @@ def test_a_no_action_report_closes_with_no_reply_and_no_channel_post_on_the_real
 @pytest.mark.parametrize("kind", ["question", "ruling_request", "conflict"])
 def test_a_declared_question_ruling_or_conflict_runs_judgement_reply_readback_and_close(
         gw, gw_shim, monkeypatch, tmp_path, kind):
-    """CEO C: the CTO declares the kind; the CEO's correlated reply is read back from the thread and closes it."""
-    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("머지하세요. 근거는 아래와 같습니다.",), relay=False, kind=kind)
+    """CEO C, closed as B: the CTO declares the kind; the CEO's reply is read back from the thread, and the
+    peer turn's structured declaration (an explicit answer as evidence) closes it."""
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path,
+                      ("머지하세요. 근거는 아래와 같습니다.", _resolve("answered", [{"answer": "머지하세요: CI green"}])),
+                      relay=False, kind=kind)
     gw_drive(gw_shim, real.prompt)
     assert len(gw.runs) == 1 and real.thread() == ["@cto-repo-factory 머지하세요. 근거는 아래와 같습니다."]
     done = real.settled()
@@ -623,6 +626,18 @@ def test_a_declared_question_ruling_or_conflict_runs_judgement_reply_readback_an
     assert gw_shim.recovery_delivery_state(GW_EVENT) == "answered"
     gw_drive(gw_shim, real.prompt, rpc_id=2)
     assert len(gw.runs) == 1 and len(real.thread()) == 1
+
+
+@pytest.mark.parametrize("kind", ["question", "ruling_request", "conflict"])
+def test_an_ack_to_a_declared_kind_is_posted_read_back_and_still_owed(gw, gw_shim, monkeypatch, tmp_path, kind):
+    """CEO: an ACK to a question is not a close. It is the CEO's own reply, posted and read back, and the event
+    stays owed (acknowledged) and visible."""
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("ACK",), relay=False, kind=kind)
+    gw_drive(gw_shim, real.prompt)
+    assert real.thread() == ["@cto-repo-factory ACK"]
+    done = real.settled()
+    assert (done["reply_state"], done["sent"], done.get("resolved")) == ("acknowledged", True, None)
+    assert gw_shim.recovery_delivery_state(GW_EVENT) == "owed"
 
 
 def test_a_declared_question_the_ceo_answers_with_silence_stays_owed_and_visible(gw, gw_shim, monkeypatch, tmp_path):

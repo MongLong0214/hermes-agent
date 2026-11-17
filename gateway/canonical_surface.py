@@ -1461,7 +1461,7 @@ class CanonicalReceiptCoordinator:
                         expected_db_path=proof.db_path, expected_db_identity=proof.db_identity,
                         expected_run_generation=run_generation,
                         held_lease=lease, peer=peer, relay=relay, observation=observation,
-                        earlier_calls=earlier,
+                        earlier_calls=earlier, owed_kind=peer_kind,
                     )
                 except asyncio.CancelledError:
                     # Cancelled past the claim (the turn runner first joins the interrupted actor): the
@@ -1521,13 +1521,16 @@ class CanonicalReceiptCoordinator:
                             resolved=result.outcome is not None,
                             calls=tuple(calls) if len(calls) <= _MAX_RECORDED_CALLS else None)
                     elif peer_kind is not None and answer.terminal_text is not None:
-                        # A bound CTO declared this post a question, ruling request or conflict: the CEO's
-                        # explicit answer is what closes it, never silence.
+                        # A bound CTO declared this post a question, ruling request or conflict: it closes
+                        # only with the peer turn's structured declaration (an explicit answer, decision or
+                        # resolution as evidence, accepted for this event), never with an acknowledgement or
+                        # silence.
                         from gateway.response_filters import is_intentional_silence_response
                         answered = bool(answer.terminal_text.strip()) and not is_intentional_silence_response(
                             answer.terminal_text)
-                        answer = replace(answer, disposition=peer_kind, resolved=answered,
-                                         outcome="answered" if answered else None)
+                        declared = getattr(result, "outcome", None) if answered else None
+                        answer = replace(answer, disposition=peer_kind, resolved=declared is not None,
+                                         outcome=declared)
                     whole = result.terminal_text if isinstance(result, CanonicalTurnResult) else None
                 answer = record_or_keep(answer, whole)
             # The terminal (or the kept answer) is durable and a replay answers it, so this answer is

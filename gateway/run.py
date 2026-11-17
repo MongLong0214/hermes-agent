@@ -3615,7 +3615,7 @@ class GatewayRunner(
         expected_db_path: Any = None, expected_db_identity: Any = None,
         expected_run_generation: int | None = None,
         held_lease: Any = None, peer: Any = None, relay: Any = None, observation: Any = None,
-        earlier_calls: Any = None,
+        earlier_calls: Any = None, owed_kind: Any = None,
     ) -> Any:
         """Run one exact cached actor without creating, routing, or delivering anything.
 
@@ -3634,7 +3634,10 @@ class GatewayRunner(
         The owner turn alone has the ``relay_resolve`` declaration (tools/relay_resolve_tool.py), bound to this
         event. ``earlier_calls`` (the calls an earlier turn of this event made, as its receipt recorded them)
         makes it a reply-only recovery turn: it may run nothing but that declaration, so recovering the reply
-        never repeats the work. Its declaration is judged from its own rows (``accepted_outcome``)."""
+        never repeats the work. Its declaration is judged from its own rows (``accepted_outcome``).
+        ``owed_kind`` (the disposition of a post the bound canonical CTO declared a question, ruling request or
+        conflict) gives a peer turn the same declaration, for this event alone: its grant names the event, its
+        tool surface carries the tool, and it is told it owes the declaration."""
         from gateway.canonical_surface import (
             bound_actor_db,
             cached_actor,
@@ -3815,7 +3818,8 @@ class GatewayRunner(
                     # Its sends land in the caller's observation: a failed turn records that scope.
                     grant_token = None if owner_turn else bind_grant(PeerToolGrant(
                         binding.name, agent, require_peer_fence,
-                        attempted=observation.attempted if observation is not None else []))
+                        attempted=observation.attempted if observation is not None else [],
+                        resolve_event=event.event_id if owed_kind is not None else None))
                     prior_principal = getattr(agent, "_turn_principal", None)
                     prior_skip_review = getattr(agent, "skip_background_review", False)
                     agent._turn_principal = None if owner_turn else "peer"
@@ -3833,10 +3837,17 @@ class GatewayRunner(
                         parent_chat_id=str(getattr(origin, "parent_chat_id", "") or ""),
                         cron_session=current_cron_session())
                     from tools.relay_resolve_tool import bind_scope, reset_reply_only, reset_scope, set_reply_only
-                    scope_token = bind_scope(event.event_id) if owner_turn else None
+                    declares = owner_turn or owed_kind is not None
+                    prior_notes = getattr(agent, "_gateway_turn_context_notes", "")
+                    if owed_kind is not None:
+                        # Told beside the quoted post, on the one-shot must-deliver channel: the stored row and
+                        # its provenance stay exactly the CTO's post.
+                        from gateway.owner_relay import peer_declaration_note
+                        agent._gateway_turn_context_notes = peer_declaration_note(owed_kind, event.event_id)
+                    scope_token = bind_scope(event.event_id) if declares else None
                     reply_only_token = set_reply_only(True) if owner_turn and earlier_calls is not None else None
                     surface = (getattr(agent, "tools", None), getattr(agent, "valid_tool_names", None))
-                    if owner_turn:
+                    if declares:
                         # The declaration is in this turn's tool surface and in no other's.
                         from tools.relay_resolve_tool import SCHEMA as RESOLVE_SCHEMA
                         agent.tools = [*(surface[0] or []), {"type": "function", "function": RESOLVE_SCHEMA}]
@@ -3875,7 +3886,9 @@ class GatewayRunner(
                         reset_relayed_owner_effects(effects_token)
                         reset_relayed_owner_turn(relayed_token)
                         reset_turn_principal(principal_token)
-                        if owner_turn:
+                        if owed_kind is not None:
+                            agent._gateway_turn_context_notes = prior_notes
+                        if declares:
                             agent.tools, agent.valid_tool_names = surface
                         if reply_only_token is not None:
                             reset_reply_only(reply_only_token)
@@ -3934,6 +3947,13 @@ class GatewayRunner(
                     facts = None
                 if facts is None or not facts.binds:
                     raise ValueError("canonical_turn_refused")
+                if owed_kind is not None:
+                    from dataclasses import replace as _replace
+                    from gateway.owner_relay import accepted_outcome
+                    from tools.relay_resolve_tool import PEER_OUTCOMES
+                    return _replace(selected, outcome=accepted_outcome(
+                        result.get("messages"), boundary, event_id=event.event_id, allowed=PEER_OUTCOMES,
+                        need_answer=True))
                 return selected
             finally:
                 for name, value in outward_callbacks.items():

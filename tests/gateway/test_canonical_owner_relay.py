@@ -330,6 +330,59 @@ def test_a_redelivery_runs_a_reply_only_recovery_turn_that_cites_the_earlier_tur
     assert receipt["response"]["outcome"] == "done"
 
 
+def test_relay_resolve_survives_the_real_turn_starts_tools_freeze_and_is_not_carried_into_other_turns(
+        ingress, send, monkeypatch):
+    """CEO: prove the declaration survives ``restore_agent_tool_prefix``, the tools-freeze merge every turn
+    starts with. The gateway adds it to the cached agent's tool surface for the owner turn; the turn's real
+    start (``conversation_loop._restore_or_build_system_prompt``, on the session's real pinned array in the
+    real state.db) must keep it for that turn, and the pin it leaves behind must not hand it to a turn that
+    did not get it."""
+    from unittest.mock import MagicMock, patch
+
+    from agent.conversation_loop import _restore_or_build_system_prompt
+    from tests.agent.test_system_prompt_restore import _make_agent
+    from tools.mcp_tool_agent import tool_pin_version
+
+    def tool(name):
+        return {"type": "function", "function": {"name": name, "description": f"{name} v1", "parameters": {}}}
+
+    db, session = ingress.runner.session_store._db, ingress.entry.session_id
+    base = [tool("read_file"), tool("terminal")]
+    db.update_system_prompt(session, "BUILT_PROMPT")
+    db.update_session_tool_names(session, {"version": tool_pin_version(), "tools": base})
+    ingress.actor.tools, ingress.actor.valid_tool_names = list(base), {"read_file", "terminal"}
+    started = []
+    ordinary = ingress.actor.run_conversation
+
+    def real_turn_start(text, **kwargs):
+        agent = _make_agent(session_db=db)  # the real function, on the surface the gateway built for this turn
+        agent.session_id, agent.side_agent, agent._bot_mode_protocol = session, False, False
+        agent._persist_disabled = False
+        agent.tools, agent.valid_tool_names = ingress.actor.tools, ingress.actor.valid_tool_names
+        with patch("agent.conversation_loop._stored_prompt_matches_runtime", return_value=True):
+            _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+        ingress.actor.tools, ingress.actor.valid_tool_names = agent.tools, agent.valid_tool_names
+        started.append(([t["function"]["name"] for t in agent.tools], sorted(agent.valid_tool_names)))
+        return ordinary(text, **kwargs)
+
+    monkeypatch.setattr(ingress.actor, "run_conversation", real_turn_start)
+    second = "cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    _entitle()
+    _transcript(_owner_record(), _owner_record("CEO: publish the second project", uuid=second))
+
+    async def exercise():
+        assert (await send(text=_relay()))[0] == 200  # an owner-relay turn: it has the declaration
+        assert (await send(text="보고: 끝났습니다.", event_id="event-2"))[0] == 200  # an ordinary peer turn
+        assert (await send(text=_relay("CEO: publish the second project", record=second),
+                           event_id="event-3"))[0] == 200  # an owner-relay turn again
+
+    asyncio.run(exercise())
+    with_it = (["read_file", "terminal", "relay_resolve"], ["read_file", "relay_resolve", "terminal"])
+    without = (["read_file", "terminal"], ["read_file", "terminal"])
+    assert started == [with_it, without, with_it]
+    assert [t["function"]["name"] for t in ingress.actor.tools] == ["read_file", "terminal"]  # nothing left behind
+
+
 def test_a_failed_call_of_the_earlier_turn_is_recorded_told_and_never_citable(ingress, send, monkeypatch):
     """A call that failed may have done part of its work: the receipt lists it, the recovery turn is told it
     failed, and a declaration cannot cite it."""

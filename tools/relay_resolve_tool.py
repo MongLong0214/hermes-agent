@@ -25,6 +25,11 @@ from tools.registry import registry, tool_error, tool_result
 
 TOOL_NAME = "relay_resolve"
 OUTCOMES = ("done", "answered", "declined", "deferred_with_reason")
+# What the peer turn of a post a bound CTO declared a question, ruling request or conflict may declare: no work to
+# report, so never ``done``; the explicit answer, decision or resolution is the evidence.
+PEER_OUTCOMES = ("answered", "declined", "deferred_with_reason")
+# Tools the gateway adds to one turn's surface and no other's: a session's tools freeze never carries or pins them.
+TURN_SCOPED_TOOLS = frozenset({TOOL_NAME})
 _MAX_EVIDENCE = 64
 
 # The event id of the relayed owner turn running in this context; None for every other turn.

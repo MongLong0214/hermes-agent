@@ -96,3 +96,66 @@ def test_a_reply_only_turn_runs_no_tool_but_the_declaration():
     finally:
         reset_reply_only(token)
     assert not is_reply_only_turn()
+
+
+# ---- the peer turn of a post a bound CTO declared owed -------------------------------------------------
+
+def _peer(resolve_event):
+    """A bound canonical peer turn: its agent, and the grant its verified ingress issued (``resolve_event``: the
+    event of an owed acp-kind the bound CTO declared, the only event the declaration may name; else None)."""
+    from agent.canonical_peer_tools import PeerToolGrant, bind_grant
+
+    agent = SimpleNamespace(_turn_principal="peer")
+    grant = PeerToolGrant("acp-canonical-ceo", agent, lambda: None, resolve_event=resolve_event)
+    return agent, grant, bind_grant(grant)
+
+
+def _resolve_call(event_id, call_id="call-r"):
+    args = {"event_id": event_id, "outcome": "answered", "evidence": [{"answer": "머지하세요"}]}
+    return SimpleNamespace(function=SimpleNamespace(name=TOOL_NAME, arguments=json.dumps(args)), id=call_id), args
+
+
+def test_a_peer_turn_may_declare_only_the_event_of_the_owed_kind_its_grant_names():
+    """Review: ACK-closing questions is rejected. The peer policy lets ``relay_resolve`` through for a peer turn
+    whose grant names an event (the bound CTO declared it owed) and for that event alone; with no event on the
+    grant (an untagged post, a report) or for any other event, or beside any other tool, the batch is refused."""
+    from agent.canonical_peer_tools import reset_grant
+    from agent.tool_executor import peer_batch_refused
+
+    for resolve_event, event_id, refused in (("event-1", "event-1", False), ("event-1", "event-2", True),
+                                             (None, "event-1", True)):
+        agent, grant, token = _peer(resolve_event)
+        try:
+            call, _ = _resolve_call(event_id)
+            assert peer_batch_refused(agent, [call]) is refused, (resolve_event, event_id)
+        finally:
+            reset_grant(token)
+    agent, grant, token = _peer("event-1")
+    try:
+        call, _ = _resolve_call("event-1")
+        assert peer_batch_refused(agent, [call, _tool_call("terminal")]) is True  # beside any other tool
+        assert peer_batch_refused(agent, [_tool_call("terminal")]) is True  # no other tool is opened by it
+    finally:
+        reset_grant(token)
+
+
+def test_the_peer_turns_declaration_runs_only_as_checked_and_only_in_its_scope():
+    from agent.canonical_peer_tools import dispatch_handler, reset_grant
+    from agent.tool_executor import peer_batch_refused
+
+    agent, grant, token = _peer("event-1")
+    try:
+        call, args = _resolve_call("event-1")
+        assert peer_batch_refused(agent, [call]) is False
+        handler = dispatch_handler(TOOL_NAME, args, "")
+        assert callable(handler)
+        scope = bind_scope("event-1")
+        try:
+            assert json.loads(handler(args))["declared"] is True
+            assert "error" in json.loads(handler({**args, "evidence": [{"answer": "changed after the check"}]}))
+        finally:
+            reset_scope(scope)
+        assert "error" in json.loads(handler(args))  # no relayed owner or owed-kind scope bound: nothing declared
+    finally:
+        reset_grant(token)
+    assert "error" in json.loads(handler(args))  # outside the turn's grant

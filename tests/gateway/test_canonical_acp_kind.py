@@ -13,6 +13,7 @@ import json
 
 import pytest
 
+from tests.gateway.test_canonical_owner_relay import _resolve, _scripted, _work  # noqa: F401 - the same turns
 from tests.gateway.test_canonical_surface_ingress import _TERMINAL, ingress, send  # noqa: F401 - fixtures
 
 
@@ -40,14 +41,28 @@ def _answers(ingress, monkeypatch, final):
     monkeypatch.setattr(ingress.actor, "run_conversation", answered)
 
 
-@pytest.mark.parametrize("kind, disposition", [
-    ("question", "question"), ("ruling_request", "ruling"), ("conflict", "conflict")])
-def test_a_bound_ctos_declared_kind_makes_the_post_owed_and_its_answer_closes_it(ingress, send, kind, disposition):
-    text = _event("@ceo 이 PR 을 머지해도 됩니까?", [*_BASE, ["acp-kind", kind]])
+_KINDS = [("question", "question"), ("ruling_request", "ruling"), ("conflict", "conflict")]
+_ANSWER = "머지하세요. 근거는 아래와 같습니다."
+
+
+def _tagged(kind, **changes):
+    return _event("@ceo 이 PR 을 머지해도 됩니까?", [*_BASE, ["acp-kind", kind]], **changes)
+
+
+@pytest.mark.parametrize("kind, disposition", _KINDS)
+def test_a_bound_ctos_declared_kind_is_closed_only_by_the_peer_turns_structured_declaration(
+        ingress, send, monkeypatch, kind, disposition):
+    """The CEO's answer alone does not close a declared question, ruling request or conflict: the peer turn
+    declares it with ``relay_resolve`` (an answer, decline or deferral, with the explicit answer, decision or
+    resolution as evidence), accepted only for this event."""
+    _scripted(ingress, monkeypatch, (_ANSWER, _resolve("answered", [{"answer": "머지하세요: 근거는 CI green"}])))
+    text = _tagged(kind)
+    notes = []
+    ingress.actor.during_turn = lambda: notes.append(getattr(ingress.actor, "_gateway_turn_context_notes", ""))
 
     async def exercise():
-        expected = (200, {"event_id": "event", "text": _TERMINAL, "disposition": disposition, "silent": False,
-                          "resolved": True})  # the CEO's explicit answer is what closes a question
+        expected = (200, {"event_id": "event", "text": _ANSWER, "disposition": disposition, "silent": False,
+                          "resolved": True})
         assert await send(text=text) == expected
         assert await send(text=text) == expected  # a replay reports it too, and runs nothing
         assert len(ingress.actor.calls) == 1
@@ -56,19 +71,97 @@ def test_a_bound_ctos_declared_kind_makes_the_post_owed_and_its_answer_closes_it
     [kwargs] = ingress.actor.turn_kwargs
     assert kwargs["persist_user_display_kind"] == "canonical_peer"  # still a peer turn: no owner authority
     [receipt] = ingress.receipts()
-    assert receipt["response"]["disposition"] == disposition
+    assert (receipt["response"]["disposition"], receipt["response"]["outcome"]) == (disposition, "answered")
+    [note] = notes  # told beside the quoted post, on the one-shot channel: the stored row is the post alone
+    assert "relay_resolve" in note and "acknowledgement" in note and '"event"' in note
+    assert getattr(ingress.actor, "_gateway_turn_context_notes", "") == ""
+    assert "relay_resolve" not in ingress.actor.model_inputs[0]
+
+
+@pytest.mark.parametrize("kind, disposition", _KINDS)
+@pytest.mark.parametrize("final", ["ACK", "👍", _ANSWER])
+def test_an_acknowledgement_or_an_answer_without_the_declaration_stays_owed(
+        ingress, send, monkeypatch, kind, disposition, final):
+    """CEO: an ACK to a question is not a close, and neither is any answer that does not declare it."""
+    _scripted(ingress, monkeypatch, (final,))
+
+    async def exercise():
+        assert await send(text=_tagged(kind)) == (
+            200, {"event_id": "event", "text": final, "disposition": disposition, "silent": False})
+
+    asyncio.run(exercise())
+    [receipt] = ingress.receipts()
+    assert "resolved" not in receipt["response"]
+
+
+@pytest.mark.parametrize("case, turn", [
+    ("bare_resolve", ("ACK", _resolve("answered", []))),
+    ("evidence_is_prose", ("ACK", _resolve("answered", "머지하세요"))),
+    ("blank_answer", ("ACK", _resolve("answered", [{"answer": "  "}]))),
+    ("only_a_tool_result_no_answer", ("ACK", _work(), _resolve("answered", [{"tool_call_id": "call-1"}]))),
+    ("unrelated_tool_result_and_no_answer", ("ACK", _resolve("answered", [{"tool_call_id": "call-9"}]))),
+    ("done_is_not_an_outcome_of_a_question", ("ACK", _work(), _resolve("done", [
+        {"tool_call_id": "call-1"}, {"answer": "머지했습니다"}]))),
+    ("unknown_outcome", ("ACK", _resolve("finished", [{"answer": "머지하세요"}]))),
+    ("another_event", ("ACK", _resolve("answered", [{"answer": "머지하세요"}], event_id="another-event"))),
+    ("the_declaration_was_refused", ("ACK", _resolve("answered", [{"answer": "머지하세요"}], ok=False))),
+])
+def test_a_declaration_that_cites_no_explicit_answer_or_names_another_event_leaves_it_owed(
+        ingress, send, monkeypatch, case, turn):
+    _scripted(ingress, monkeypatch, turn)
+
+    async def exercise():
+        assert await send(text=_tagged("question")) == (
+            200, {"event_id": "event", "text": "ACK", "disposition": "question", "silent": False})
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("kind", ["question", "ruling_request", "conflict"])
 def test_a_declared_kind_answered_with_silence_is_owed_never_resolved(ingress, send, monkeypatch, kind):
-    _answers(ingress, monkeypatch, "[SILENT]")
     disposition = {"question": "question", "ruling_request": "ruling", "conflict": "conflict"}[kind]
+    _scripted(ingress, monkeypatch, ("[SILENT]", _resolve("answered", [{"answer": "머지하세요"}])))
 
     async def exercise():
-        assert await send(text=_event("@ceo ruling?", [*_BASE, ["acp-kind", kind]])) == (
+        assert await send(text=_tagged(kind)) == (
             200, {"event_id": "event", "text": "[SILENT]", "disposition": disposition, "silent": True})
 
     asyncio.run(exercise())
+
+
+def test_relay_resolve_is_offered_only_to_the_peer_turn_of_an_owed_kind_for_that_event(ingress, send):
+    """The declaration is in the tool surface, and in the grant, of the peer turn of a post the bound CTO
+    declared a question, ruling request or conflict, for that event: not of an untagged post, a report, an
+    unknown kind, or any turn after it."""
+    from agent.canonical_peer_tools import _grant
+    from tools.relay_resolve_tool import current_scope
+
+    base = [{"type": "function", "function": {"name": "read_file"}}]
+    ingress.actor.tools, ingress.actor.valid_tool_names = list(base), {"read_file"}
+    seen = []
+
+    def during():
+        grant = _grant.get()
+        seen.append((sorted(ingress.actor.valid_tool_names),
+                     sorted(t["function"]["name"] for t in ingress.actor.tools),
+                     grant.resolve_event, current_scope()))
+
+    ingress.actor.during_turn = during
+    cases = [("event-1", [*_BASE, ["acp-kind", "question"]]), ("event-2", [*_BASE, ["acp-kind", "report"]]),
+             ("event-3", _BASE), ("event-4", [*_BASE, ["acp-kind", "urgent"]]),
+             ("event-5", [*_BASE, ["acp-kind", "conflict"]])]
+
+    async def exercise():
+        for event, tags in cases:
+            assert (await send(text=_event("@ceo?", tags, event=event), event_id=event))[0] == 200
+
+    asyncio.run(exercise())
+    offered = (["read_file", "relay_resolve"], ["read_file", "relay_resolve"])
+    assert seen == [(*offered, "event-1", "event-1"), (["read_file"], ["read_file"], None, None),
+                    (["read_file"], ["read_file"], None, None), (["read_file"], ["read_file"], None, None),
+                    (*offered, "event-5", "event-5")]
+    assert [t["function"]["name"] for t in ingress.actor.tools] == ["read_file"]  # nothing left behind
+    assert ingress.actor.valid_tool_names == {"read_file"}
 
 
 @pytest.mark.parametrize("tags", [

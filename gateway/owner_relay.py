@@ -137,12 +137,15 @@ def _is_error(content: Any) -> bool:
     return isinstance(parsed, Mapping) and bool(parsed.get("error"))
 
 
-def accepted_outcome(messages: Any, boundary: Any, *, event_id: str, earlier: Any = ()) -> Optional[str]:
+def accepted_outcome(messages: Any, boundary: Any, *, event_id: str, earlier: Any = (), allowed: Any = None,
+                     need_answer: bool = False) -> Optional[str]:
     """The outcome of this turn's declaration, or None: the LAST ``relay_resolve`` call of the turn that began at
     ``messages[boundary]``, when its handler accepted it (a result that says ``declared``), it names *event_id*
     and a known outcome, and every evidence item is real: a ``tool_call_id`` of a call this turn made, or one of
     the *earlier* turns' recorded calls (each with a result that is no error and made before the declaration),
-    or an explicit answer; ``done`` needs at least one tool result. Anything else resolves nothing."""
+    or an explicit answer; ``done`` needs at least one tool result. *allowed*: the outcomes this turn may
+    declare (default all); *need_answer*: at least one explicit answer must be cited (a post a CTO declared a
+    question, ruling request or conflict: the answer, decision or resolution). Anything else resolves nothing."""
     from tools.relay_resolve_tool import OUTCOMES, TOOL_NAME, evidence_items
 
     if not isinstance(messages, list) or isinstance(boundary, bool) or not isinstance(boundary, int):
@@ -165,7 +168,7 @@ def accepted_outcome(messages: Any, boundary: Any, *, event_id: str, earlier: An
     except (ValueError, StopIteration, KeyError, TypeError):
         return None
     if (not isinstance(args, Mapping) or not isinstance(result, Mapping) or result.get("declared") is not True
-            or args.get("event_id") != event_id or args.get("outcome") not in OUTCOMES):
+            or args.get("event_id") != event_id or args.get("outcome") not in (allowed or OUTCOMES)):
         return None
     items = evidence_items(args.get("evidence"))
     if items is None:
@@ -175,6 +178,8 @@ def accepted_outcome(messages: Any, boundary: Any, *, event_id: str, earlier: An
     if any(kind == "tool" and value not in known for kind, value in items):
         return None
     if args["outcome"] == "done" and not any(kind == "tool" for kind, _ in items):
+        return None
+    if need_answer and not any(kind == "answer" for kind, _ in items):
         return None
     return args["outcome"]
 
@@ -255,6 +260,17 @@ def event_content(text: Any, *, event_id: str, channel_id: str, author_id: str) 
 
 
 ACP_KIND_TAG = "acp-kind"
+_KIND_WORDS = {"question": "a question", "ruling": "a ruling request", "conflict": "a conflict"}
+
+
+def peer_declaration_note(disposition: str, event_id: str) -> str:
+    """What the peer turn of a post a bound CTO declared owed is told, after the quoted post: it owes an answer
+    and closes it with the ``relay_resolve`` declaration, which an acknowledgement is not."""
+    return (f"\n[The canonical CTO declared the post above {_KIND_WORDS.get(disposition, 'owed')} the CEO owes an "
+            f"answer. Answer it in your reply. Then declare it handled by calling the relay_resolve tool once with "
+            f"event_id {json.dumps(event_id)}, an outcome (answered, declined or deferred_with_reason) and "
+            "evidence: answer items stating the explicit answer, decision or, for a conflict, the resolution. An "
+            "acknowledgement, or an answer without that declaration, leaves it open.]")
 
 
 def event_acp_kind(text: Any, *, event_id: str, channel_id: str, author_id: str) -> Optional[str]:
