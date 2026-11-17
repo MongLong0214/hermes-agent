@@ -96,6 +96,57 @@ if [ -z "${BUZZ_PRIVATE_KEY:-}" ]; then
   fi
 fi
 
+# 에이전트 셸(CLAUDECODE)은 어떤 경로로도 CEO 키로 서명하지 못한다. 위 블록은 BUZZ_PRIVATE_KEY 가
+# 이미 있으면 통째로 건너뛰고 buzz 는 --private-key 도 받으므로, 최종 키를 여기서 한 번 더 본다.
+# 개인키가 아니라 공개키로 비교한다 — 16진 표기(대소문자)나 별칭이 달라도 같은 키면 같은 공개키다.
+# 공개키를 계산하지 못하거나 keys/ceo.pub 가 없으면 CEO 가 아님을 증명하지 못한 것이므로 거부한다.
+# CEO 경로(CLAUDECODE 없음)는 건드리지 않는다.
+_refuse_ceo_key() {
+  printf '%s' "$1" | python3 -I -c '
+import re, sys
+from pathlib import Path
+P = 2**256 - 2**32 - 977
+N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+G = (0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+     0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8)
+def add(a, b):
+    if a is None or b is None:
+        return a or b
+    if a[0] == b[0] and (a[1] + b[1]) % P == 0:
+        return None
+    m = (3 * a[0] * a[0] * pow(2 * a[1], -1, P) if a == b else (b[1] - a[1]) * pow(b[0] - a[0], -1, P)) % P
+    x = (m * m - a[0] - b[0]) % P
+    return (x, (m * (a[0] - x) - a[1]) % P)
+key = sys.stdin.read().strip()
+try:
+    ceo_pub = (Path(sys.argv[1]) / "keys" / "ceo.pub").read_text().strip().lower()
+    if not re.fullmatch("[0-9a-fA-F]{64}", key) or not re.fullmatch("[0-9a-f]{64}", ceo_pub):
+        sys.exit(2)
+    d, point, bit = int(key, 16), None, G
+    if not 0 < d < N:
+        sys.exit(2)
+    while d:
+        if d & 1:
+            point = add(point, bit)
+        bit, d = add(bit, bit), d >> 1
+    sys.exit(0 if "%064x" % point[0] == ceo_pub else 1)
+except Exception:
+    sys.exit(2)
+' "$B" 2>/dev/null
+  [ $? -eq 1 ] && return 0
+  printf '{"error":"identity_error","message":"agent shell may not sign as the CEO, and this key could not be shown to be a different key (keys/ceo.pub).","retryable":false}\n' >&2
+  exit 3
+}
+if [ -n "${CLAUDECODE:-}" ]; then
+  [ -n "${BUZZ_PRIVATE_KEY:-}" ] && _refuse_ceo_key "$BUZZ_PRIVATE_KEY"
+  _prev=""
+  for _a in "$@"; do
+    [ "$_prev" = "--private-key" ] && _refuse_ceo_key "$_a"
+    case "$_a" in --private-key=*) _refuse_ceo_key "${_a#--private-key=}";; esac
+    _prev="$_a"
+  done
+fi
+
 if [ -z "${BUZZ_RELAY_URL:-}" ]; then
   # relay-host.txt 에는 스킴이 없다. 그냥 붙이면 relay 가 400 을 준다
   # ("Client sent an HTTP request to an HTTPS server").
