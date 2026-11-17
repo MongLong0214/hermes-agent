@@ -19,8 +19,8 @@ from types import SimpleNamespace
 import pytest
 from test_shim_canary import OTHER
 from test_shim_publish_retry import (  # noqa: F401 - the shim fixture is this module's too
-    _FAKE, _SHIM, CHANNEL, EVENT_A, EVENT_B, PEER, SIGNER, ask, body, calls, final, log_text, plan, posts, record,
-    shim)
+    _FAKE, _SHIM, CHANNEL, EVENT_A, EVENT_B, PEER, SIGNER, ask, body, calls, final, load, log_text, plan, posts,
+    record, shim)
 # The real coordinator under a tmp home, and the shim wired to it (its fixtures, not copies).
 from test_shim_text_cap_notice import _pin_the_module_home  # noqa: F401
 from test_shim_text_cap_notice import CHANNEL as GW_CHANNEL
@@ -493,21 +493,23 @@ def _rows(text, kwargs, history, final_text, calls):
         if kwargs.get(name):
             user[key] = kwargs[name]
     rows = [user]
-    for name, args, out, call_id in calls:
+    for name, args, out, call_id, recorded in calls:
         rows.append({"role": "assistant", "content": None, "tool_calls": [
             {"id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]})
-        rows.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": out})
+        rows.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": out,
+                     "_tool_outcome": recorded})
     return [*history, *rows, {"role": "assistant", "content": final_text}]
 
 
 def _resolve(outcome="done", evidence=None, call_id="resolve-1"):
     args = {"event_id": GW_EVENT, "outcome": outcome,
             "evidence": [{"tool_call_id": "call-1"}] if evidence is None else evidence}
-    return ("relay_resolve", args, json.dumps({"declared": True, "event_id": GW_EVENT, "outcome": outcome}), call_id)
+    return ("relay_resolve", args, json.dumps({"declared": True, "event_id": GW_EVENT, "outcome": outcome}), call_id,
+            "ok")
 
 
-def _work(call_id="call-1"):
-    return ("run_cancel", {"run_id": "r1"}, '{"ok": true}', call_id)
+def _work(call_id="call-1", name="run_cancel", out='{"ok": true}', outcome="ok"):
+    return (name, {"run_id": "r1"}, out, call_id, outcome)
 
 
 def _real_path(gw, gw_shim, monkeypatch, tmp_path, *turns, relay=True, kind=None):
@@ -615,7 +617,7 @@ def test_a_declared_question_ruling_or_conflict_runs_judgement_reply_readback_an
     """CEO C, closed as B: the CTO declares the kind; the CEO's reply is read back from the thread, and the
     peer turn's structured declaration (an explicit answer as evidence) closes it."""
     real = _real_path(gw, gw_shim, monkeypatch, tmp_path,
-                      ("머지하세요. 근거는 아래와 같습니다.", _resolve("answered", [{"answer": "머지하세요: CI green"}])),
+                      ("머지하세요. 근거는 아래와 같습니다.", _resolve("answered", [{"answer": "머지하세요"}])),
                       relay=False, kind=kind)
     gw_drive(gw_shim, real.prompt)
     assert len(gw.runs) == 1 and real.thread() == ["@cto-repo-factory 머지하세요. 근거는 아래와 같습니다."]
@@ -684,3 +686,82 @@ def test_a_reopened_legacy_silence_posts_the_owed_notice_and_never_re_executes(g
     assert (done["kind"], done["disposition"], done["reply_state"]) == ("notice", "owner_relay", "owed")
     assert len(real.thread()) == 2 and all("SILENT" not in post for post in real.thread())
     assert gw_shim.recovery_delivery_state(GW_EVENT) == "owed"
+
+
+@pytest.mark.parametrize("kind", ["question", "ruling_request", "conflict"])
+def test_ack_only_reply_with_private_answer_evidence(gw, gw_shim, monkeypatch, tmp_path, kind):
+    """Review: the turn declared an explicit answer in its evidence and ended "ACK"; only "ACK" was posted and
+    the event was confirmed. What is posted and read back now contains the declared answer, so a posted bare ACK
+    never confirms."""
+    answer = "Do not merge; the change still loses messages."
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("ACK", _resolve("answered", [{"answer": answer}])),
+                      relay=False, kind=kind)
+    gw_drive(gw_shim, real.prompt)
+    assert real.thread() == [f"@cto-repo-factory ACK\n\n{answer}"]  # never the bare ACK
+    done = real.settled()
+    assert (done["reply_state"], done["resolved"], done["sent"]) == ("confirmed", True, True)
+    assert gw_shim.recovery_delivery_state(GW_EVENT) == "answered"
+
+
+@pytest.mark.parametrize("result", [
+    '{"output":"operation failed", "exit_code":1, "error":null}',
+    '{"success":false,"message":"operation failed"}',
+])
+def test_failed_tool_result_cannot_close_on_the_real_path(gw, gw_shim, monkeypatch, tmp_path, result):
+    """The executor recorded these results as failed (``_detect_tool_failure``); citing them closes nothing."""
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path,
+                      ("The operation is done.", _work(name="terminal", out=result, outcome="failed"),
+                       _resolve("done")))
+    gw_drive(gw_shim, real.prompt)
+    assert real.thread() == ["@cto-repo-factory The operation is done."]
+    assert real.settled()["reply_state"] == "acknowledged"
+    assert gw_shim.recovery_delivery_state(GW_EVENT) == "owed"
+
+
+def test_resolved_silent_owner_can_recover_reply(gw, gw_shim, monkeypatch, tmp_path):
+    """Review: a declared but silent owner turn was recorded resolved, so no recovery turn ran. It stays owed,
+    and the redelivery's reply-only turn publishes the reply and closes it."""
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("[SILENT]", _work(), _resolve("done")),
+                      ("The project is stopped.", _resolve("done")))
+    gw_drive(gw_shim, real.prompt)
+    assert len(gw.runs) == 1 and gw_shim.recovery_delivery_state(GW_EVENT) == "owed"
+    [notice] = real.thread()
+    assert "SILENT" not in notice
+    gw_drive(gw_shim, real.prompt, rpc_id=2)
+    assert len(gw.runs) == 2
+    assert real.thread()[1:] == ["@cto-repo-factory The project is stopped."]
+    done = json.loads((Path(gw_shim.PUBLISHED) / (GW_EVENT + ".answer")).read_text().splitlines()[0])
+    assert (done["reply_state"], done["resolved"]) == ("confirmed", True)  # the reply took the slot the notice left open
+    assert gw_shim.recovery_delivery_state(GW_EVENT) == "answered"
+
+
+def test_exit_zero_pending_readback_can_settle_after_restart(shim, monkeypatch):
+    """Review: a shim that died with ``pending: true`` after an exit 0 send whose read-back failed was never
+    settled: a fresh shim refused the journal and never read the thread. It reads the thread (never resends),
+    finds the post, confirms it and clears pending."""
+    with monkeypatch.context() as patch:
+        patch.setattr(shim, "_read_back", lambda *args: "unknown")
+        patch.setattr(shim.threading.Thread, "start", lambda self: None)  # the process dies before its retry runs
+        shim.publish_reply(EVENT_A, CHANNEL, "The project is stopped.", owed="owner_relay", resolved=True)
+    assert record(shim, EVENT_A)["pending"] is True and len(posts(shim, EVENT_A)) == 1
+    restarted = load(f"u1_restarted_{id(shim)}", monkeypatch)
+    _gateway_answers(restarted, "The project is stopped.", "owner_relay", resolved=True)
+    ask(restarted, EVENT_A, rpc_id=2)
+    done = record(shim, EVENT_A)
+    assert (done["sent"], done["reply_state"], done.get("pending"), done["resolved"]) == (True, "confirmed", False, True)
+    assert len(posts(shim, EVENT_A)) == 1 and sum(c["cmd"] == "send" for c in calls(shim, EVENT_A)) == 1
+    assert restarted.recovery_delivery_state(EVENT_A) == "answered"
+
+
+def test_a_pending_journal_whose_thread_cannot_be_read_stays_unconfirmed_and_is_never_resent(shim, monkeypatch):
+    with monkeypatch.context() as patch:
+        patch.setattr(shim, "_read_back", lambda *args: "unknown")
+        patch.setattr(shim.threading.Thread, "start", lambda self: None)
+        shim.publish_reply(EVENT_A, CHANNEL, "The project is stopped.", owed="owner_relay", resolved=True)
+    restarted = load(f"u1_restarted_unreadable_{id(shim)}", monkeypatch)
+    monkeypatch.setattr(restarted, "_read_back", lambda *args: "unknown")
+    _gateway_answers(restarted, "The project is stopped.", "owner_relay", resolved=True)
+    ask(restarted, EVENT_A, rpc_id=2)
+    done = record(shim, EVENT_A)
+    assert (done["reply_state"], done["sent"], done.get("pending")) == ("unconfirmed", False, False)
+    assert sum(c["cmd"] == "send" for c in calls(shim, EVENT_A)) == 1

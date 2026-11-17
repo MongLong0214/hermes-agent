@@ -334,7 +334,8 @@ def _append_skipped_tool_results(
     for tc in tool_calls:
         name = _tc_name(tc)
         result = content.format(name=name)
-        messages.append(make_tool_result_message(name, result, _pairing_tool_call_id(tc), effect_disposition="none"))
+        messages.append(make_tool_result_message(name, result, _pairing_tool_call_id(tc), effect_disposition="none",
+                                                 outcome="refused"))
         if hook_error_type is not None:
             _ToolCallRef(name, {}, effective_task_id, (hook_id or _pairing_tool_call_id)(tc), []).emit_post(
                 agent, result,
@@ -490,7 +491,8 @@ def append_peer_refusals(agent, tool_calls, messages: list, *, reasons: Optional
         # No str.format over the block: it carries a JSON schema, braces included.
         result = (_PEER_ARGUMENT_REFUSAL.replace("{name}", name).replace("{reason}", _flatten_probe(block)) if block
                   else _PEER_SIBLING_REFUSAL.replace("{name}", name))
-        messages.append(make_tool_result_message(name, result, _pairing_tool_call_id(tc), effect_disposition="none"))
+        messages.append(make_tool_result_message(name, result, _pairing_tool_call_id(tc), effect_disposition="none",
+                                                 outcome="refused"))
 
 
 def _refuse_peer_tool_calls(agent, tool_calls, messages: list) -> bool:
@@ -1292,7 +1294,9 @@ def _commit_tool_result(
     # Multimodal dicts become an OpenAI-style content list; text-only servers get a
     # string-safe fallback so a rejected image result never poisons history.
     _tool_content = agent._tool_result_content_for_active_model(function_name, persisted_result)
-    tool_message = make_tool_result_message(function_name, _tool_content, tool_call_id, effect_disposition=effect_disposition)
+    tool_message = make_tool_result_message(
+        function_name, _tool_content, tool_call_id, effect_disposition=effect_disposition,
+        outcome="refused" if blocked else "failed" if is_error else "ok")
     # Prepare presentation data before the append. The emitting completion callback
     # stays below the durability fence; raw tool/model content remains unchanged.
     prepare_metadata = getattr(agent, "tool_result_metadata_callback", None)

@@ -55,7 +55,7 @@ def test_a_bound_ctos_declared_kind_is_closed_only_by_the_peer_turns_structured_
     """The CEO's answer alone does not close a declared question, ruling request or conflict: the peer turn
     declares it with ``relay_resolve`` (an answer, decline or deferral, with the explicit answer, decision or
     resolution as evidence), accepted only for this event."""
-    _scripted(ingress, monkeypatch, (_ANSWER, _resolve("answered", [{"answer": "머지하세요: 근거는 CI green"}])))
+    _scripted(ingress, monkeypatch, (_ANSWER, _resolve("answered", [{"answer": "머지하세요"}])))
     text = _tagged(kind)
     notes = []
     ingress.actor.during_turn = lambda: notes.append(getattr(ingress.actor, "_gateway_turn_context_notes", ""))
@@ -76,6 +76,21 @@ def test_a_bound_ctos_declared_kind_is_closed_only_by_the_peer_turns_structured_
     assert "relay_resolve" in note and "acknowledgement" in note and '"event"' in note
     assert getattr(ingress.actor, "_gateway_turn_context_notes", "") == ""
     assert "relay_resolve" not in ingress.actor.model_inputs[0]
+
+
+@pytest.mark.parametrize("kind, disposition", _KINDS)
+def test_a_declared_answer_is_always_in_the_published_reply_of_a_declared_kind(
+        ingress, send, monkeypatch, kind, disposition):
+    """The turn declared an explicit answer and ended "ACK": the published reply carries the answer."""
+    answer = "Do not merge; the change still loses messages."
+    _scripted(ingress, monkeypatch, ("ACK", _resolve("answered", [{"answer": answer}])))
+
+    async def exercise():
+        assert await send(text=_tagged(kind)) == (200, {
+            "event_id": "event", "text": f"ACK\n\n{answer}", "disposition": disposition, "silent": False,
+            "resolved": True})
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("kind, disposition", _KINDS)

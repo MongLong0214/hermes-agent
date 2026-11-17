@@ -1110,7 +1110,42 @@ _RETRIES = []  # one daemon thread per answer whose post is still being retried;
 _RETRIES_LOCK = threading.Lock()
 
 
+def _retry_lock(name):
+    """The fd holding ``PUBLISHED/.<name>.retry`` under an exclusive ``flock``, or None when another holder has it.
+    A retry thread holds it while it lives; the kernel drops it when the process dies (or a retry never started),
+    which is how a later shim tells a pending journal whose owner is gone from one still being finished."""
+    try:
+        fd = os.open(os.path.join(PUBLISHED, f".{name}.retry"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _release_retry_lock(name, fd):
+    if fd is None:
+        return
+    try:
+        os.unlink(os.path.join(PUBLISHED, f".{name}.retry"))
+    except OSError:
+        pass
+    os.close(fd)
+
+
 def _retry_publication(name, record, body, digests, tag):
+    """Finish one answer's post off the turn path (``_retry_publication_locked``), holding its retry lock."""
+    lock = _retry_lock(name)
+    try:
+        _retry_publication_locked(name, record, body, digests, tag)
+    finally:
+        _release_retry_lock(name, lock)
+
+
+def _retry_publication_locked(name, record, body, digests, tag):
     """Finish one answer's post off the turn path. Before each resend the thread is read back: an earlier
     attempt that landed is recorded as ``sent`` (``recovered``) and never sent again, and a read-back that
     fails is read again after the next wait, never taken for absence. At most one resend per wait in
@@ -1206,6 +1241,39 @@ def _reopens_owed_slot(name, body, resolved):
     return True
 
 
+def _settle_abandoned(name, body, digests, channel, target, owed, resolved):
+    """An owed answer's journal says ``pending: true`` and nothing is finishing it: its shim died (or its retry
+    never started) after an exit 0 send whose read-back failed. A retry thread alive anywhere holds the journal's
+    retry lock, and then nothing is touched. Otherwise, with this very body, the thread is read, never resent:
+    found, the post is ``confirmed`` (or ``acknowledged``, without the turn's declaration) and pending is
+    cleared; not found or unreadable, pending is cleared and the reply stays ``unconfirmed`` (nobody is left to
+    finish it). True only when the thread shows the post."""
+    lock = _retry_lock(name)
+    if lock is None:
+        return False
+    try:
+        prior = publication_record(name)
+        if (prior.get("kind") != "answer" or prior.get("pending") is not True or owed not in ANSWER_OWED
+                or prior.get("body_sha256") != _sha256(body)):
+            return False
+        posted = _read_back(channel, target, digests) == "posted"
+        at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        if posted:
+            _rewrite_publication(name, dict(
+                prior, sent=True, state="sent", delivery="posted", disposition=owed, recovered=True, pending=False,
+                reason="found in the thread after the shim that sent it ended", at=at,
+                reply_state=_reply_state(True, resolved), **({"resolved": True} if resolved else {})))
+            log(f"prompt {name[:12]}… pending owed reply found in the thread after its shim ended; not posted again")
+        else:
+            _rewrite_publication(name, dict(prior, sent=False, delivery="failed", disposition=owed, pending=False,
+                                            reply_state="unconfirmed", at=at))
+            log(f"prompt {name[:12]}… pending owed reply not shown by the thread and its shim is gone: unconfirmed; "
+                "not posted again")
+        return posted
+    finally:
+        _release_retry_lock(name, lock)
+
+
 def _settle_claimed(name, body, digests, channel, target, owed, resolved):
     """The answer is the text its claimed journal already holds, or the event is not owed: nothing is posted
     either way. True only when the thread, read now, shows this very post and it is journaled so.
@@ -1215,7 +1283,9 @@ def _settle_claimed(name, body, digests, channel, target, owed, resolved):
     is ``confirmed`` (or ``acknowledged``, without the turn's declaration); not found, ``unconfirmed``. A
     reply already ``acknowledged`` becomes ``confirmed`` when this answer is the turn's declaration."""
     prior = publication_record(name)
-    if prior.get("kind") != "answer" or prior.get("pending") is True:
+    if prior.get("kind") == "answer" and prior.get("pending") is True:
+        return _settle_abandoned(name, body, digests, channel, target, owed, resolved)
+    if prior.get("kind") != "answer":
         return False
     legacy = "disposition" not in prior
     if owed not in ANSWER_OWED:

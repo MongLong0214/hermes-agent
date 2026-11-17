@@ -102,17 +102,19 @@ class VerifiedRelay:
 
 
 def turn_calls(messages: Any, boundary: Any) -> list:
-    """``[{"id", "tool", "ok"}, ...]``: every tool call of the turn that began at ``messages[boundary]``, in order,
-    with whether its result was no error. A call that failed is listed too (it may have done part of its work),
-    and only the calls that did not fail can be cited as evidence. The declaration itself is not work."""
+    """``[{"id", "tool", "ok"}, ...]``: every tool call of the turn that began at ``messages[boundary]`` that got a
+    result row, in order, with ``ok``: the executor recorded that call's outcome as ``ok`` on the row
+    (``_tool_outcome``, set where it produced the result). A call that failed or was refused is listed too (it
+    may have done part of its work) and cannot be cited. The result's text is never read. The declaration itself
+    is not work."""
     from tools.relay_resolve_tool import TOOL_NAME
 
     if not isinstance(messages, list) or isinstance(boundary, bool) or not isinstance(boundary, int):
         return []
-    results = {}
+    outcomes = {}
     for row in messages[max(boundary, 0):]:
         if isinstance(row, Mapping) and row.get("role") == "tool" and isinstance(row.get("tool_call_id"), str):
-            results[row["tool_call_id"]] = row.get("content")
+            outcomes[row["tool_call_id"]] = row.get("_tool_outcome")
     calls = []
     for row in messages[max(boundary, 0):]:
         if not isinstance(row, Mapping) or row.get("role") != "assistant" or not isinstance(row.get("tool_calls"), list):
@@ -121,31 +123,20 @@ def turn_calls(messages: Any, boundary: Any) -> list:
             function = call.get("function") if isinstance(call, Mapping) else None
             name = function.get("name") if isinstance(function, Mapping) else None
             call_id = call.get("id") if isinstance(call, Mapping) else None
-            if isinstance(name, str) and isinstance(call_id, str) and name != TOOL_NAME and call_id in results:
-                calls.append({"id": call_id, "tool": name, "ok": not _is_error(results[call_id])})
+            if isinstance(name, str) and isinstance(call_id, str) and name != TOOL_NAME and call_id in outcomes:
+                calls.append({"id": call_id, "tool": name, "ok": outcomes[call_id] == "ok"})
     return calls
 
 
-def _is_error(content: Any) -> bool:
-    """A tool result that says it failed: a JSON object with an ``error``, or no content at all."""
-    if not isinstance(content, str) or not content.strip():
-        return True
-    try:
-        parsed = json.loads(content)
-    except ValueError:
-        return False
-    return isinstance(parsed, Mapping) and bool(parsed.get("error"))
-
-
-def accepted_outcome(messages: Any, boundary: Any, *, event_id: str, earlier: Any = (), allowed: Any = None,
-                     need_answer: bool = False) -> Optional[str]:
-    """The outcome of this turn's declaration, or None: the LAST ``relay_resolve`` call of the turn that began at
-    ``messages[boundary]``, when its handler accepted it (a result that says ``declared``), it names *event_id*
-    and a known outcome, and every evidence item is real: a ``tool_call_id`` of a call this turn made, or one of
-    the *earlier* turns' recorded calls (each with a result that is no error and made before the declaration),
-    or an explicit answer; ``done`` needs at least one tool result. *allowed*: the outcomes this turn may
-    declare (default all); *need_answer*: at least one explicit answer must be cited (a post a CTO declared a
-    question, ruling request or conflict: the answer, decision or resolution). Anything else resolves nothing."""
+def accepted_declaration(messages: Any, boundary: Any, *, event_id: str, earlier: Any = (), allowed: Any = None,
+                         need_answer: bool = False) -> Optional[tuple]:
+    """``(outcome, answers)`` of this turn's declaration, or None: the LAST ``relay_resolve`` call of the turn
+    that began at ``messages[boundary]``, when the executor recorded it ``ok`` (its handler accepted it), it names
+    *event_id* and a known outcome, and every evidence item is real: a ``tool_call_id`` of a call this turn made
+    before it, or one of the *earlier* turns' recorded calls, that the executor recorded ``ok``, or an explicit
+    answer (returned as *answers*); ``done`` needs at least one tool result. *allowed*: the outcomes this turn
+    may declare (default all); *need_answer*: at least one explicit answer must be cited (a post a CTO declared
+    a question, ruling request or conflict: the answer, decision or resolution). Anything else resolves nothing."""
     from tools.relay_resolve_tool import OUTCOMES, TOOL_NAME, evidence_items
 
     if not isinstance(messages, list) or isinstance(boundary, bool) or not isinstance(boundary, int):
@@ -163,12 +154,12 @@ def accepted_outcome(messages: Any, boundary: Any, *, event_id: str, earlier: An
     at, call_id, raw = declaration
     try:
         args = json.loads(raw) if isinstance(raw, str) else raw
-        result = next(json.loads(r["content"]) for r in rows[at:]
-                      if isinstance(r, Mapping) and r.get("role") == "tool" and r.get("tool_call_id") == call_id)
-    except (ValueError, StopIteration, KeyError, TypeError):
+        accepted = next(r.get("_tool_outcome") == "ok" for r in rows[at:]
+                        if isinstance(r, Mapping) and r.get("role") == "tool" and r.get("tool_call_id") == call_id)
+    except (ValueError, StopIteration, TypeError):
         return None
-    if (not isinstance(args, Mapping) or not isinstance(result, Mapping) or result.get("declared") is not True
-            or args.get("event_id") != event_id or args.get("outcome") not in (allowed or OUTCOMES)):
+    if (not accepted or not isinstance(args, Mapping) or args.get("event_id") != event_id
+            or args.get("outcome") not in (allowed or OUTCOMES)):
         return None
     items = evidence_items(args.get("evidence"))
     if items is None:
@@ -181,7 +172,22 @@ def accepted_outcome(messages: Any, boundary: Any, *, event_id: str, earlier: An
         return None
     if need_answer and not any(kind == "answer" for kind, _ in items):
         return None
-    return args["outcome"]
+    return args["outcome"], tuple(value for kind, value in items if kind == "answer")
+
+
+def accepted_outcome(messages: Any, boundary: Any, **kwargs: Any) -> Optional[str]:
+    """The outcome of :func:`accepted_declaration`, or None."""
+    declaration = accepted_declaration(messages, boundary, **kwargs)
+    return declaration[0] if declaration is not None else None
+
+
+def with_declared_answers(reply: str, answers: Any) -> str:
+    """*reply* as published: it always says each explicit answer the turn declared. An answer the reply already
+    contains (whatever its spacing or case) is not repeated; any other is appended, so a turn that declared an
+    answer and then ended with a bare acknowledgement never has the acknowledgement alone posted."""
+    said = " ".join(reply.split()).casefold()
+    missing = [a for a in answers if " ".join(a.split()).casefold() not in said]
+    return reply if not missing else reply.rstrip() + "\n\n" + "\n\n".join(missing)
 
 
 def parse_relay(text: Any) -> Optional[RelayClaim]:
@@ -489,12 +495,14 @@ def new_metadata(relay: VerifiedRelay, *, binding: str, author_id: str, channel_
             "timestamp": relay.timestamp, "nonce": secrets.token_hex(16)}
 
 
-def render_owner_turn(relay: VerifiedRelay, metadata: Mapping[str, str], *, earlier: Any = None) -> str:
+def render_owner_turn(relay: VerifiedRelay, metadata: Mapping[str, str], *, earlier: Any = None,
+                      declared: Any = None) -> str:
     """The model-facing text of the owner turn: its provenance, the original quoted verbatim between
     per-turn nonce markers, and the CTO's note quoted apart, carrying no owner authority. *earlier*: the calls
     (``[{"id", "tool"}]``) the instruction's earlier turn made, for a reply-only recovery turn: this instruction
     already ran, its answer did not declare it resolved, and this turn may do nothing but answer and declare.
-    Raises ``ValueError("canonical_envelope_escape")`` when either text holds the nonce."""
+    *declared* (``{"outcome", "answers"}``): the earlier turn did declare it, but published no reply; this turn
+    publishes it. Raises ``ValueError("canonical_envelope_escape")`` when either text holds the nonce."""
     nonce = metadata["nonce"]
     if any(nonce in text for text in (relay.original, relay.owner_text, relay.note)):
         raise ValueError("canonical_envelope_escape")
@@ -515,7 +523,13 @@ def render_owner_turn(relay: VerifiedRelay, metadata: Mapping[str, str], *, earl
             "any action. The earlier turn made these calls: "
             + (", ".join(f"{c['tool']} (tool_call_id {c['id']}{'' if c.get('ok') else ', failed'})"
                          for c in earlier) or "none")
-            + ". Answer the thread and declare what is true, citing them.\n") if earlier is not None else "")
+            + ". Answer the thread and declare what is true, citing them.\n"
+            + (("The earlier turn declared this instruction "
+                f"{declared['outcome']}" + (" with the answer " + "; ".join(json.dumps(a, ensure_ascii=False)
+                                                                           for a in declared["answers"])
+                                            if declared.get("answers") else "")
+                + " but published no reply: publish it now, and declare it again.\n") if declared else ""))
+           if earlier is not None else "")
         + f"<<<owner-instruction:{nonce}>>>\n{relay.owner_text}\n<<<end-owner-instruction:{nonce}>>>"
     )
 

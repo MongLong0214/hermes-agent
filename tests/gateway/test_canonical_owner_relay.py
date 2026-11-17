@@ -186,17 +186,18 @@ def test_a_peer_message_is_never_owed_a_reply_by_what_it_says(ingress, send, mon
 # What completes an owed reply is the owner turn's own ``relay_resolve`` call, accepted from that turn and that
 # event only, with evidence that refers to something the event's turns did. No word of an answer does.
 
-def _work(call_id="call-1", name="run_cancel", out='{"ok": true}'):
-    """One tool call the turn made for the instruction, and the result it got."""
-    return (name, {"run_id": "r1"}, out, call_id)
+def _work(call_id="call-1", name="run_cancel", out='{"ok": true}', outcome="ok"):
+    """One tool call the turn made for the instruction, the result it got, and the outcome the executor
+    recorded on that result row (``_tool_outcome``: ok, failed or refused): the only thing the gateway reads."""
+    return (name, {"run_id": "r1"}, out, call_id, outcome)
 
 
 def _resolve(outcome="done", evidence=None, *, event_id="event", call_id="resolve-1", ok=True):
-    """The turn's ``relay_resolve`` call, and the result its handler gave."""
+    """The turn's ``relay_resolve`` call, and the result its handler gave (recorded failed when refused)."""
     args = {"event_id": event_id, "outcome": outcome,
             "evidence": [{"tool_call_id": "call-1"}] if evidence is None else evidence}
     out = json.dumps({"declared": True, "event_id": event_id, "outcome": outcome} if ok else {"error": "refused"})
-    return ("relay_resolve", args, out, call_id)
+    return ("relay_resolve", args, out, call_id, "ok" if ok else "failed")
 
 
 def _scripted(ingress, monkeypatch, *turns):
@@ -209,10 +210,11 @@ def _scripted(ingress, monkeypatch, *turns):
         result = original(text, **kwargs)
         boundary = ingress.actor._persist_user_message_idx
         rows = [result["messages"][boundary]]
-        for name, args, out, call_id in calls:
+        for name, args, out, call_id, recorded in calls:
             rows.append({"role": "assistant", "content": None, "tool_calls": [
                 {"id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]})
-            rows.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": out})
+            rows.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": out,
+                         "_tool_outcome": recorded})
         rows.append({"role": "assistant", "content": final})
         result["messages"][boundary:] = rows
         result["final_response"] = final
@@ -236,11 +238,12 @@ def test_a_declaration_citing_what_the_turn_did_or_decided_resolves_the_relayed_
         ingress, send, monkeypatch, outcome, evidence):
     _entitle()
     _transcript(_owner_record())
-    _scripted(ingress, monkeypatch, ("정리했습니다.", _work(), _resolve(outcome, evidence)))
+    reply = "정리했습니다." + "".join(f" {item['answer']}" for item in evidence if "answer" in item)
+    _scripted(ingress, monkeypatch, (reply, _work(), _resolve(outcome, evidence)))
 
     async def exercise():
-        assert await send(text=_relay()) == (200, _owed("정리했습니다.", resolved=True))
-        assert await send(text=_relay()) == (200, _owed("정리했습니다.", resolved=True))  # a terminal: replayed
+        assert await send(text=_relay()) == (200, _owed(reply, resolved=True))
+        assert await send(text=_relay()) == (200, _owed(reply, resolved=True))  # a terminal: replayed
         assert len(ingress.actor.calls) == 1
 
     asyncio.run(exercise())
@@ -259,7 +262,9 @@ def test_a_declaration_citing_what_the_turn_did_or_decided_resolves_the_relayed_
     ("done_cites_only_an_answer", ("ACK", _resolve("done", [{"answer": "ok"}]))),
     ("blank_answer", ("ACK", _resolve("answered", [{"answer": "  "}]))),
     ("unknown_outcome", ("ACK", _work(), _resolve("finished"))),
-    ("cites_a_tool_result_that_failed", ("ACK", _work(out='{"error": "no such run"}'), _resolve("done"))),
+    ("cites_a_tool_result_that_failed", ("ACK", _work(outcome="failed"), _resolve("done"))),
+    ("cites_a_call_the_executor_refused", ("ACK", _work(outcome="refused"), _resolve("done"))),
+    ("cites_a_call_with_no_recorded_outcome", ("ACK", _work(outcome=None), _resolve("done"))),
     ("the_declaration_itself_was_refused", ("ACK", _work(), _resolve("done", ok=False))),
     ("cites_work_made_after_it", ("ACK", _resolve("done"), _work())),
     # (3) a resolve for a different event.
@@ -330,6 +335,107 @@ def test_a_redelivery_runs_a_reply_only_recovery_turn_that_cites_the_earlier_tur
     assert receipt["response"]["outcome"] == "done"
 
 
+@pytest.mark.parametrize("outcome", ["answered", "declined", "deferred_with_reason"])
+@pytest.mark.parametrize("final, text", [
+    ("ACK", "ACK\n\n프로젝트는 중지됐고 결과는 CI 로그에 있습니다."),
+    ("확인", "확인\n\n프로젝트는 중지됐고 결과는 CI 로그에 있습니다."),
+    ("프로젝트는   중지됐고 결과는\nCI 로그에 있습니다. 감사합니다.",  # already says it, whatever the spacing
+     "프로젝트는   중지됐고 결과는\nCI 로그에 있습니다. 감사합니다."),
+])
+def test_a_declared_answer_is_always_in_the_published_reply(ingress, send, monkeypatch, outcome, final, text):
+    """Review: the evidence answer was not tied to the reply. A turn that declared an explicit answer and then
+    ended "ACK" had only "ACK" posted, and was confirmed. The published reply now always contains the declared
+    answer: when the turn's own reply does not say it, it is appended."""
+    _entitle()
+    _transcript(_owner_record())
+    answer = "프로젝트는 중지됐고 결과는 CI 로그에 있습니다."
+    _scripted(ingress, monkeypatch, (final, _resolve(outcome, [{"answer": answer}])))
+
+    async def exercise():
+        assert await send(text=_relay()) == (200, _owed(text, resolved=True))
+        assert await send(text=_relay()) == (200, _owed(text, resolved=True))  # replayed as published
+
+    asyncio.run(exercise())
+    [receipt] = ingress.receipts()
+    assert receipt["response"]["terminal_text"] == text
+
+
+@pytest.mark.parametrize("text, outcome, closes", [
+    ('{"output":"operation failed", "exit_code":1, "error":null}', "failed", False),
+    ('{"success":false,"message":"operation failed"}', "failed", False),
+    ('{"ok": true}', "failed", False),       # a result that reads fine, recorded failed
+    ('{"ok": true}', "refused", False),
+    ('{"ok": true}', None, False),           # nothing recorded: not a success
+    ('{"error": "an error is the data here"}', "ok", True),  # a result that reads as an error, recorded ok
+])
+def test_failed_tool_result_cannot_close(ingress, send, monkeypatch, text, outcome, closes):
+    """Review: only a truthy JSON ``error`` counted as failure, so a nonzero exit code or ``success: false``
+    closed an instruction. What counts is the outcome the executor recorded on the call's result row, where
+    the batch result is produced; the result text is never parsed."""
+    _entitle()
+    _transcript(_owner_record())
+    _scripted(ingress, monkeypatch, ("The operation is done.", _work(out=text, outcome=outcome), _resolve("done")))
+
+    async def exercise():
+        assert await send(text=_relay()) == (200, _owed("The operation is done.", **({"resolved": True} if closes else {})))
+
+    asyncio.run(exercise())
+
+
+def test_refused_recovery_call_is_not_real_evidence(ingress, send, monkeypatch):
+    """A call the reply-only recovery turn made and the executor refused did nothing, so it cannot be cited."""
+    from types import SimpleNamespace
+
+    from agent.tool_executor import append_peer_refusals
+    from tools.relay_resolve_tool import reset_reply_only, set_reply_only
+
+    rows = []
+    call = SimpleNamespace(id="call-9", function=SimpleNamespace(name="terminal", arguments='{"command": "rm x"}'))
+    token = set_reply_only(True)
+    try:
+        append_peer_refusals(SimpleNamespace(), [call], rows)
+    finally:
+        reset_reply_only(token)
+    assert rows[0]["_tool_outcome"] == "refused"  # recorded where the executor produces the refusal
+    _entitle()
+    _transcript(_owner_record())
+    refused = ("terminal", {"command": "rm x"}, rows[0]["content"], "call-9", rows[0]["_tool_outcome"])
+    _scripted(ingress, monkeypatch, ("ACK",), ("The operation is done.", refused,
+                                               _resolve("done", [{"tool_call_id": "call-9"}])))
+
+    async def exercise():
+        assert await send(text=_relay()) == (200, _owed("ACK"))
+        assert await send(text=_relay()) == (200, _owed("The operation is done."))  # recovery turn: still owed
+
+    asyncio.run(exercise())
+    assert len(ingress.actor.calls) == 2
+
+
+def test_resolved_silent_owner_can_recover_reply(ingress, send, monkeypatch):
+    """Review: ``resolved: true`` was recorded though the owner turn ended silent, so no reply-only recovery
+    ran and the event stayed owed forever. Resolved counts only with a published reply: a declared but silent
+    turn stays owed, keeps its declaration, and its redelivery's reply-only turn is given it and publishes."""
+    _entitle()
+    _transcript(_owner_record())
+    _scripted(ingress, monkeypatch, ("[SILENT]", _work(), _resolve("done")),
+              ("The project is stopped.", _resolve("done")))
+
+    async def exercise():
+        assert await send(text=_relay()) == (
+            200, {"event_id": "event", "text": "[SILENT]", "disposition": "owner_relay", "silent": True})
+        [receipt] = ingress.receipts()
+        assert "resolved" not in receipt["response"] and "outcome" not in receipt["response"]
+        assert receipt["response"]["declared"] == {"outcome": "done", "answers": []}
+        assert await send(text=_relay()) == (200, _owed("The project is stopped.", resolved=True))
+        assert len(ingress.actor.calls) == 2
+        assert await send(text=_relay()) == (200, _owed("The project is stopped.", resolved=True))  # replayed
+        assert len(ingress.actor.calls) == 2
+
+    asyncio.run(exercise())
+    second = ingress.actor.model_inputs[1]
+    assert "reply-only" in second and "declared" in second and "published no reply" in second
+
+
 def test_relay_resolve_survives_the_real_turn_starts_tools_freeze_and_is_not_carried_into_other_turns(
         ingress, send, monkeypatch):
     """CEO: prove the declaration survives ``restore_agent_tool_prefix``, the tools-freeze merge every turn
@@ -388,7 +494,7 @@ def test_a_failed_call_of_the_earlier_turn_is_recorded_told_and_never_citable(in
     failed, and a declaration cannot cite it."""
     _entitle()
     _transcript(_owner_record())
-    _scripted(ingress, monkeypatch, ("ACK", _work(out='{"error": "no such run"}')),
+    _scripted(ingress, monkeypatch, ("ACK", _work(outcome="failed")),
               ("정리했습니다.", _resolve("done", [{"tool_call_id": "call-1"}])))
 
     async def exercise():

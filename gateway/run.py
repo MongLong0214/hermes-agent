@@ -3634,7 +3634,7 @@ class GatewayRunner(
         The owner turn alone has the ``relay_resolve`` declaration (tools/relay_resolve_tool.py), bound to this
         event. ``earlier_calls`` (the calls an earlier turn of this event made, as its receipt recorded them)
         makes it a reply-only recovery turn: it may run nothing but that declaration, so recovering the reply
-        never repeats the work. Its declaration is judged from its own rows (``accepted_outcome``).
+        never repeats the work. Its declaration is judged from its own rows (``accepted_declaration``).
         ``owed_kind`` (the disposition of a post the bound canonical CTO declared a question, ruling request or
         conflict) gives a peer turn the same declaration, for this event alone: its grant names the event, its
         tool surface carries the tool, and it is told it owes the declaration."""
@@ -3934,11 +3934,12 @@ class GatewayRunner(
                     if not opening_row_is_this_relay(result.get("messages"), boundary, relay_meta, peer_prompt):
                         raise ValueError("canonical_turn_refused")
                     from dataclasses import replace as _replace
-                    from gateway.owner_relay import accepted_outcome, turn_calls
+                    from gateway.owner_relay import accepted_declaration, turn_calls
+                    declaration = accepted_declaration(result.get("messages"), boundary, event_id=event.event_id,
+                                                       earlier=earlier_calls or ())
                     return _replace(
                         selected, calls=tuple(turn_calls(result.get("messages"), boundary)),
-                        outcome=accepted_outcome(result.get("messages"), boundary, event_id=event.event_id,
-                                                 earlier=earlier_calls or ()))
+                        outcome=declaration[0] if declaration else None, answers=declaration[1] if declaration else ())
                 try:
                     facts = turn_provenance(
                         result.get("messages"), history_boundary=boundary, peer=peer, body=event.text,
@@ -3949,11 +3950,12 @@ class GatewayRunner(
                     raise ValueError("canonical_turn_refused")
                 if owed_kind is not None:
                     from dataclasses import replace as _replace
-                    from gateway.owner_relay import accepted_outcome
+                    from gateway.owner_relay import accepted_declaration
                     from tools.relay_resolve_tool import PEER_OUTCOMES
-                    return _replace(selected, outcome=accepted_outcome(
-                        result.get("messages"), boundary, event_id=event.event_id, allowed=PEER_OUTCOMES,
-                        need_answer=True))
+                    declaration = accepted_declaration(result.get("messages"), boundary, event_id=event.event_id,
+                                                       allowed=PEER_OUTCOMES, need_answer=True)
+                    return _replace(selected, outcome=declaration[0] if declaration else None,
+                                    answers=declaration[1] if declaration else ())
                 return selected
             finally:
                 for name, value in outward_callbacks.items():
