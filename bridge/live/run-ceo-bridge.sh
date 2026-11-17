@@ -24,7 +24,7 @@ unset BUZZ_ACP_CHANNELS
 bash "$B/preflight.sh" || true
 HOSTPORT="$(cat "$B/relay-host.txt" 2>/dev/null || echo "172.30.1.88:3000")"
 export BUZZ_RELAY_URL="${BUZZ_RELAY_URL:-wss://${HOSTPORT}}"
-export BUZZ_PRIVATE_KEY="$(cat "$B/keys/ceo2.priv")"
+export BUZZ_PRIVATE_KEY="$(cat "$B/keys/ceo.priv")"
 export BUZZ_ACP_AGENT_OWNER="$(cat "$B/keys/owner.pub")"
 # buzz-acp freezes the pubkey allowlist at startup. Let events reach the canonical gateway,
 # which checks explicit (author, room) grants per request; private relay membership remains required.

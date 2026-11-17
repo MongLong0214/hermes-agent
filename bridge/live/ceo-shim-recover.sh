@@ -11,7 +11,7 @@ B="$HOME/.hermes/bridge"
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:$B/bin:$HOME/.local/bin:/opt/homebrew/bin:${PATH:-}"
 HOSTPORT="$(cat "$B/relay-host.txt" 2>/dev/null || echo "172.30.1.88:3000")"
 export BUZZ_RELAY_URL="${BUZZ_RELAY_URL:-wss://${HOSTPORT}}"
-export BUZZ_PRIVATE_KEY="$(cat "$B/keys/ceo2.priv")"
+export BUZZ_PRIVATE_KEY="$(cat "$B/keys/ceo.priv")"
 export BUZZ_ACP_AGENT_OWNER="$(cat "$B/keys/owner.pub")"
 if [ -z "${API_SERVER_KEY:-}" ]; then
   API_SERVER_KEY=$(sed -n "s/^API_SERVER_KEY=//p" "$HOME/.hermes/.env" | head -1 | tr -d "\"'")
