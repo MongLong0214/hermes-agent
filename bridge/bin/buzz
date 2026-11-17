@@ -1,0 +1,180 @@
+#!/bin/bash
+# buzz — 자격증명을 스스로 주입하는 진입점. ~/.local/bin/buzz 로 설치된다.
+#
+# 왜 여기냐. `~/.hermes/bridge/bin/buzz` 에 같은 래퍼가 이미 있었는데, 그 디렉터리가
+# 아무 PATH 에도 없다. CEO 셸이 `buzz` 를 부르면 ~/.local/bin 이 먼저 잡히고, 거기는
+# 앱 번들 바이너리로 가는 순수 심링크였다. 그래서 래퍼는 있는데 아무도 지나지
+# 않았다 — 이름이 적힌 자리와 실제로 통과하는 자리가 달랐다.
+#
+# 관측: 2026-08-21, CEO 가 #658 검토를 마치고도 Buzz 회신을 못 냈다. 사유는
+# "셸에 BUZZ_PRIVATE_KEY 가 없음". 같은 서명이 2026-08-15 에도 있었고 그때는 11시간
+# 동안 596회 실패했다. 두 번 다 원인은 환경변수 상속이었고, 두 번 다 재시작으로
+# 덮었다. 재시작은 다음 재시작까지만 유효하다.
+#
+# 신원 규칙 — 조용한 사칭을 막는 것이 이 파일의 두 번째 목적이다.
+#   1. BUZZ_PRIVATE_KEY 가 이미 있으면 그대로 쓴다. 명시적으로 정한 쪽이 이긴다.
+#   2. 없으면 BUZZ_IDENTITY 가 고르는 keys/<id>.priv 를 쓴다.
+#   3. 둘 다 없으면 ceo 로 떨어진다. 이 파일의 주 호출자가 CEO 셸이고, 기본을
+#      바꾸면 CEO 답장이 조용히 다른 이름으로 나간다. CEO 키는 keys/ceo.priv 하나뿐이다.
+#      예전 기본값이던 폐기 키는 keys/ 에 없으므로 그 이름을 대면 키 없음으로 거부된다.
+#
+# 3번은 사람이 맨손으로 `buzz` 를 치면 CEO 이름으로 서명한다는 뜻이다. 그래서 그
+# 경우에만 경고한다 — stderr 가 TTY 인지로 구분한다. CEO 의 서브셸은 TTY 가 아니라
+# 조용히 지나가고, 사람은 자기가 누구로 서명하는지 보게 된다.
+#
+# 원본 바이너리는 buzz-raw 로 그대로 남아 있다. 되돌리려면:
+#   ln -sfn "$(cat ~/.local/bin/.buzz.symlink-target.bak)" ~/.local/bin/buzz
+set -uo pipefail
+
+REAL="$(cat "$HOME/.local/bin/.buzz.symlink-target.bak" 2>/dev/null || true)"
+[ -x "$REAL" ] || REAL="/Applications/Buzz.app/Contents/MacOS/buzz"
+B="$HOME/.hermes/bridge"
+
+if [ -z "${BUZZ_PRIVATE_KEY:-}" ]; then
+  # 에이전트 셸은 폴백을 못 쓴다 — 여기서 죽는다.
+  #
+  # 관측: 2026-08-25, CTO 세션이 맨손으로 `buzz` 를 불러 hermes P0 복구 통지, S7 레이어
+  # 충돌 경고, S7 PREFLIGHT 패킷과 정정본, S7 GATE 조사 결과를 전부 **CEO 이름으로**
+  # 발행했다. 원일이 화면을 보고 지적할 때까지 아무도 몰랐다.
+  #
+  # 아래 TTY 경고가 왜 못 막았나. 경고는 `[ -t 2 ]` 로 사람만 대상으로 한다. 에이전트
+  # 셸은 stderr 가 TTY 가 아니라 조용히 통과한다 — 즉 **경고가 닿지 않는 유일한 부류가
+  # 정확히 사고를 내는 부류였다.** 경고는 사람에게 남기고, 에이전트에게는 거부를 준다.
+  #
+  # CLAUDECODE 로 가르는 이유: CEO 경로(hermes acp / gateway)에는 이 변수가 없다.
+  # 2026-08-25 실측으로 PID 46947·47121 양쪽 모두 0 건을 확인하고 골랐다. CEO 가 답장을
+  # 못 내는 사고(2026-08-15 11시간 596회, 2026-08-21 재발)를 이 가드가 되살리지 않게
+  # 하는 것이 조건 선택의 전부다. 명시적으로 BUZZ_IDENTITY=ceo 를 준 호출은 통과한다.
+  if [ -n "${CLAUDECODE:-}" ] && [ -z "${BUZZ_IDENTITY:-}" ]; then
+    # 대상 채널에서 신원을 역산한다. CTO 세션은 언제든 생성·교체·제거되므로
+    # 세션 설정이나 cwd 에 신원을 박아두면 그 세션이 사라질 때 같이 사라진다.
+    # 반면 "어느 방에 말하는가" 는 항상 argv 에 있고, 릴레이의 채널 멤버십이
+    # 이미 그 방의 CTO 가 누구인지 알고 있다. 그래서 맵은 관리 대상이 아니라
+    # 파생물이다 — 없으면 그 자리에서 다시 만든다.
+    CH=""
+    _prev=""
+    for _a in "$@"; do
+      [ "$_prev" = "--channel" ] && CH="$_a" && break
+      case "$_a" in --channel=*) CH="${_a#--channel=}"; break;; esac
+      _prev="$_a"
+    done
+
+    # 맵 파일은 캐시일 뿐 권위가 아니다. 호출마다 로스터에서 다시 만들고, 만들지 못하면
+    # (로스터를 못 읽음, 별칭이 모호함, 스크립트 없음) 남아 있는 옛 항목을 쓰지 않고 거부한다.
+    # 폐기·미등록 방은 새 맵에 없으므로 같은 경로로 거부된다.
+    MAP="$B/channel-cto.map"
+    RESOLVED=""
+    if [ -n "$CH" ] && [ -x "$B/buzz-identity-map.sh" ] && "$B/buzz-identity-map.sh" >/dev/null 2>&1; then
+      RESOLVED="$(awk -v c="$CH" '$1==c {print $2; exit}' "$MAP" 2>/dev/null)"
+    fi
+
+    if [ -n "$RESOLVED" ]; then
+      BUZZ_IDENTITY="$RESOLVED"
+      printf 'buzz: 채널 %s -> %s 로 서명합니다.\n' "$CH" "$BUZZ_IDENTITY" >&2
+    else
+      printf '{"error":"identity_error","message":"agent shell could not resolve an identity for channel=%s. set BUZZ_IDENTITY explicitly (available: %s), or add the channel to %s. refusing to fall back to the CEO.","retryable":false}\n' \
+        "${CH:-<none>}" \
+        "$(ls "$B/keys/"*.priv 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/\.priv$//' | paste -sd, - )" \
+        "$MAP" >&2
+      exit 3
+    fi
+  fi
+  IDENTITY="${BUZZ_IDENTITY:-ceo}"
+  KEY_FILE="$B/keys/${IDENTITY}.priv"
+  if [ -r "$KEY_FILE" ]; then
+    BUZZ_PRIVATE_KEY="$(cat "$KEY_FILE")"
+    export BUZZ_PRIVATE_KEY
+    if [ -z "${BUZZ_IDENTITY:-}" ] && [ -t 2 ]; then
+      printf 'buzz: BUZZ_PRIVATE_KEY 도 BUZZ_IDENTITY 도 없어 %s 로 서명합니다.\n' "$IDENTITY" >&2
+    fi
+  else
+    # 이름을 대고 죽는다. 조용히 기본으로 되돌아가면 요청한 역할이 아닌 이름으로
+    # 발행되고, 그것이 이 파일이 막으려는 사고다.
+    printf '{"error":"identity_error","message":"no key for BUZZ_IDENTITY=%s (%s)","retryable":false}\n' \
+      "$IDENTITY" "$KEY_FILE" >&2
+    exit 3
+  fi
+fi
+
+# 에이전트 셸(CLAUDECODE)은 어떤 경로로도 CEO 키로 서명하지 못한다. 위 블록은 BUZZ_PRIVATE_KEY 가
+# 이미 있으면 통째로 건너뛰고 buzz 는 --private-key 도 받으므로, 최종 키를 여기서 한 번 더 본다.
+# 개인키가 아니라 공개키로 비교한다 — 16진 표기(대소문자)나 별칭이 달라도 같은 키면 같은 공개키다.
+# 키는 64자리 16진 또는 bech32 nsec 이다. 공개키를 계산하지 못하거나(디코드 실패 포함)
+# keys/ceo.pub 가 없으면 CEO 가 아님을 증명하지 못한 것이므로 거부한다.
+# CEO 경로(CLAUDECODE 없음)는 건드리지 않는다.
+#
+# 한계: 이것은 에이전트 셸의 실수(2026-08-25 사고)를 막는 가드이지 같은 계정의 고의 우회를
+# 막는 장치가 아니다. 같은 uid 의 프로세스는 CLAUDECODE 를 지우거나 keys/ceo.priv 를 읽어
+# 원본 buzz 를 직접 부를 수 있고, 키 파일이 그 uid 에 읽히는 한 래퍼는 이를 막지 못한다.
+_refuse_ceo_key() {
+  printf '%s' "$1" | python3 -I -c '
+import re, sys
+from pathlib import Path
+P = 2**256 - 2**32 - 977
+N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+G = (0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+     0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8)
+def add(a, b):
+    if a is None or b is None:
+        return a or b
+    if a[0] == b[0] and (a[1] + b[1]) % P == 0:
+        return None
+    m = (3 * a[0] * a[0] * pow(2 * a[1], -1, P) if a == b else (b[1] - a[1]) * pow(b[0] - a[0], -1, P)) % P
+    x = (m * m - a[0] - b[0]) % P
+    return (x, (m * (a[0] - x) - a[1]) % P)
+def nsec(text):
+    text = text.lower() if text == text.upper() else text
+    chars = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+    hrp, _, rest = text.rpartition("1")
+    if hrp != "nsec" or len(rest) != 58 or any(c not in chars for c in rest):
+        raise ValueError
+    data = [chars.index(c) for c in rest]
+    c = 1
+    for v in [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp] + data:
+        top, c = c >> 25, ((c & 0x1FFFFFF) << 5) ^ v
+        for i in range(5):
+            c ^= (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)[i] if (top >> i) & 1 else 0
+    bits = "".join("%05d" % int(bin(v)[2:]) for v in data[:-6])
+    if c != 1 or len(bits) != 260 or bits[256:] != "0000":
+        raise ValueError
+    return "%064x" % int(bits[:256], 2)
+key = sys.stdin.read().strip()
+try:
+    ceo_pub = (Path(sys.argv[1]) / "keys" / "ceo.pub").read_text().strip().lower()
+    if key[:5].lower() == "nsec1":
+        key = nsec(key)
+    if not re.fullmatch("[0-9a-fA-F]{64}", key) or not re.fullmatch("[0-9a-f]{64}", ceo_pub):
+        sys.exit(2)
+    d, point, bit = int(key, 16), None, G
+    if not 0 < d < N:
+        sys.exit(2)
+    while d:
+        if d & 1:
+            point = add(point, bit)
+        bit, d = add(bit, bit), d >> 1
+    sys.exit(0 if "%064x" % point[0] == ceo_pub else 1)
+except Exception:
+    sys.exit(2)
+' "$B" 2>/dev/null
+  [ $? -eq 1 ] && return 0
+  printf '{"error":"identity_error","message":"agent shell may not sign as the CEO, and this key could not be shown to be a different key (keys/ceo.pub).","retryable":false}\n' >&2
+  exit 3
+}
+if [ -n "${CLAUDECODE:-}" ]; then
+  [ -n "${BUZZ_PRIVATE_KEY:-}" ] && _refuse_ceo_key "$BUZZ_PRIVATE_KEY"
+  _prev=""
+  for _a in "$@"; do
+    [ "$_prev" = "--private-key" ] && _refuse_ceo_key "$_a"
+    case "$_a" in --private-key=*) _refuse_ceo_key "${_a#--private-key=}";; esac
+    _prev="$_a"
+  done
+fi
+
+if [ -z "${BUZZ_RELAY_URL:-}" ]; then
+  # relay-host.txt 에는 스킴이 없다. 그냥 붙이면 relay 가 400 을 준다
+  # ("Client sent an HTTP request to an HTTPS server").
+  BUZZ_RELAY_URL="wss://$(cat "$B/relay-host.txt" 2>/dev/null || echo 172.30.1.88:3000)"
+  export BUZZ_RELAY_URL
+fi
+
+exec python3 "$B/buzz-mention-enforce.py" "$REAL" "$@"

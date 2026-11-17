@@ -22,7 +22,7 @@ def test_staged_scripts_generate_unbounded_subscriptions_and_complete_atomic_map
     (bridge / 'keys/owner.pub').write_text(OWNER)
     (bridge / 'keys/cto-local.pub').write_text(CTO)
     # Pure fixture bytes, never copied from real signing material.
-    (bridge / 'keys/ceo2.priv').write_text('fixture-only')
+    (bridge / 'keys/ceo.priv').write_text('fixture-only')
     (bridge / 'preflight.sh').write_text('exit 0\n')
     (bridge / 'relay-host.txt').write_text('relay.invalid:3000')
     (bridge / 'bin/buzz-acp').write_text('#!/bin/bash\nexec "' + sys.executable + '" -c '\
