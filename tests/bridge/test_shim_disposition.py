@@ -11,11 +11,27 @@ import hashlib
 import importlib.util
 import json
 import os
+import sys
 import urllib.request
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from test_shim_canary import OTHER
 from test_shim_publish_retry import (  # noqa: F401 - the shim fixture is this module's too
-    _SHIM, CHANNEL, EVENT_A, EVENT_B, PEER, SIGNER, ask, body, calls, final, log_text, plan, posts, record, shim)
+    _FAKE, _SHIM, CHANNEL, EVENT_A, EVENT_B, PEER, SIGNER, ask, body, calls, final, log_text, plan, posts, record,
+    shim)
+# The real coordinator under a tmp home, and the shim wired to it (its fixtures, not copies).
+from test_shim_text_cap_notice import _pin_the_module_home  # noqa: F401
+from test_shim_text_cap_notice import CHANNEL as GW_CHANNEL
+from test_shim_text_cap_notice import EVENT as GW_EVENT
+from test_shim_text_cap_notice import OTHER as GW_BRIDGE
+from test_shim_text_cap_notice import SIGNER as GW_CTO
+from test_shim_text_cap_notice import drive as gw_drive
+from test_shim_text_cap_notice import entry as gw_entry
+from test_shim_text_cap_notice import gw  # noqa: F401
+from test_shim_text_cap_notice import shim as gw_shim  # noqa: F401
+from test_shim_text_cap_notice import thread_prompt
 
 
 class _Gateway(str):
@@ -98,7 +114,7 @@ def test_a_send_that_cannot_be_read_back_is_never_complete_and_never_sent_twice(
 def test_a_reply_to_another_event_does_not_complete_this_one(shim):
     """The wrapper exits 0, but the only matching post in the thread replies to another event."""
     with open(shim.state / "relay.jsonl", "w") as handle:
-        handle.write(json.dumps({"id": "9" * 64, "pubkey": SIGNER, "kind": 9, "content": body(EVENT_A),
+        handle.write(json.dumps({"id": "9" * 64, "pubkey": OTHER, "kind": 9, "content": body(EVENT_A),
                                  "created_at": 1, "tags": [["e", EVENT_B, "", "reply"]]}) + "\n")
     plan(shim, "send", EVENT_A, {"posts": False})
     _gateway_answers(shim, f"answer for {EVENT_A}", "ruling")
@@ -211,14 +227,15 @@ def test_a_failed_send_is_still_resent_once_a_complete_read_shows_it_absent(shim
 
 # ---- review r2 -------------------------------------------------------------------------------------------
 
-def _journal(shim, event_id, **fields):
-    """A journal entry as a shim left it: the base shim's own shape, plus *fields*."""
+def _journal(shim, event_id, *, slot="", **fields):
+    """A journal entry as a shim left it: the base shim's own shape (no disposition), plus *fields*, in the
+    event's journal slot (``slot`` ``.answer``: the slot a refused event's one terminal answer takes)."""
     entry = {"journal": 2, "sent": True, "state": "sent", "delivery": "posted", "kind": "answer",
              "event_id": event_id, "ref": None, "channel": CHANNEL, "roster_generation": None,
              "reply_to": event_id, "reason": "exit 0:", "attempts": 1, "at": "2026-11-16T00:00:00+0000"}
     entry.update(fields)
     os.makedirs(shim.PUBLISHED, exist_ok=True)
-    with open(os.path.join(shim.PUBLISHED, event_id), "w", encoding="utf-8") as handle:
+    with open(os.path.join(shim.PUBLISHED, event_id + slot), "w", encoding="utf-8") as handle:
         handle.write(json.dumps(entry) + "\n")
 
 
@@ -250,11 +267,10 @@ def test_recovery_keeps_an_unconfirmed_owed_event_recoverable(shim):
 
 
 def test_recovery_still_reads_an_event_that_is_not_owed_as_answered(shim):
-    _journal(shim, EVENT_A, body_sha256=_body_sha("hello"))  # the base shim's journal: no disposition
-    assert shim.recovery_delivery_state(EVENT_A) == "answered"
     _gateway_answers(shim, "hello", None)
     ask(shim, EVENT_B)
     final(shim, EVENT_B)
+    assert record(shim, EVENT_B)["disposition"] is None  # judged by the gateway, and not owed
     assert shim.recovery_delivery_state(EVENT_B) == "answered"
 
 
@@ -307,7 +323,6 @@ def test_a_base_journal_that_posted_silence_for_an_event_now_owed_is_reopened_an
     """Review r2: the base shim journaled ``[SILENT]`` plus an exit-0 send as the event's answer. The gateway
     now judges the event owed (live, or derived on replay): the answer marker is replaced by ``owed``."""
     _journal(shim, EVENT_A, body_sha256=_body_sha("[SILENT]"))
-    assert shim.recovery_delivery_state(EVENT_A) == "answered"  # what the base left
     _gateway_answers(shim, "[SILENT]", "owner_relay", silent=True)
     ask(shim, EVENT_A)
     done = record(shim, EVENT_A)
@@ -325,3 +340,226 @@ def test_a_base_journal_of_a_real_answer_is_not_reopened_by_the_silence_path(shi
     _gateway_answers(shim, "[SILENT]", "owner_relay", silent=True)
     ask(shim, EVENT_A)
     assert record(shim, EVENT_A)["kind"] == "answer" and posts(shim, EVENT_A) == []
+
+
+# ---- review r3 -------------------------------------------------------------------------------------------
+
+def _original(event_id, content="@ceo please do it"):
+    """The signed original recovery fetches from the relay by id (``canonical_batch.fetch_event``)."""
+    return {"id": event_id, "pubkey": SIGNER, "content": content, "tags": [["h", CHANNEL], ["p", OTHER]]}
+
+
+def _recover(shim, event_id):
+    """What batch recovery and ``recover`` do for one event: skip it when answered, else fetch its original
+    and deliver it through the same ``deliver_event``. Returns the ids it fetched."""
+    fetched = []
+
+    def lookup(wanted):
+        fetched.append(wanted)
+        return _original(wanted)
+
+    shim._batch.deliver_member(SimpleNamespace(**vars(shim)), "s", [], CHANNEL, event_id, lookup)
+    return fetched
+
+
+def test_recovery_fetches_the_original_of_an_answer_with_no_disposition_and_reopens_its_silence(shim):
+    """Review r3 (P1): a sent answer the base shim journaled has no disposition, so nothing says the event was
+    not owed. Recovery skipped it as answered before fetching the original, and the base's ``[SILENT]`` stayed
+    the event's answer. It reads as ``unverified``, and its original is fetched and judged like any event."""
+    _journal(shim, EVENT_A, body_sha256=_body_sha("[SILENT]"))
+    assert shim.recovery_delivery_state(EVENT_A) == "unverified"  # never answered
+    assert shim._batch.already_delivered(SimpleNamespace(**vars(shim)), EVENT_A) is False
+    _gateway_answers(shim, "[SILENT]", "owner_relay", silent=True)
+    assert _recover(shim, EVENT_A) == [EVENT_A]
+    done = record(shim, EVENT_A)
+    assert (done["kind"], done["disposition"], done["reply_state"]) == ("notice", "owner_relay", "owed")
+    assert shim.recovery_delivery_state(EVENT_A) == "owed"
+    [post] = posts(shim, EVENT_A)
+    assert "SILENT" not in post["content"] and EVENT_A in post["content"]
+
+
+def test_a_base_silence_in_the_answer_slot_is_reopened_by_redelivery(shim):
+    """Review r3 (P1): a refused event's one terminal answer lives in ``<event>.answer``. A base ``[SILENT]``
+    there survived redelivery, because only the first slot was looked at."""
+    _journal(shim, EVENT_A, kind="notice", preclaim=True, body_sha256=_body_sha("refusal notice"))
+    _journal(shim, EVENT_A, slot=".answer", body_sha256=_body_sha("[SILENT]"))
+    assert shim.recovery_delivery_state(EVENT_A) == "unverified"
+    _gateway_answers(shim, "[SILENT]", "owner_relay", silent=True)
+    ask(shim, EVENT_A)
+    done = record(shim, EVENT_A + ".answer")
+    assert (done["kind"], done["disposition"], done["reply_state"]) == ("notice", "owner_relay", "owed")
+    assert record(shim, EVENT_A)["kind"] == "notice" and "disposition" not in record(shim, EVENT_A)
+    assert shim.recovery_delivery_state(EVENT_A) == "owed"
+    [post] = posts(shim, EVENT_A)
+    assert "SILENT" not in post["content"]
+    ask(shim, EVENT_A, rpc_id=2)  # redelivered: the notice is told once
+    assert len(posts(shim, EVENT_A)) == 1
+
+
+def test_recovery_settles_a_legacy_answer_once_the_gateway_says_it_was_not_owed(shim):
+    _journal(shim, EVENT_A, body_sha256=_body_sha("hello"))
+    assert shim.recovery_delivery_state(EVENT_A) == "unverified"
+    _gateway_answers(shim, "hello", None)
+    assert _recover(shim, EVENT_A) == [EVENT_A]
+    assert record(shim, EVENT_A)["disposition"] is None and posts(shim, EVENT_A) == []  # nothing is posted
+    assert shim.recovery_delivery_state(EVENT_A) == "answered"
+    assert _recover(shim, EVENT_A) == []  # answered now: skipped, its original is not fetched again
+
+
+def test_a_legacy_answer_with_no_original_to_fetch_is_not_given_a_recovery_notice(shim):
+    _journal(shim, EVENT_A, body_sha256=_body_sha("hello"))
+    shim.refuse_recovery_event("s", [{"type": "text", "text": "x"}], EVENT_A, "original unavailable")
+    assert posts(shim, EVENT_A) == [] and "no new notice" in log_text(shim)
+
+
+def test_a_legacy_answer_of_an_owed_event_is_rechecked_against_the_thread_not_trusted(shim):
+    """The base shim journaled an exit 0 send with no read-back as the answer. Judged owed now, it is read
+    back, never reposted: found in the thread, it is confirmed; not found, it is unconfirmed and still owed."""
+    text = "중지했고 결과를 보고합니다."
+    with open(shim.state / "relay.jsonl", "w") as handle:
+        handle.write(json.dumps({"id": "8" * 64, "pubkey": OTHER, "kind": 9, "content": f"@{PEER} {text}",
+                                 "created_at": 1, "tags": [["e", EVENT_A, "", "reply"]]}) + "\n")
+    _journal(shim, EVENT_A, body_sha256=_body_sha(text))
+    _journal(shim, EVENT_B, reply_to=EVENT_B, body_sha256=_body_sha(text))  # the same text, never posted
+    _gateway_answers(shim, text, "owner_relay", resolved=True)
+    ask(shim, EVENT_A)
+    ask(shim, EVENT_B)
+    done = record(shim, EVENT_A)
+    assert (done["disposition"], done["reply_state"], done["sent"], done["resolved"]) == (
+        "owner_relay", "confirmed", True, True)
+    assert record(shim, EVENT_B)["reply_state"] == "unconfirmed" and record(shim, EVENT_B)["sent"] is False
+    assert [c for c in calls(shim) if c["cmd"] == "send"] == []  # nothing was posted again
+
+
+def test_redelivering_the_same_body_after_the_readbacks_expired_rechecks_the_thread_and_confirms(shim):
+    """Review r3 (P2): the post landed, every read-back failed, the retries ran out. The same body redelivered
+    was rejected before any read, so the post that exists stayed unconfirmed."""
+    plan(shim, "send", EVENT_A, {"posts": True})
+    plan(shim, "thread", EVENT_A, {"exit": 1})
+    _gateway_answers(shim, "done", "owner_relay", resolved=True)
+    ask(shim, EVENT_A)
+    first = final(shim, EVENT_A)
+    assert (first["reply_state"], first["sent"]) == ("unconfirmed", False) and len(posts(shim, EVENT_A)) == 1
+    ask(shim, EVENT_A, rpc_id=2)  # the thread is still unreadable: nothing changes, nothing is posted
+    again = record(shim, EVENT_A)
+    assert (again["reply_state"], again["sent"]) == ("unconfirmed", False)
+    plan(shim, "thread", EVENT_A, {})  # readable now
+    ask(shim, EVENT_A, rpc_id=3)
+    done = record(shim, EVENT_A)
+    assert (done["reply_state"], done["sent"], done["delivery"], done["resolved"]) == (
+        "confirmed", True, "posted", True)
+    assert len(posts(shim, EVENT_A)) == 1 and sum(c["cmd"] == "send" for c in calls(shim, EVENT_A)) == 1
+    assert shim.recovery_delivery_state(EVENT_A) == "answered"
+
+
+def test_a_same_body_recheck_that_finds_nothing_posts_nothing_and_stays_unconfirmed(shim, monkeypatch):
+    plan(shim, "send", EVENT_A, {"posts": False})  # exit 0, and it never lands
+    _gateway_answers(shim, "done", "owner_relay", resolved=True)
+    ask(shim, EVENT_A)
+    assert final(shim, EVENT_A)["reply_state"] == "unconfirmed"
+    sends = sum(c["cmd"] == "send" for c in calls(shim, EVENT_A))
+    ask(shim, EVENT_A, rpc_id=2)
+    assert record(shim, EVENT_A)["reply_state"] == "unconfirmed"
+    assert sum(c["cmd"] == "send" for c in calls(shim, EVENT_A)) == sends and posts(shim, EVENT_A) == []
+
+
+@pytest.mark.parametrize("answer", ["", "   \n"])
+def test_an_owed_event_with_no_answer_text_is_not_posted_and_stays_owed(shim, answer):
+    """Review r3 (P2): a marker-only answer (nothing left once the gateway strips the declaration) is no
+    answer: it posts nothing of its own, and the thread is told the event is still owed."""
+    _gateway_answers(shim, answer, "owner_relay")
+    ask(shim, EVENT_A)
+    done = final(shim, EVENT_A)
+    assert (done["kind"], done["reply_state"]) == ("notice", "owed")
+    [post] = posts(shim, EVENT_A)
+    assert "RESOLVED" not in post["content"] and EVENT_A in post["content"]
+    assert shim.recovery_delivery_state(EVENT_A) == "owed"
+
+
+def _real_path(gw, gw_shim, monkeypatch, tmp_path, *answers):
+    """The shim wired to the real coordinator and a relayed owner instruction its CTO is entitled to relay;
+    turn n of the cached actor answers ``answers[n]`` (the last repeats). Returns what a test reads."""
+    import time
+
+    from tests.gateway.test_canonical_owner_relay import _entitle, _owner_record, _relay, _transcript
+
+    _entitle(actor=GW_CTO)
+    _transcript(_owner_record())
+
+    def run_conversation(text, *, conversation_history, task_id, **kwargs):
+        gw.runs.append(text)
+        final_text = answers[min(len(gw.runs), len(answers)) - 1]
+        user = {"role": "user", "content": text}
+        for key, name in (("display_kind", "persist_user_display_kind"),
+                          ("display_metadata", "persist_user_display_metadata")):
+            if kwargs.get(name):
+                user[key] = kwargs[name]
+        gw.actor._persist_user_message_idx = len(conversation_history)
+        return {"completed": True, "session_id": task_id, "final_response": final_text,
+                "messages": [*conversation_history, user, {"role": "assistant", "content": final_text}]}
+
+    monkeypatch.setattr(gw.actor, "run_conversation", run_conversation)
+    # A Buzz CLI that keeps its own thread, so the read-back sees exactly what landed.
+    state = tmp_path / "fake"
+    state.mkdir()
+    cli = Path(gw_shim.BUZZ_CLI)
+    cli.write_text(f"#!{sys.executable}\n" + _FAKE.format(state=str(state), signer=GW_BRIDGE, channel=GW_CHANNEL))
+    cli.chmod(0o755)
+    monkeypatch.setattr(gw_shim, "PUBLISH_RETRY_BACKOFF", (0.05,) * 5)
+
+    def thread():
+        path = state / "relay.jsonl"
+        return [json.loads(line)["content"] for line in path.read_text().splitlines()] if path.exists() else []
+
+    def journal():
+        return json.loads((Path(gw_shim.PUBLISHED) / GW_EVENT).read_text().splitlines()[0])
+
+    def settled():
+        end = time.monotonic() + 20
+        while journal().get("pending") is True and time.monotonic() < end:
+            time.sleep(0.02)
+        return journal()
+
+    return SimpleNamespace(prompt=thread_prompt([gw_entry(1, 20)], _relay()), thread=thread, settled=settled)
+
+
+def test_an_acknowledged_owner_relay_runs_a_new_owner_turn_on_redelivery_and_its_declared_answer_confirms(
+        gw, gw_shim, monkeypatch, tmp_path):
+    """Review r3 (P1), on the real path: the real coordinator, its HTTP handler and SQLite, and the shim.
+    The first turn only acknowledges; the event's redelivery runs a new owner turn on the same session; that
+    turn's declared answer is posted, read back and confirmed. No stub stands in for the gateway's replay."""
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, "ACK", "[RESOLVED]\n중지했고 결과를 보고합니다.")
+    gw_drive(gw_shim, real.prompt)
+    assert len(gw.runs) == 1 and real.thread() == ["@cto-repo-factory ACK"]
+    assert real.settled()["reply_state"] == "acknowledged"
+    assert gw_shim.recovery_delivery_state(GW_EVENT) == "owed"
+
+    gw_drive(gw_shim, real.prompt, rpc_id=2)  # buzz-acp redelivers the event
+    assert len(gw.runs) == 2  # the gateway ran a new owner turn instead of replaying the ACK
+    assert real.thread() == ["@cto-repo-factory ACK", "@cto-repo-factory 중지했고 결과를 보고합니다."]
+    done = real.settled()
+    assert (done["reply_state"], done["resolved"], done["sent"], done["disposition"]) == (
+        "confirmed", True, True, "owner_relay")
+    assert gw_shim.recovery_delivery_state(GW_EVENT) == "answered"
+
+    gw_drive(gw_shim, real.prompt, rpc_id=3)  # resolved: a terminal, replayed, and nothing is posted again
+    assert len(gw.runs) == 2 and len(real.thread()) == 2
+    assert "RESOLVED" not in " ".join(real.thread())
+
+
+def test_a_marker_only_owner_answer_posts_nothing_on_the_real_path_and_the_owed_event_runs_again(
+        gw, gw_shim, monkeypatch, tmp_path):
+    """Review r3 (P2): ``[RESOLVED]`` alone posted as ``@cto… [RESOLVED]``, and a resolved empty reply was
+    possible. It is no answer: nothing of it is posted, the thread is told the event is owed, and the
+    redelivery's new turn answers."""
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, "[RESOLVED]\n[RESOLVED]", "[RESOLVED]\n[RESOLVED]\n끝냈습니다.")
+    gw_drive(gw_shim, real.prompt)
+    [notice] = real.thread()
+    assert "RESOLVED" not in notice and GW_EVENT in notice
+    done = real.settled()
+    assert (done["kind"], done["reply_state"], done["disposition"]) == ("notice", "owed", "owner_relay")
+    gw_drive(gw_shim, real.prompt, rpc_id=2)  # redelivered: a new turn, and its answer is the reply
+    assert len(gw.runs) == 2
+    assert real.thread()[1:] == ["@cto-repo-factory 끝냈습니다."]
+    assert "RESOLVED" not in " ".join(real.thread())
+    assert gw_shim.recovery_delivery_state(GW_EVENT) == "answered"
