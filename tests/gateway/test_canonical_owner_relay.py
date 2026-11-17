@@ -283,7 +283,10 @@ def test_a_declaration_citing_what_the_turn_did_or_decided_resolves_the_relayed_
     ("public_reply_with_a_drive_path", ("ACK", _work(), _resolve("done", public_reply="Saved at C:/Users/isaac/export.json"))),
     ("public_reply_with_a_unc_path", ("ACK", _work(), _resolve("done", public_reply="Saved at \\\\server\\share\\export.json"))),
     ("public_reply_with_a_file_uri", ("ACK", _work(), _resolve("done", public_reply="Saved at file:///Users/isaac/export.json"))),
-    ("public_reply_with_a_root_dir", ("ACK", _work(), _resolve("done", public_reply="Look in /etc"))),
+    ("public_reply_with_a_path_after_a_colon", ("ACK", _work(), _resolve(
+        "done", public_reply="Output:/Users/isaac/private/export.json"))),
+    ("public_reply_with_a_spaced_path", ("ACK", _work(), _resolve("done", public_reply="Saved to /Customer Exports/private.json"))),
+    ("public_reply_with_a_slash_in_prose", ("ACK", _work(), _resolve("done", public_reply="Handled and/or deferred."))),
     ("public_reply_with_a_root_named_file", ("ACK", _work(), _resolve("done", public_reply="Saved at /private-report.json"))),
     # public_reply is required, and what is published is only ever it: a structural filter refuses private text.
     ("no_public_reply", ("ACK", _work(), _resolve("done", public_reply=None))),
@@ -436,6 +439,8 @@ def test_a_declared_public_answer_is_published_exactly(ingress, send, monkeypatc
 @pytest.mark.parametrize("public_reply", [
     "Saved to /Users/isaac/.hermes/private/customer-export.json",       # an absolute path
     "Saved to ~/private/out.txt", "Saved to C:\\Users\\isaac\\out.txt",
+    "Output:/Users/isaac/private/export.json", "Output:/x", "Saved to /Customer Exports/private.json",
+    "Saved to /customer_export", "Handled and/or deferred 1/2.", "Version 2.1/2.2 shipped",
     "Result of call-1 was ok",                                          # this turn's own tool call id
     "see call_a1b2c3d4e5f6", "see fc_0123456789abcdef01234567", "see toolu_0123456789abcdef", "see acp_call_3",
     "session 20261117_064935_ab12cd",                                   # a Hermes session id
@@ -461,8 +466,8 @@ def test_a_public_reply_carrying_a_path_or_id_is_refused_and_stays_owed(ingress,
 
 
 @pytest.mark.parametrize("public_reply", [
-    "The project is stopped; see https://example.com/runs/42 for the report.", "Handled and/or deferred 1/2.",
-    "Use /stop to cancel", "Version 2.1/2.2 shipped", "call me back after the freeze", "call_back is a word",
+    "The project is stopped; see https://example.com/runs/42 for the report.",
+    "Use /stop to cancel", "call me back after the freeze", "call_back is a word",
     "프로젝트를 중지했고 보고서는 스레드에 있습니다.",
 ])
 def test_a_public_reply_that_is_plain_prose_is_published(ingress, send, monkeypatch, public_reply):

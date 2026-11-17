@@ -94,10 +94,16 @@ def test_the_tool_has_a_required_public_reply_and_says_what_is_published():
     "Saved to ~/private/out.txt", "Saved to C:\\Users\\isaac\\out.txt", "(/Users/isaac/a)",
     # the review's forms: a drive with a forward slash, a UNC share, a single-segment root, a file: URI
     "Saved at C:/Users/isaac/private/export.json", "Saved at d:/x", "Saved at \\\\server\\private\\customer-export.json",
-    "Saved at \\\\host\\share", "Saved at /private-report.json", "Look in /etc", "Look in /tmp.", "see /var",
-    "see /Users", "see /home", "see /opt/x", "see /Volumes", "see /Library", "see /System", "see /private",
+    "Saved at \\\\host\\share", "Saved at \\\\", "Saved at /private-report.json", "see /opt/x", "see /etc/hosts",
     "Saved at /export.json", "Saved at file:///Users/isaac/private/export.json", "see file:/tmp/x",
-    "see FILE:///etc/hosts", "see file:relative.txt",
+    "see FILE:///etc/hosts", "see file:relative.txt", "the file: it is ready",
+    # one strict rule: any slash that is not part of an http(s) URL or a standalone /word command is refused
+    "Output:/Users/isaac/private/export.json", "Output:/x", "Saved to /Customer Exports/private.json",
+    "Saved to /customer_export", "Users/isaac/private/export.json", "see ./run.sh", "see ../x", "see a/b/c.txt",
+    "Handled and/or deferred", "Handled 1/2.", "Version 2.1/2.2 shipped", "TCP/IP", "a/b",
+    "see (/stop)", "see ('/ok')", "see x/stop", "/stop/", "/stop/x", "/stop.json", "/stop-all", "/stop_all", "/stop2",
+    "/abcdefghijklmnopq", "see /stop:/x", "see /Users/isaac/x?u=https://a.b", "Saved to https:///Users/isaac/x",
+    "see http://a.b/c and /Users/isaac/x", "see ahttps://a.b/c", "see https://a.b/c /Users/isaac/x",
     "see call_a1b2c3d4e5f6", "see call_ABCdef0123456789abcdefgh", "see fc_0123456789abcdef01234567",
     "see toolu_0123456789abcdef", "see acp_call_3",
     "session 20261117_064935_ab12cd", "session 20261117_064935_ab12cd34",
@@ -113,12 +119,14 @@ def test_public_reply_problem_refuses_a_path_or_an_id_this_codebase_issues(text)
 
 
 @pytest.mark.parametrize("text", [
-    "The project is stopped; see https://example.com/runs/42 for the report.", "Handled and/or deferred 1/2.",
-    "Use /stop to cancel", "Version 2.1/2.2 shipped", "call me back after the freeze", "call_back is a word",
+    "The project is stopped; see https://example.com/runs/42 for the report.",
+    "Use /stop to cancel", "call me back after the freeze", "call_back is a word",
     "프로젝트를 중지했고 보고서는 스레드에 있습니다.", "Fixed in 3 of 20260101 files", "ticket ab-12 closed",
-    "Use /stop.", "Run /status and /help", "http://example.com/a/b is up", "TCP/IP and a/b and 3/4", "meet at 5:30",
-    "the file: it is ready", "profile c: drive is unused", "a path-like word like private-report is fine",
-    "/stop", "/help me", "see ('/ok')",
+    "Use /stop.", "Run /status and /help", "http://example.com/a/b is up", "meet at 5:30",
+    "profile c: drive is unused", "a path-like word like private-report is fine",
+    "/stop", "/help me", "/STOP!", "Use /stop, then /status.", "Use /stop (or /help).", "Try /stop?",
+    "/abcdefghijklmnop", "Open HTTPS://Example.com/A/b. Then /stop", "see (https://example.com/a/b) and /stop;",
+    "/중지 로 취소",
 ])
 def test_public_reply_problem_lets_prose_through(text):
     from tools.relay_resolve_tool import public_reply_problem

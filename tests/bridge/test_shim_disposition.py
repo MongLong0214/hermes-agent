@@ -715,7 +715,9 @@ def test_private_evidence_is_not_published(gw, gw_shim, monkeypatch, tmp_path, e
 
 
 @pytest.mark.parametrize("public_reply", ["Saved to /Users/isaac/.hermes/private/customer-export.json",
-                                          "session 7b622a35-9409-4df4-bfe7-1e140ed238ba", "call_a1b2c3d4e5f6 passed"])
+                                          "session 7b622a35-9409-4df4-bfe7-1e140ed238ba", "call_a1b2c3d4e5f6 passed",
+                                          "Output:/Users/isaac/private/export.json",
+                                          "Saved to /Customer Exports/private.json"])
 def test_a_public_reply_carrying_a_path_or_id_is_refused_and_stays_owed_on_the_real_path(
         gw, gw_shim, monkeypatch, tmp_path, public_reply):
     real = _real_path(gw, gw_shim, monkeypatch, tmp_path,

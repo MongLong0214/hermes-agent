@@ -39,17 +39,27 @@ _MAX_EVIDENCE = 64
 PUBLIC_LABELS = {"done": "done", "answered": "answered", "declined": "declined", "deferred_with_reason": "deferred"}
 _MAX_PUBLIC_REPLY = 2_000
 
-# A public_reply may not carry what the codebase keeps private. Structural, by the shapes it issues, not words:
-_ROOTS = "Users|home|private|var|tmp|etc|opt|Volumes|Library|System"
-_PATH = re.compile(
-    r"(?<![\w/:.~-])/(?:[\w.@+~-]+/)+[\w.@+~-]*"                  # an absolute path of two or more segments (not a URL's)
-    rf"|(?<![\w/:.~-])/(?:{_ROOTS})(?![A-Za-z0-9])"                 # a single-segment path at a known root: /etc, /private-x
-    r"|(?<![\w/:.~-])/[\w@+~-]+\.[A-Za-z0-9]{1,8}\b"                 # a file at the root: /export.json (/stop passes)
-    r"|(?<!\w)~/[\w.@+~/-]+"                                       # a home-relative path
-    r"|(?<![A-Za-z0-9])[A-Za-z]:[/\\]"                              # a drive path: C:/ or C:\
-    r"|(?<![\w\\])\\\\[\w.$-]"                                   # a UNC path: \\server
-    r"|\bfile:(?=\S)",                                             # any file: URI
-    re.IGNORECASE)
+# A public_reply may not carry what the codebase keeps private. One strict rule for paths, not a list of roots:
+# a backslash pair, a drive letter before a colon and a slash or backslash, ``file:`` and ``~/`` are refused outright;
+# so is ANY other "/" that is not part of an http(s) URL or a standalone ``/word`` command (letters only, at most 16,
+# whitespace or the start before it, whitespace, the end or punctuation then whitespace or the end after it).
+# ``a/b``, ``and/or`` and ``TCP/IP`` are refused too, and so is a single-word path such as ``/export.json``.
+_PATH = re.compile(r"\\\\|[A-Za-z]:[/\\]|\bfile:|~/", re.IGNORECASE)
+_URL = re.compile(r"\bhttps?://[^\W_][^\s\\]*", re.IGNORECASE)
+_COMMAND = re.compile(r"(?<!\S)/[^\W\d_]{1,16}(?=[.,;:!?)\]}'\"]*(?:\s|\Z))")
+
+
+_MASK = "\x00"
+
+
+def _holds_path(text: str) -> bool:
+    # A masked URL or command leaves a mark that is neither a space nor a slash, so whatever stands against it is
+    # not a standalone command, and any slash still left is a path. The URL goes first: its own "s:/" is no drive.
+    rest = _URL.sub(_MASK, text)
+    return bool(_PATH.search(rest)) or "/" in _COMMAND.sub(_MASK, rest)
+
+
+
 _ID = re.compile(
     r"\b(?:call|fc|toolu)_[A-Za-z0-9]{8,}\b|\bacp_call_\d+\b"            # tool call ids (generated or a provider's)
     r"|\b\d{8}_\d{6}_[0-9a-f]{6,12}\b"                                 # hermes_state_ids.new_session_id
@@ -93,15 +103,16 @@ def reply_only_refuses(names: Iterable[str]) -> bool:
 
 
 def public_reply_problem(text: Any, known_ids: Iterable[str] = ()) -> Optional[str]:
-    """Why *text* may not be published, or None. Refused: nothing, over 2,000 characters, an absolute filesystem
-    path, an id of a shape this codebase issues (a tool call, a session, a receipt, a claim or a ledger key, a
-    claim owner or event id), or any of *known_ids* (the tool call ids of the turns concerned) as a whole id."""
+    """Why *text* may not be published, or None. Refused: nothing, over 2,000 characters, a path (a backslash pair, a
+    drive path, ``file:``, ``~/``, or any "/" outside an http(s) URL and a standalone ``/word`` command), an id of
+    a shape this codebase issues (a tool call, a session, a receipt, a claim or a ledger key, a claim owner or
+    event id), or any of *known_ids* (the tool call ids of the turns concerned) as a whole id."""
     if not isinstance(text, str) or not text.strip():
         return "it is empty"
     if len(text) > _MAX_PUBLIC_REPLY:
         return f"it is over {_MAX_PUBLIC_REPLY} characters"
-    if _PATH.search(text):
-        return "it holds a file path"
+    if _holds_path(text):
+        return "it holds a file path or a slash"
     if _ID.search(text):
         return "it holds an id (tool call, session, receipt or claim)"
     for known in known_ids:
@@ -136,8 +147,8 @@ SCHEMA = {
         "results), answered (the instruction asked a question), declined (you will not do it) or "
         "deferred_with_reason (it waits on something). What the thread is told is exactly '<outcome>: "
         "<public_reply>' (outcome as done, answered, declined or deferred): public_reply IS the answer, the "
-        "decision or the reason, one plain statement for the CTO, with no file path (/etc, C:/..., file://, a UNC "
-        "share) and no tool call, session, claim or receipt id; one that has any is refused and the instruction "
+        "decision or the reason, one plain statement for the CTO, with no slash except in an http(s) URL or a "
+        "standalone /command, no backslash pair, drive path, file: or ~/, and no tool call, session, claim or receipt id; one that has any is refused and the instruction "
         "stays open. evidence is internal, never published, and cites tool calls only: tool_call_id items naming "
         "tool results of this instruction's turns, required for done and optional otherwise; prose in evidence "
         "is never the answer."),
