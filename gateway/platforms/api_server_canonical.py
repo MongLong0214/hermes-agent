@@ -251,6 +251,8 @@ async def handle_canonical_surface_event(self, request: "web.Request") -> "web.R
 
         body["disposition"] = receipt.disposition
         body["silent"] = is_intentional_silence_response(receipt.terminal_text)
+        if receipt.resolved:
+            body["resolved"] = True  # the turn's own declaration; only it completes the owed reply
     return web.json_response(body)
 
 

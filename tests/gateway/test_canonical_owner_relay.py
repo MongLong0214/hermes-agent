@@ -184,6 +184,50 @@ def test_a_peer_message_is_never_owed_a_reply_by_what_it_says(ingress, send, mon
     assert "disposition" not in receipt["response"]
 
 
+@pytest.mark.parametrize("final, text, resolved", [
+    ("[RESOLVED]\n중지했고 결과는 아래와 같습니다.", "중지했고 결과는 아래와 같습니다.", True),
+    ("  [RESOLVED]  \r\n\n  ok  ", "ok", True),
+    ("중지했습니다. [RESOLVED]", "중지했습니다. [RESOLVED]", False),          # not the first line
+    ("확인했습니다.\n[RESOLVED]\n중지했습니다.", "확인했습니다.\n[RESOLVED]\n중지했습니다.", False),
+    ("[RESOLVED] 중지했습니다.", "[RESOLVED] 중지했습니다.", False),            # not a line of its own
+    ("[RESOLVED]", "[RESOLVED]", False),                                       # a declaration with no reply
+    ("[resolved]\nok", "[resolved]\nok", False),                               # exactly the marker
+])
+def test_the_turn_declares_a_relayed_instruction_resolved_only_by_a_marker_line_opening_its_answer(
+        ingress, send, monkeypatch, final, text, resolved):
+    """Review r2: what completes an owed reply is the CEO turn's own declaration, never the wording of its
+    answer. The owner turn is told how to make it; the gateway reads it only as the first line of the final
+    answer, strips it from the reply and records it with the receipt, so a replay reports it too."""
+    _entitle()
+    _transcript(_owner_record())
+    _answers(ingress, monkeypatch, final)
+    expected = {"event_id": "event", "text": text, "disposition": "owner_relay", "silent": False,
+                **({"resolved": True} if resolved else {})}
+
+    async def exercise():
+        assert await send(text=_relay()) == (200, expected)
+        assert await send(text=_relay()) == (200, expected)
+        assert len(ingress.actor.calls) == 1
+
+    asyncio.run(exercise())
+    [receipt] = ingress.receipts()
+    assert receipt["response"]["terminal_text"] == text
+    assert receipt["response"].get("resolved") is (True if resolved else None)
+    [model_input] = ingress.actor.model_inputs
+    assert "[RESOLVED]" in model_input and "otherwise" in model_input  # the owner turn is told the protocol
+
+
+def test_a_peer_answer_is_never_read_for_a_resolved_declaration(ingress, send, monkeypatch):
+    _entitle()
+    _transcript(_owner_record())
+    _answers(ingress, monkeypatch, "[RESOLVED]\nok")
+
+    async def exercise():
+        assert await send(text="보고: 끝났습니다.") == (200, {"event_id": "event", "text": "[RESOLVED]\nok"})
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("acp_state", ["still_provable", "gone"])
 def test_a_receipt_written_before_dispositions_existed_still_owes_the_relayed_reply(
         ingress, send, monkeypatch, acp_state):

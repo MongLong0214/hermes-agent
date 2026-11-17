@@ -63,6 +63,11 @@ REASONS = frozenset({
 })
 DISPLAY_KIND = "owner_relay"
 METADATA_KEY = "owner_relay"
+# The owner turn's own declaration that it handled the relayed instruction: a line holding exactly this opens
+# its final answer. The turn is told so (:func:`render_owner_turn`). It completes the reply the thread is owed;
+# no wording of an answer can (an acknowledgement is not told from an answer by its words), and nothing in a
+# message grants it.
+RESOLVED_MARKER = "[RESOLVED]"
 # One state_meta row per transcript record relayed: ``<prefix><session>:<record uuid>`` -> the receipt key.
 RECORD_LEDGER_PREFIX = "owner-relay-record:v1:"
 
@@ -99,6 +104,20 @@ class VerifiedRelay:
     record: str
     timestamp: str
     note: str
+
+
+def split_resolved(text: Any) -> tuple[Any, bool]:
+    """``(reply, True)`` when the first non-empty line of *text* is exactly :data:`RESOLVED_MARKER` and a reply
+    follows it, the marker line removed; ``(text, False)`` otherwise (the marker anywhere else, or alone, is
+    no declaration)."""
+    if not isinstance(text, str):
+        return text, False
+    lines = text.replace("\r\n", "\n").split("\n")
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first is None or lines[first].strip() != RESOLVED_MARKER:
+        return text, False
+    reply = "\n".join(lines[first + 1:]).strip()
+    return (reply, True) if reply else (text, False)
 
 
 def parse_relay(text: Any) -> Optional[RelayClaim]:
@@ -382,7 +401,9 @@ def render_owner_turn(relay: VerifiedRelay, metadata: Mapping[str, str]) -> str:
         f"CTO's Claude session {relay.session}, transcript record {relay.record} at {relay.timestamp}. It "
         "carries the owner's authority: act on it as if the owner had typed it here. Do not ask the owner "
         "to confirm, re-approve or retype it. Your answer goes to the Buzz thread it was relayed in; if a tool "
-        "or a permission refuses, report that refusal there, never as a request for the owner to approve again.\n"
+        "or a permission refuses, report that refusal there, never as a request for the owner to approve again. "
+        f"Begin your answer with a line holding exactly {RESOLVED_MARKER}, then your reply, only when you have "
+        "fully handled this instruction; otherwise answer without that line and the instruction stays open.\n"
         f"<<<owner-instruction:{nonce}>>>\n{relay.owner_text}\n<<<end-owner-instruction:{nonce}>>>"
     )
 

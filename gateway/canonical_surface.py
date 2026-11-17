@@ -496,6 +496,9 @@ class CanonicalReceiptResult:
     terminal_text: str | None = None
     failure: dict | None = None
     disposition: str | None = None
+    # The owner turn declared the instruction handled (gateway/owner_relay.py RESOLVED_MARKER); only with a
+    # disposition.
+    resolved: bool = False
 
 
 def _log_record_state(level: int, what: str, *, stage: str, binding: Any, event: Any, key: str,
@@ -932,8 +935,9 @@ class CanonicalReceiptCoordinator:
             if (parsed.get("state") == "terminal" and isinstance(response, dict)
                     and isinstance(response.get("terminal_text"), str)):
                 disposition = response.get("disposition")
-                return CanonicalReceiptResult("terminal", response["terminal_text"], None,
-                                              disposition if disposition in _DISPOSITIONS else None)
+                disposition = disposition if disposition in _DISPOSITIONS else None
+                return CanonicalReceiptResult("terminal", response["terminal_text"], None, disposition,
+                                              disposition is not None and response.get("resolved") is True)
         except ValueError as exc:
             if str(exc) == "canonical_receipt_conflict":
                 raise
@@ -1257,7 +1261,8 @@ class CanonicalReceiptCoordinator:
             def outcome(answer: CanonicalReceiptResult) -> dict[str, Any]:
                 return ({"failure": answer.failure} if answer.failure is not None else {"response": {
                     "binding_name": binding.name, "terminal_text": answer.terminal_text,
-                    **({"disposition": answer.disposition} if answer.disposition else {})}})
+                    **({"disposition": answer.disposition} if answer.disposition else {}),
+                    **({"resolved": True} if answer.resolved else {})}})
 
             def terminal_of(answer: CanonicalReceiptResult) -> str:
                 # Bound to this claim (its owner) and to this one write (a nonce no one holds before it
@@ -1414,11 +1419,17 @@ class CanonicalReceiptCoordinator:
                                                                              proof))
                         return kept
                 else:
+                    resolved = False
+                    if relay is not None and isinstance(result, CanonicalTurnResult):
+                        # The owner turn's own declaration leads its answer and is not part of the reply.
+                        from gateway.owner_relay import split_resolved
+                        reply, resolved = split_resolved(result.terminal_text)
+                        result = replace(result, terminal_text=reply)
                     answer = _result_answer(result, observation)
                     if relay is not None and answer.terminal_text is not None:
                         # The disposition is the gateway's own judgement of the event (its verified relay),
                         # recorded with the answer so a replay reports it too.
-                        answer = replace(answer, disposition=DISPOSITION_OWNER_RELAY)
+                        answer = replace(answer, disposition=DISPOSITION_OWNER_RELAY, resolved=resolved)
                     whole = result.terminal_text if isinstance(result, CanonicalTurnResult) else None
                 answer = record_or_keep(answer, whole)
             # The terminal (or the kept answer) is durable and a replay answers it, so this answer is

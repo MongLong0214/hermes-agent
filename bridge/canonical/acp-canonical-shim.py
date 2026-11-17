@@ -758,15 +758,19 @@ ANSWER_OWED = frozenset({"owner_relay", "question", "ruling", "conflict"})
 
 class Answer(str):
     """The gateway's answer text, with the disposition it recorded for the event and whether the answer is
-    the silence marker (``disposition`` None: the event is owed nothing)."""
+    the silence marker (``disposition`` None: the event is owed nothing) and whether the CEO turn declared the
+    event resolved (gateway/owner_relay.py RESOLVED_MARKER). Only that declaration completes an owed reply:
+    nothing in an answer's wording does."""
 
     disposition = None
     silent = False
+    resolved = False
 
-    def __new__(cls, text, disposition=None, silent=False):
+    def __new__(cls, text, disposition=None, silent=False, resolved=False):
         self = super().__new__(cls, text)
         self.disposition = disposition if isinstance(disposition, str) and disposition in ANSWER_OWED else None
         self.silent = silent is True and self.disposition is not None
+        self.resolved = resolved is True and self.disposition is not None
         return self
 
 
@@ -783,7 +787,8 @@ def submit(text, event_id, author, channel):
         answer = json.loads(response.read().decode())
         text = answer.get("text", "")
         # A malformed answer stays what it is, for the caller to refuse as it always has.
-        return Answer(text, answer.get("disposition"), answer.get("silent")) if isinstance(text, str) else text
+        return (Answer(text, answer.get("disposition"), answer.get("silent"), answer.get("resolved"))
+                if isinstance(text, str) else text)
 
 
 def _registry_peer(channel):
@@ -1100,27 +1105,6 @@ def _rewrite_publication(name, record):
             pass
 
 
-# Acknowledgement-only replies: they decide only whether an owed reply is complete (``acknowledged``, still owed),
-# never what anything is allowed to do. Compared whole, after the leading @mentions, punctuation, symbols and
-# emoji are dropped and the case folded, so a reply that says anything else is substantive.
-_ACKNOWLEDGEMENTS = frozenset({
-    "ack", "acknowledged", "ok", "okay", "k", "roger", "received", "noted", "got it", "copy", "yes", "yep",
-    "확인", "확인했습니다", "확인함", "접수", "접수했습니다", "수신", "수신했습니다", "알겠습니다", "알겠어요", "네", "넵", "예",
-})
-_LEADING_MENTIONS = re.compile(r"(?:@\S+\s*)+")
-
-
-def _acknowledgement_only(text):
-    """True when *text* is only an acknowledgement: nothing is left of it, or only a word of
-    ``_ACKNOWLEDGEMENTS``, once its leading mentions, punctuation, symbols, emoji and joiners are dropped."""
-    import unicodedata
-
-    stripped = _LEADING_MENTIONS.sub("", unicodedata.normalize("NFKC", text).strip(), count=1)
-    kept = "".join(" " if ch.isspace() else ch for ch in stripped
-                   if ch.isspace() or unicodedata.category(ch)[0] not in "PSMC")
-    return " ".join(kept.casefold().split()) in _ACKNOWLEDGEMENTS | {""}
-
-
 _RETRIES = []  # one daemon thread per answer whose post is still being retried; never joined
 _RETRIES_LOCK = threading.Lock()
 
@@ -1137,6 +1121,7 @@ def _retry_publication(name, record, body, digests, tag):
     # An owed reply is not done by a send that exited 0: only the thread showing it is. So "sent" is read
     # back like a failure, and never resent unless a complete read shows it absent.
     owes = bool(record.get("disposition")) and kind == "answer"
+    resolved = record.get("resolved") is True
     retryable = RETRYABLE_SEND_STATES + (("sent",) if owes else ())
     try:
         for delay in PUBLISH_RETRY_BACKOFF:
@@ -1169,7 +1154,7 @@ def _retry_publication(name, record, body, digests, tag):
     sent = state == "sent" and (found or not owes)
     _rewrite_publication(name, dict(record, sent=sent, state=state, delivery="posted" if sent else "failed",
                                     reason=str(reason)[:400], attempts=attempts, pending=False,
-                                    **({"reply_state": _reply_state(sent, body)} if owes else {}),
+                                    **({"reply_state": _reply_state(sent, resolved)} if owes else {}),
                                     **({"recovered": True} if found else {}),
                                     at=time.strftime("%Y-%m-%dT%H:%M:%S%z")))
     if found:
@@ -1185,16 +1170,52 @@ def _retry_publication(name, record, body, digests, tag):
         log(f"prompt {tag}… {kind} NOT posted (no retry) on attempt {attempts}: {state}: {reason}")
 
 
-def _reply_state(sent, body):
-    """An owed reply's journal state: ``confirmed`` only when the thread shows it and it says something,
-    ``acknowledged`` when the thread shows only an acknowledgement (still owed), else ``unconfirmed``."""
-    if not sent:
-        return "unconfirmed"
-    return "acknowledged" if _acknowledgement_only(body) else "confirmed"
+def _reply_state(sent, resolved):
+    """An owed reply's journal state: ``confirmed`` only when the thread shows it and the CEO turn declared the
+    event resolved, ``acknowledged`` when the thread shows a reply the turn did not declare resolved (still
+    owed, whatever the reply says), else ``unconfirmed``."""
+    return "unconfirmed" if not sent else "confirmed" if resolved else "acknowledged"
+
+
+def _reopens_owed_slot(name, body, resolved):
+    """Whether the journal ``PUBLISHED/<name>`` of an owed event may take another answer, and clear it if so:
+    its reply is not yet ``confirmed`` (acknowledged only, or never seen in the thread), no retry is pending
+    on it, and this is a different text, which is an answer the turn declared resolved or one for a reply the
+    thread never showed. The same text, a pending retry and a confirmed reply keep the one claim."""
+    prior = publication_record(name)
+    if not (prior.get("kind") == "answer" and prior.get("disposition") in ANSWER_OWED
+            and prior.get("pending") is not True and prior.get("body_sha256") != _sha256(body)
+            and (prior.get("reply_state") == "unconfirmed"
+                 or (prior.get("reply_state") == "acknowledged" and resolved))):
+        return False
+    try:
+        os.unlink(os.path.join(PUBLISHED, name))
+    except OSError:
+        return False
+    log(f"prompt {name[:12]}… owed reply was {prior.get('reply_state')}; taking this answer")
+    return True
+
+
+def reopen_base_silence(event_id, channel, answer):
+    """The base shim journaled ``[SILENT]`` and an exit 0 send as the answer of an event the gateway now judges
+    owed: that marker says answered, which it never was. It is cleared, so the event's one notice takes its
+    place (``owed``). Only that very record: this event's, an answer, no disposition, the silence text's body."""
+    prior, handle = publication_record(event_id), _peer_handle(channel)
+    silence = {_sha256(answer), _sha256(f"@{handle} {answer}")}
+    if not (prior.get("event_id") == event_id and prior.get("kind") == "answer" and prior.get("sent") is True
+            and "disposition" not in prior and prior.get("body_sha256") in silence
+            and not os.path.lexists(os.path.join(PUBLISHED, event_id + ".answer"))):
+        return False
+    try:
+        os.unlink(os.path.join(PUBLISHED, event_id))
+    except OSError:
+        return False
+    log(f"prompt {event_id[:12]}… journaled answered with silence by an earlier shim; owed now: reopened")
+    return True
 
 
 def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_to=None, preclaim=False,
-                  owed=None):
+                  owed=None, resolved=False):
     """Post *answer* once as the thread reply to *event_id*. True only when the wrapper sent it.
 
     The delivery journal is ``PUBLISHED/<event id>``: claimed before the send (one post per event,
@@ -1213,21 +1234,26 @@ def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_t
     *owed* (a disposition in ``ANSWER_OWED``): the event is owed a reply. Its answer is complete only when the
     thread, read back, shows this bridge's reply to this event (``_is_this_post``: its signer, its target, its
     body); a send that exited 0 is read back at once, and until the read shows the post the journal says
-    ``reply_state: unconfirmed`` and the retry reads before it ever resends. An owed notice (``kind`` notice)
-    is no reply: ``reply_state: owed``."""
+    ``reply_state: unconfirmed`` and the retry reads before it ever resends. It is ``confirmed`` only with
+    *resolved*, the CEO turn's own declaration that it resolved the event; a reply the thread shows without it
+    is ``acknowledged``, still owed, whatever it says. An owed notice (``kind`` notice) is no reply:
+    ``reply_state: owed``. The claim of an owed event is final only once ``confirmed``
+    (``_reopens_owed_slot``)."""
     name, target = (event_id, event_id) if event_id is not None else (ref, reply_to)
     if event_id is not None and not preclaim:
         name = outcome_key(event_id, channel)
     tag = name[:12] if event_id is not None else name
-    fd, why = _claim(name)
-    if fd is None:
-        log(f"prompt {tag}… reply already published once; not posting again" if why == "exists"
-            else f"prompt {tag}… reply not posted: {why}")
-        return False
     handle = _peer_handle(channel)
     body = f"@{handle} {answer}" if handle and not answer.lstrip().startswith(f"@{handle}") else answer
     digests = {_sha256(body), _sha256(f"@{handle} {body}")}
     owes = owed in ANSWER_OWED and kind == "answer"
+    fd, why = _claim(name)
+    if fd is None and why == "exists" and owes and _reopens_owed_slot(name, body, resolved):
+        fd, why = _claim(name)
+    if fd is None:
+        log(f"prompt {tag}… reply already published once; not posting again" if why == "exists"
+            else f"prompt {tag}… reply not posted: {why}")
+        return False
     confirmed = False
     if handle is None:  # nothing was sent: no attempt, and no retry
         refusal = _roster_module.RosterError("reply room inactive or roster unavailable")
@@ -1239,9 +1265,10 @@ def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_t
     sent = state == "sent" and (confirmed or not owes)
     retry = bool(kind == "answer" and attempts and target
                  and (state in RETRYABLE_SEND_STATES or (owes and state == "sent" and not confirmed)))
-    reply_state = _reply_state(sent, body) if owes else "owed" if owed in ANSWER_OWED else None
+    reply_state = _reply_state(sent, resolved) if owes else "owed" if owed in ANSWER_OWED else None
     record = {"journal": 2, **({"preclaim": True} if preclaim else {}),
               **({"disposition": owed, "reply_state": reply_state} if reply_state else {}),
+              **({"resolved": True} if owes and resolved else {}),
               "sent": sent, "state": state, "delivery": "posted" if sent else "failed",
               "kind": kind, "event_id": event_id, "ref": ref, "channel": channel,
               "roster_generation": getattr(_local, "roster_generation", None),
@@ -1430,7 +1457,7 @@ def batch_sections(prompt):
 def refuse_recovery_event(session, prompt, event_id, reason):
     """A recovery refusal owns a separate notice key; it never spends the event's answer marker."""
     state = recovery_delivery_state(event_id)
-    if state in ("answered", "pending", "notified"):
+    if state in ("answered", "pending", "notified", "owed"):
         log(f"prompt {event_id} recovery unavailable; existing delivery state {state}; no new notice")
         return
     ref = "unattributed-" + hashlib.sha256(("recovery:" + event_id).encode()).hexdigest()
@@ -1462,13 +1489,18 @@ def recovery_delivery_state(event_id):
     """
     records = [publication_record(event_id + suffix) for suffix in ("", ".answer")]
     records = [r for r in records if r.get("event_id") == event_id]
-    if any(r.get("kind") == "answer" and r.get("sent") is True for r in records):
+    # An owed event's answer is complete only once ``confirmed`` (the thread showed it and the CEO turn declared
+    # the event resolved); a journal with no disposition is an event that was not owed.
+    if any(r.get("kind") == "answer" and r.get("sent") is True
+           and (not r.get("disposition") or r.get("reply_state") == "confirmed") for r in records):
         return "answered"
     with _INFLIGHT_LOCK:
         if event_id in _INFLIGHT:
             return "pending"
     if os.path.lexists(os.path.join(PUBLISHED, event_id + INFLIGHT_SUFFIX)):
         return "pending"  # includes abandoned/uncertain ownership; the reaper arbitrates it
+    if any(r.get("disposition") in ANSWER_OWED for r in records):
+        return "owed"  # told or acknowledged or unconfirmed, never complete: recovery resubmits it
     if any(r.get("kind") in ("notice", "unfinished_notice", "answer") for r in records):
         return "notified"
     return "unknown"
@@ -2067,10 +2099,11 @@ def deliver_event(session, parsed, text, mentioned):
         # the thread is told once (the slot of its one real reply stays open: preclaim) and the journal
         # keeps the event unprocessed.
         log(f"prompt {base[:12]}… owed a reply ({owed}) but the CEO's turn ended silent: UNPROCESSED; telling the thread")
+        reopen_base_silence(base, channel, answer)
         publish_reply(base, channel, UNANSWERED_NOTICE.format(disposition=owed, event=base), kind="notice",
                       preclaim=True, owed=owed)
     elif answered and answer and answer.strip():
-        publish_reply(base, channel, answer, owed=owed)
+        publish_reply(base, channel, answer, owed=owed, resolved=getattr(answer, "resolved", False))
     elif notice is not None:
         # A notice that fails stays journaled as that failure and is the end of it. It is not
         # turned into an error result either: buzz-acp requeues a failed attempt, which would
