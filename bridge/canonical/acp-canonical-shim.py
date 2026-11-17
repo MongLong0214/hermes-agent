@@ -749,6 +749,27 @@ def fit_text(text, channel, event_id):
     return legal
 
 
+# Dispositions whose inbound is owed a reply: its answer completes it only once the thread itself shows this
+# bridge's reply to this event. A disposition is the gateway's own judgement of the event (today only a verified
+# owner relay, gateway/owner_relay.py), read from its answer's JSON in this closed set and from nowhere else:
+# never from a message's words, which grant nothing.
+ANSWER_OWED = frozenset({"owner_relay", "question", "ruling", "conflict"})
+
+
+class Answer(str):
+    """The gateway's answer text, with the disposition it recorded for the event and whether the answer is
+    the silence marker (``disposition`` None: the event is owed nothing)."""
+
+    disposition = None
+    silent = False
+
+    def __new__(cls, text, disposition=None, silent=False):
+        self = super().__new__(cls, text)
+        self.disposition = disposition if isinstance(disposition, str) and disposition in ANSWER_OWED else None
+        self.silent = silent is True and self.disposition is not None
+        return self
+
+
 def submit(text, event_id, author, channel):
     """Answer text, or raise. The caller turns a failure into a visible refusal sentence. Author and
     channel are the event's own, from ``envelope()`` or a verified relay event; nothing stands in for either."""
@@ -759,7 +780,10 @@ def submit(text, event_id, author, channel):
         BASE + ROUTE, data=body, method="POST",
         headers={"Authorization": "Bearer " + KEY, "Content-Type": "application/json"})
     with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-        return json.loads(response.read().decode()).get("text", "")
+        answer = json.loads(response.read().decode())
+        text = answer.get("text", "")
+        # A malformed answer stays what it is, for the caller to refuse as it always has.
+        return Answer(text, answer.get("disposition"), answer.get("silent")) if isinstance(text, str) else text
 
 
 def _registry_peer(channel):
@@ -1089,6 +1113,10 @@ def _retry_publication(name, record, body, digests, tag):
     ends meanwhile leaves it: as that failure, with nothing to resume."""
     channel, target, kind = record["channel"], record["reply_to"], record["kind"]
     state, reason, attempts, found = record["state"], record["reason"], record["attempts"], False
+    # An owed reply is not done by a send that exited 0: only the thread showing it is. So "sent" is read
+    # back like a failure, and never resent unless a complete read shows it absent.
+    owes = bool(record.get("disposition")) and kind == "answer"
+    retryable = RETRYABLE_SEND_STATES + (("sent",) if owes else ())
     try:
         for delay in PUBLISH_RETRY_BACKOFF:
             time.sleep(delay)
@@ -1101,7 +1129,7 @@ def _retry_publication(name, record, body, digests, tag):
                 continue
             state, reason = _send_attempt(channel, target, body)
             attempts += 1
-            if state not in RETRYABLE_SEND_STATES:
+            if state not in retryable:
                 break
             log(f"prompt {tag}… {kind} NOT posted on attempt {attempts}: {state}: {reason}")
             _rewrite_publication(name, dict(record, state=state, reason=str(reason)[:400], attempts=attempts,
@@ -1112,15 +1140,18 @@ def _retry_publication(name, record, body, digests, tag):
         log(f"prompt {tag}… {kind} retry stopped: {type(exc).__name__}")
     if found:
         state, reason = "sent", f"found in the thread after attempt {attempts} ({state}: {reason})"
-    sent = state == "sent"
+    sent = state == "sent" and (found or not owes)
     _rewrite_publication(name, dict(record, sent=sent, state=state, delivery="posted" if sent else "failed",
                                     reason=str(reason)[:400], attempts=attempts, pending=False,
+                                    **({"reply_state": "confirmed" if sent else "unconfirmed"} if owes else {}),
                                     **({"recovered": True} if found else {}),
                                     at=time.strftime("%Y-%m-%dT%H:%M:%S%z")))
     if found:
         log(f"prompt {tag}… {kind} found in the thread after attempt {attempts}: POSTED, not sent again")
     elif sent:
         log(f"prompt {tag}… {kind} POSTED to thread on attempt {attempts}")
+    elif owes and state == "sent":
+        log(f"prompt {tag}… {kind} sent but never read back from the thread: UNPROCESSED, owed a reply")
     elif state in RETRYABLE_SEND_STATES:
         log(f"prompt {tag}… {kind} NOT posted after {attempts} attempt(s): retries exhausted, no further retry: "
             f"{state}: {reason}")
@@ -1128,7 +1159,8 @@ def _retry_publication(name, record, body, digests, tag):
         log(f"prompt {tag}… {kind} NOT posted (no retry) on attempt {attempts}: {state}: {reason}")
 
 
-def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_to=None, preclaim=False):
+def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_to=None, preclaim=False,
+                  owed=None):
     """Post *answer* once as the thread reply to *event_id*. True only when the wrapper sent it.
 
     The delivery journal is ``PUBLISHED/<event id>``: claimed before the send (one post per event,
@@ -1142,7 +1174,13 @@ def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_t
     here; the journal holds ``pending: true`` until it ends); every other failure, and every notice,
     stays recorded as one and is never retried. An unattributed refusal has
     no event id: its notice passes ``event_id=None``, is journaled under its correlation key *ref*
-    and replies to *reply_to*, the thread buzz-acp's ``[Context]`` names (None: the channel)."""
+    and replies to *reply_to*, the thread buzz-acp's ``[Context]`` names (None: the channel).
+
+    *owed* (a disposition in ``ANSWER_OWED``): the event is owed a reply. Its answer is complete only when the
+    thread, read back, shows this bridge's reply to this event (``_is_this_post``: its signer, its target, its
+    body); a send that exited 0 is read back at once, and until the read shows the post the journal says
+    ``reply_state: unconfirmed`` and the retry reads before it ever resends. An owed notice (``kind`` notice)
+    is no reply: ``reply_state: owed``."""
     name, target = (event_id, event_id) if event_id is not None else (ref, reply_to)
     if event_id is not None and not preclaim:
         name = outcome_key(event_id, channel)
@@ -1154,14 +1192,22 @@ def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_t
         return False
     handle = _peer_handle(channel)
     body = f"@{handle} {answer}" if handle and not answer.lstrip().startswith(f"@{handle}") else answer
+    digests = {_sha256(body), _sha256(f"@{handle} {body}")}
+    owes = owed in ANSWER_OWED and kind == "answer"
+    confirmed = False
     if handle is None:  # nothing was sent: no attempt, and no retry
         refusal = _roster_module.RosterError("reply room inactive or roster unavailable")
         state, reason, attempts = "error", f"{type(refusal).__name__}: {refusal}"[:300], 0
     else:
         (state, reason), attempts = _send_attempt(channel, target, body), 1
-    sent = state == "sent"
-    retry = bool(kind == "answer" and attempts and target and state in RETRYABLE_SEND_STATES)
+        if owes and state == "sent" and target:
+            confirmed = _read_back(channel, target, digests) == "posted"
+    sent = state == "sent" and (confirmed or not owes)
+    retry = bool(kind == "answer" and attempts and target
+                 and (state in RETRYABLE_SEND_STATES or (owes and state == "sent" and not confirmed)))
+    reply_state = (("confirmed" if sent else "unconfirmed") if owes else "owed" if owed in ANSWER_OWED else None)
     record = {"journal": 2, **({"preclaim": True} if preclaim else {}),
+              **({"disposition": owed, "reply_state": reply_state} if reply_state else {}),
               "sent": sent, "state": state, "delivery": "posted" if sent else "failed",
               "kind": kind, "event_id": event_id, "ref": ref, "channel": channel,
               "roster_generation": getattr(_local, "roster_generation", None),
@@ -1176,7 +1222,6 @@ def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_t
         return sent
     log(f"prompt {tag}… {kind} NOT posted on attempt 1: {state}: {reason}; the thread is read back before "
         f"any retry")
-    digests = {_sha256(body), _sha256(f"@{handle} {body}")}
     thread = threading.Thread(target=_retry_publication, args=(name, record, body, digests, tag),
                               name=f"publish-retry-{tag}", daemon=True)
     try:
@@ -1199,6 +1244,12 @@ UNATTRIBUTED_NOTICE = (
 RECOVERY_UNKNOWN_NOTICE = (
     "이 프롬프트의 이벤트 경계를 복구하지 못했습니다. 이전 제출의 CEO 수신 여부와 턴의 결과는 "
     "알 수 없습니다(outcome unknown). 이번 복구에서는 제출하지 않았고 자동 재전송은 없습니다. (ref {ref})")
+
+
+# Fixed text, as every notice: the disposition's name, the event id, nothing of the message or the answer.
+UNANSWERED_NOTICE = (
+    "이 메시지({disposition})는 CEO 에게 전달되고 턴도 끝났지만 답이 없었습니다. 답이 필요한 메시지이므로 "
+    "처리 완료로 보지 않고 미처리로 남깁니다. 답이 필요하면 다시 요청해 주세요. (event {event})")
 
 
 def journal_undeliverable(ref, shape, reason):
@@ -1976,8 +2027,16 @@ def deliver_event(session, parsed, text, mentioned):
         "sessionId": session,
         "update": {"sessionUpdate": "agent_message_chunk",
                    "content": {"type": "text", "text": answer}}}})
-    if answered and answer and answer.strip():
-        publish_reply(base, channel, answer)
+    owed = getattr(answer, "disposition", None) if answered else None
+    if owed in ANSWER_OWED and (getattr(answer, "silent", False) or not answer.strip()):
+        # An inbound that is owed a reply ended silent. Silence, and this turn's end_turn, complete nothing:
+        # the thread is told once (the slot of its one real reply stays open: preclaim) and the journal
+        # keeps the event unprocessed.
+        log(f"prompt {base[:12]}… owed a reply ({owed}) but the CEO's turn ended silent: UNPROCESSED; telling the thread")
+        publish_reply(base, channel, UNANSWERED_NOTICE.format(disposition=owed, event=base), kind="notice",
+                      preclaim=True, owed=owed)
+    elif answered and answer and answer.strip():
+        publish_reply(base, channel, answer, owed=owed)
     elif notice is not None:
         # A notice that fails stays journaled as that failure and is the end of it. It is not
         # turned into an error result either: buzz-acp requeues a failed attempt, which would

@@ -13,7 +13,7 @@ import secrets
 import sqlite3
 import time
 from contextlib import closing, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
@@ -43,6 +43,12 @@ _RECEIPT_NAMESPACE = "canonical-receipt:v2"
 _CLAIM_NAMESPACE = "canonical-claim:v1"
 _KEPT_NAMESPACE = "canonical-answer-kept:v1"
 ANSWER_UNRECORDED = "canonical_answer_unrecorded"
+# What the gateway judged an admitted event to be, recorded with its answer. Only a verified owner relay
+# (gateway/owner_relay.py: proven against the relaying CTO's transcript) is judged today, and its answer owes
+# the thread a reply: silence, a transport ack or a tool's success completes nothing. Never read from the
+# event's text.
+DISPOSITION_OWNER_RELAY = "owner_relay"
+_DISPOSITIONS = frozenset({DISPOSITION_OWNER_RELAY})
 
 logger = logging.getLogger(__name__)
 
@@ -489,6 +495,7 @@ class CanonicalReceiptResult:
     status: str
     terminal_text: str | None = None
     failure: dict | None = None
+    disposition: str | None = None
 
 
 def _log_record_state(level: int, what: str, *, stage: str, binding: Any, event: Any, key: str,
@@ -904,7 +911,9 @@ class CanonicalReceiptCoordinator:
             response = parsed.get("response")
             if (parsed.get("state") == "terminal" and isinstance(response, dict)
                     and isinstance(response.get("terminal_text"), str)):
-                return CanonicalReceiptResult("terminal", response["terminal_text"])
+                disposition = response.get("disposition")
+                return CanonicalReceiptResult("terminal", response["terminal_text"], None,
+                                              disposition if disposition in _DISPOSITIONS else None)
         except ValueError as exc:
             if str(exc) == "canonical_receipt_conflict":
                 raise
@@ -1227,7 +1236,8 @@ class CanonicalReceiptCoordinator:
 
             def outcome(answer: CanonicalReceiptResult) -> dict[str, Any]:
                 return ({"failure": answer.failure} if answer.failure is not None else {"response": {
-                    "binding_name": binding.name, "terminal_text": answer.terminal_text}})
+                    "binding_name": binding.name, "terminal_text": answer.terminal_text,
+                    **({"disposition": answer.disposition} if answer.disposition else {})}})
 
             def terminal_of(answer: CanonicalReceiptResult) -> str:
                 # Bound to this claim (its owner) and to this one write (a nonce no one holds before it
@@ -1385,6 +1395,10 @@ class CanonicalReceiptCoordinator:
                         return kept
                 else:
                     answer = _result_answer(result, observation)
+                    if relay is not None and answer.terminal_text is not None:
+                        # The disposition is the gateway's own judgement of the event (its verified relay),
+                        # recorded with the answer so a replay reports it too.
+                        answer = replace(answer, disposition=DISPOSITION_OWNER_RELAY)
                     whole = result.terminal_text if isinstance(result, CanonicalTurnResult) else None
                 answer = record_or_keep(answer, whole)
             # The terminal (or the kept answer) is durable and a replay answers it, so this answer is
