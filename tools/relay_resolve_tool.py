@@ -2,9 +2,11 @@
 
 A relayed owner instruction (gateway/owner_relay.py) is owed a reply the thread shows, and it is complete only
 when the turn that answered it declares it resolved. The declaration is this tool call, never a word in an
-answer: ``relay_resolve(event_id, outcome, evidence)`` with an ``outcome`` of done, answered, declined or
-deferred_with_reason and non-empty ``evidence``, each item either ``{"tool_call_id": ...}`` (a tool result the
-event's turns produced) or ``{"answer": ...}`` (an explicit answer to what was asked).
+answer: ``relay_resolve(event_id, outcome, public_reply, evidence)`` with an ``outcome`` of done, answered,
+declined or deferred_with_reason. ``public_reply`` is the one thing the thread is told (``<label>: <public_reply>``),
+so for answered, declined and deferred it IS the declared answer; ``evidence`` is internal and cites tool calls
+only (``{"tool_call_id": ...}``, a tool result the event's turns produced), required for ``done`` and never
+published.
 
 The tool is registered so a relayed owner turn can dispatch it, and is in no toolset: the gateway adds it to
 that turn alone. Here it only refuses what cannot count: outside a relayed owner turn, or for another event,
@@ -27,7 +29,7 @@ from tools.registry import registry, tool_error, tool_result
 TOOL_NAME = "relay_resolve"
 OUTCOMES = ("done", "answered", "declined", "deferred_with_reason")
 # What the peer turn of a post a bound CTO declared a question, ruling request or conflict may declare: no work to
-# report, so never ``done``; the explicit answer, decision or resolution is the evidence.
+# report, so never ``done``; the declared answer, decision or resolution is the public_reply.
 PEER_OUTCOMES = ("answered", "declined", "deferred_with_reason")
 # Tools the gateway adds to one turn's surface and no other's: a session's tools freeze never carries or pins them.
 TURN_SCOPED_TOOLS = frozenset({TOOL_NAME})
@@ -38,10 +40,16 @@ PUBLIC_LABELS = {"done": "done", "answered": "answered", "declined": "declined",
 _MAX_PUBLIC_REPLY = 2_000
 
 # A public_reply may not carry what the codebase keeps private. Structural, by the shapes it issues, not words:
+_ROOTS = "Users|home|private|var|tmp|etc|opt|Volumes|Library|System"
 _PATH = re.compile(
-    r"(?<![\w/:.~-])/(?:[\w.@+~-]+/)+[\w.@+~-]*"      # an absolute path of two or more segments (not a URL's)
-    r"|(?<!\w)~/[\w.@+~/-]+"                          # a home-relative path
-    r"|(?<!\w)[A-Za-z]:\\\S+")                       # a Windows path
+    r"(?<![\w/:.~-])/(?:[\w.@+~-]+/)+[\w.@+~-]*"                  # an absolute path of two or more segments (not a URL's)
+    rf"|(?<![\w/:.~-])/(?:{_ROOTS})(?![A-Za-z0-9])"                 # a single-segment path at a known root: /etc, /private-x
+    r"|(?<![\w/:.~-])/[\w@+~-]+\.[A-Za-z0-9]{1,8}\b"                 # a file at the root: /export.json (/stop passes)
+    r"|(?<!\w)~/[\w.@+~/-]+"                                       # a home-relative path
+    r"|(?<![A-Za-z0-9])[A-Za-z]:[/\\]"                              # a drive path: C:/ or C:\
+    r"|(?<![\w\\])\\\\[\w.$-]"                                   # a UNC path: \\server
+    r"|\bfile:(?=\S)",                                             # any file: URI
+    re.IGNORECASE)
 _ID = re.compile(
     r"\b(?:call|fc|toolu)_[A-Za-z0-9]{8,}\b|\bacp_call_\d+\b"            # tool call ids (generated or a provider's)
     r"|\b\d{8}_\d{6}_[0-9a-f]{6,12}\b"                                 # hermes_state_ids.new_session_id
@@ -103,18 +111,20 @@ def public_reply_problem(text: Any, known_ids: Iterable[str] = ()) -> Optional[s
 
 
 def evidence_items(evidence: Any) -> Optional[list]:
-    """``[("tool", id) | ("answer", text), ...]`` for well-formed evidence, else None: a non-empty list of at
-    most 64 objects, each holding exactly one non-blank ``tool_call_id`` or ``answer`` string."""
-    if not isinstance(evidence, list) or not 0 < len(evidence) <= _MAX_EVIDENCE:
+    """``[("tool", id), ...]`` for well-formed evidence, else None: absent or empty (only ``done`` needs a call to
+    cite) or at most 64 objects, each holding exactly one non-blank ``tool_call_id``. Evidence cites tool calls
+    only: prose in it is never an answer (the declared answer is the ``public_reply``), so an ``answer`` item is
+    malformed."""
+    if evidence is None:
+        return []
+    if not isinstance(evidence, list) or len(evidence) > _MAX_EVIDENCE:
         return None
     items = []
     for item in evidence:
-        if not isinstance(item, dict) or len(item) != 1:
+        value = item.get("tool_call_id") if isinstance(item, dict) and set(item) == {"tool_call_id"} else None
+        if not isinstance(value, str) or not value.strip():
             return None
-        (key, value), = item.items()
-        if key not in ("tool_call_id", "answer") or not isinstance(value, str) or not value.strip():
-            return None
-        items.append(("tool" if key == "tool_call_id" else "answer", value.strip()))
+        items.append(("tool", value.strip()))
     return items
 
 
@@ -123,28 +133,28 @@ SCHEMA = {
     "description": (
         "Declare the relayed owner instruction of this turn handled. Call it once, after the work it cites, "
         "only when the instruction really is resolved. outcome: done (the work is finished: cite its tool "
-        "results), answered (the instruction asked a question: give the explicit answer), declined (you will not "
-        "do it: give the reason) or deferred_with_reason (it waits on something: say what). evidence is required "
-        "and internal, never published: tool_call_id items name tool results of this instruction's turns, answer "
-        "items state the explicit answer or reason. A declaration without real evidence leaves the instruction "
-        "open. What the thread is told is exactly '<outcome>: <public_reply>' (outcome as done, answered, "
-        "declined or deferred); public_reply is one plain statement for the CTO, with no file path and no tool "
-        "call, session, claim or receipt id: a public_reply that has one is refused and the instruction stays "
-        "open."),
+        "results), answered (the instruction asked a question), declined (you will not do it) or "
+        "deferred_with_reason (it waits on something). What the thread is told is exactly '<outcome>: "
+        "<public_reply>' (outcome as done, answered, declined or deferred): public_reply IS the answer, the "
+        "decision or the reason, one plain statement for the CTO, with no file path (/etc, C:/..., file://, a UNC "
+        "share) and no tool call, session, claim or receipt id; one that has any is refused and the instruction "
+        "stays open. evidence is internal, never published, and cites tool calls only: tool_call_id items naming "
+        "tool results of this instruction's turns, required for done and optional otherwise; prose in evidence "
+        "is never the answer."),
     "parameters": {
         "type": "object",
         "properties": {
             "event_id": {"type": "string", "description": "The Buzz event id of the relayed instruction."},
             "outcome": {"type": "string", "enum": list(OUTCOMES)},
             "evidence": {
-                "type": "array", "minItems": 1, "maxItems": _MAX_EVIDENCE,
-                "items": {"type": "object", "minProperties": 1, "maxProperties": 1, "properties": {
-                    "tool_call_id": {"type": "string", "description": "A tool call id whose result you cite."},
-                    "answer": {"type": "string", "description": "The explicit answer or reason."}}}},
+                "type": "array", "maxItems": _MAX_EVIDENCE,
+                "items": {"type": "object", "required": ["tool_call_id"], "additionalProperties": False,
+                          "properties": {"tool_call_id": {
+                              "type": "string", "description": "A tool call id whose result you cite."}}}},
             "public_reply": {"type": "string", "maxLength": _MAX_PUBLIC_REPLY,
                              "description": "What the thread is told after the outcome label, in plain words."},
         },
-        "required": ["event_id", "outcome", "evidence", "public_reply"],
+        "required": ["event_id", "outcome", "public_reply"],
     },
 }
 
@@ -158,8 +168,11 @@ def _handle(args: dict, **_kwargs: Any) -> str:
     outcome = args.get("outcome")
     if outcome not in OUTCOMES:
         return tool_error(f"outcome must be one of {', '.join(OUTCOMES)}.")
-    if evidence_items(args.get("evidence")) is None:
-        return tool_error("evidence must be a non-empty list of {tool_call_id} or {answer} items.")
+    evidence = evidence_items(args.get("evidence"))
+    if evidence is None:
+        return tool_error("evidence must be a list of {tool_call_id} items; prose in it is never the answer.")
+    if outcome == "done" and not evidence:
+        return tool_error("done cites at least one tool result of this instruction's turns in evidence.")
     problem = public_reply_problem(args.get("public_reply"))
     if problem is not None:
         return tool_error(f"public_reply refused: {problem}. Say it in plain words, with no path and no id.")

@@ -55,8 +55,7 @@ def test_a_bound_ctos_declared_kind_is_closed_only_by_the_peer_turns_structured_
     """The CEO's answer alone does not close a declared question, ruling request or conflict: the peer turn
     declares it with ``relay_resolve`` (an answer, decline or deferral, with the explicit answer, decision or
     resolution as evidence), accepted only for this event."""
-    _scripted(ingress, monkeypatch, (_ANSWER, _resolve("answered", [{"answer": "머지하세요"}],
-                                                       public_reply="머지하세요. 근거는 CI green.")))
+    _scripted(ingress, monkeypatch, (_ANSWER, _resolve("answered", [], public_reply="머지하세요. 근거는 CI green.")))
     text = _tagged(kind)
     notes = []
     ingress.actor.during_turn = lambda: notes.append(getattr(ingress.actor, "_gateway_turn_context_notes", ""))
@@ -88,8 +87,9 @@ def test_the_published_reply_of_a_declared_kind_is_the_label_and_the_public_repl
     """The turn ended "ACK" and its evidence holds private text: the thread receives ``<label>: <public_reply>``
     and nothing of the turn's free text or evidence."""
     private = "Do not merge; /Users/isaac/.hermes/private/notes.md says the change loses messages."
-    _scripted(ingress, monkeypatch, ("ACK", _resolve(outcome, [{"answer": private}],
-                                                     public_reply="Do not merge; it still loses messages.")))
+    _scripted(ingress, monkeypatch, ("ACK " + private, _work(out=private),
+                                     _resolve(outcome, [{"tool_call_id": "call-1"}],
+                                              public_reply="Do not merge; it still loses messages.")))
 
     async def exercise():
         status, body = await send(text=_tagged(kind))
@@ -104,8 +104,7 @@ def test_the_published_reply_of_a_declared_kind_is_the_label_and_the_public_repl
 @pytest.mark.parametrize("kind, disposition", _KINDS)
 def test_a_declared_kinds_public_reply_with_a_path_or_id_is_refused_and_stays_owed(
         ingress, send, monkeypatch, kind, disposition):
-    _scripted(ingress, monkeypatch, ("ACK", _resolve("answered", [{"answer": "머지하세요"}],
-                                                     public_reply="See /Users/isaac/.hermes/x.json")))
+    _scripted(ingress, monkeypatch, ("ACK", _resolve("answered", [], public_reply="See /Users/isaac/.hermes/x.json")))
 
     async def exercise():
         assert await send(text=_tagged(kind)) == (
@@ -131,16 +130,15 @@ def test_an_acknowledgement_or_an_answer_without_the_declaration_stays_owed(
 
 
 @pytest.mark.parametrize("case, turn", [
-    ("bare_resolve", ("ACK", _resolve("answered", []))),
+    ("no_public_reply", ("ACK", _resolve("answered", [], public_reply=None))),
+    ("empty_public_reply", ("ACK", _resolve("answered", [], public_reply="  "))),
     ("evidence_is_prose", ("ACK", _resolve("answered", "머지하세요"))),
-    ("blank_answer", ("ACK", _resolve("answered", [{"answer": "  "}]))),
-    ("only_a_tool_result_no_answer", ("ACK", _work(), _resolve("answered", [{"tool_call_id": "call-1"}]))),
-    ("unrelated_tool_result_and_no_answer", ("ACK", _resolve("answered", [{"tool_call_id": "call-9"}]))),
-    ("done_is_not_an_outcome_of_a_question", ("ACK", _work(), _resolve("done", [
-        {"tool_call_id": "call-1"}, {"answer": "머지했습니다"}]))),
-    ("unknown_outcome", ("ACK", _resolve("finished", [{"answer": "머지하세요"}]))),
-    ("another_event", ("ACK", _resolve("answered", [{"answer": "머지하세요"}], event_id="another-event"))),
-    ("the_declaration_was_refused", ("ACK", _resolve("answered", [{"answer": "머지하세요"}], ok=False))),
+    ("evidence_prose_is_no_answer", ("ACK", _resolve("answered", [{"answer": "머지하세요"}], public_reply="ACK"))),
+    ("unrelated_tool_result", ("ACK", _resolve("answered", [{"tool_call_id": "call-9"}]))),
+    ("done_is_not_an_outcome_of_a_question", ("ACK", _work(), _resolve("done", [{"tool_call_id": "call-1"}]))),
+    ("unknown_outcome", ("ACK", _resolve("finished", []))),
+    ("another_event", ("ACK", _resolve("answered", [], event_id="another-event"))),
+    ("the_declaration_was_refused", ("ACK", _resolve("answered", [], ok=False))),
 ])
 def test_a_declaration_that_cites_no_explicit_answer_or_names_another_event_leaves_it_owed(
         ingress, send, monkeypatch, case, turn):

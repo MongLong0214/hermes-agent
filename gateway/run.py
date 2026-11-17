@@ -3955,7 +3955,7 @@ class GatewayRunner(
                     from gateway.owner_relay import accepted_declaration
                     from tools.relay_resolve_tool import PEER_OUTCOMES
                     declaration = accepted_declaration(result.get("messages"), boundary, event_id=event.event_id,
-                                                       allowed=PEER_OUTCOMES, need_answer=True)
+                                                       allowed=PEER_OUTCOMES)
                     return _replace(selected, outcome=declaration[0] if declaration else None,
                                     public_reply=declaration[1] if declaration else None,
                                     evidence=tuple(declaration[2]) if declaration else ())

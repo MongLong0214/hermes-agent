@@ -240,10 +240,10 @@ def _owed(final, **extra):
 
 @pytest.mark.parametrize("outcome, evidence", [
     ("done", [{"tool_call_id": "call-1"}]),
-    ("done", [{"tool_call_id": "call-1"}, {"answer": "stopped, and the project reads stopped"}]),
-    ("answered", [{"answer": "freshreadme-2 is stopped; the report follows"}]),
-    ("declined", [{"answer": "the freeze forbids it; reported to the CTO"}]),
-    ("deferred_with_reason", [{"answer": "waits for the CTO's merge, which is open"}]),
+    ("answered", []),                                # the declared answer IS the public_reply: no evidence needed
+    ("answered", [{"tool_call_id": "call-1"}]),
+    ("declined", []),
+    ("deferred_with_reason", [{"tool_call_id": "call-1"}]),
 ])
 def test_a_declaration_citing_what_the_turn_did_or_decided_resolves_the_relayed_instruction(
         ingress, send, monkeypatch, outcome, evidence):
@@ -263,7 +263,7 @@ def test_a_declaration_citing_what_the_turn_did_or_decided_resolves_the_relayed_
     [receipt] = ingress.receipts()
     assert receipt["response"]["outcome"] == outcome and receipt["response"]["resolved"] is True
     # The evidence is internal: kept in the receipt, never in the reply.
-    assert receipt["response"]["evidence"] == evidence
+    assert receipt["response"].get("evidence", []) == evidence  # kept in the receipt (none to keep when none cited)
     assert receipt["response"]["calls"] == [{"id": "call-1", "tool": "run_cancel", "ok": True}]  # what the turn did
     [model_input] = ingress.actor.model_inputs
     assert "relay_resolve" in model_input and "deferred_with_reason" in model_input  # the turn is told the tool
@@ -275,7 +275,16 @@ def test_a_declaration_citing_what_the_turn_did_or_decided_resolves_the_relayed_
     ("evidence_is_prose", ("ACK", _work(), _resolve("done", "everything is done"))),
     ("evidence_of_another_turns_tool_result", ("ACK", _work(), _resolve("done", [{"tool_call_id": "call-9"}]))),
     ("done_cites_only_an_answer", ("ACK", _resolve("done", [{"answer": "ok"}]))),
+    # Evidence cites tool calls only: prose in it is no answer, and a declaration carrying it resolves nothing.
+    ("evidence_prose_is_no_answer", ("ACK", _resolve("answered", [{"answer": "Do not merge; it loses messages."}]))),
     ("blank_answer", ("ACK", _resolve("answered", [{"answer": "  "}]))),
+    ("answered_cites_a_tool_call_it_did_not_make", ("ACK", _resolve("answered", [{"tool_call_id": "call-9"}]))),
+    # The reviewer's path forms, and the single-segment, drive, UNC and file: URI ones.
+    ("public_reply_with_a_drive_path", ("ACK", _work(), _resolve("done", public_reply="Saved at C:/Users/isaac/export.json"))),
+    ("public_reply_with_a_unc_path", ("ACK", _work(), _resolve("done", public_reply="Saved at \\\\server\\share\\export.json"))),
+    ("public_reply_with_a_file_uri", ("ACK", _work(), _resolve("done", public_reply="Saved at file:///Users/isaac/export.json"))),
+    ("public_reply_with_a_root_dir", ("ACK", _work(), _resolve("done", public_reply="Look in /etc"))),
+    ("public_reply_with_a_root_named_file", ("ACK", _work(), _resolve("done", public_reply="Saved at /private-report.json"))),
     # public_reply is required, and what is published is only ever it: a structural filter refuses private text.
     ("no_public_reply", ("ACK", _work(), _resolve("done", public_reply=None))),
     ("empty_public_reply", ("ACK", _work(), _resolve("done", public_reply="   "))),
@@ -366,28 +375,62 @@ def test_a_redelivery_runs_a_reply_only_recovery_turn_that_cites_the_earlier_tur
                                             ("deferred_with_reason", "deferred")])
 @pytest.mark.parametrize("final", ["ACK", "[SILENT]", "자세히: /Users/isaac/.hermes/private/customer-export.json"])
 def test_private_evidence_is_not_published(ingress, send, monkeypatch, outcome, label, final):
-    """Review (public safety): publishing the declaration's evidence leaked private tool output, local paths and
-    session or claim ids to the thread. Evidence is internal and stays in the receipt. What is published is
-    exactly ``<outcome label>: <public_reply>``, composed by the gateway; the turn's own free text (here an ACK,
-    silence, or a private path) is never what the thread receives once the turn declared."""
+    """Review (public safety): publishing a declaration's evidence leaked private tool output, local paths and
+    session or claim ids to the thread. Evidence cites tool calls only, stays in the receipt, and is never
+    published. What is published is exactly ``<outcome label>: <public_reply>``, composed by the gateway; the
+    turn's own free text (an ACK, silence, a private path) and the tool's private output are never what the
+    thread receives once the turn declared."""
     _entitle()
     _transcript(_owner_record())
-    private = ["Private tool output: customer export contains INTERNAL-CUSTOMER-7741.",
-               "Evidence file: /Users/isaac/.hermes/private/customer-export.json",
-               "Session 7b622a35-9409-4df4-bfe7-1e140ed238ba; claim private-claim-7741"]
-    evidence = [{"tool_call_id": "call-1"}, *({"answer": text} for text in private)]
-    _scripted(ingress, monkeypatch, (final, _work(out=private[0]),
-                                     _resolve(outcome, evidence, public_reply="The review is complete.")))
+    private = "Private tool output: customer export contains INTERNAL-CUSTOMER-7741 at /Users/isaac/.hermes/x.json"
+    _scripted(ingress, monkeypatch, (final, _work(out=private),
+                                     _resolve(outcome, [{"tool_call_id": "call-1"}],
+                                              public_reply="The review is complete.")))
 
     async def exercise():
         status, body = await send(text=_relay())
         assert (status, body) == (200, _owed(f"{label}: The review is complete.", resolved=True))
-        assert not any(text in json.dumps(body, ensure_ascii=False) for text in private)
+        assert private not in json.dumps(body, ensure_ascii=False)
 
     asyncio.run(exercise())
     [receipt] = ingress.receipts()
     assert receipt["response"]["terminal_text"] == f"{label}: The review is complete."
-    assert [item["answer"] for item in receipt["response"]["evidence"] if "answer" in item] == private  # kept
+    assert receipt["response"]["evidence"] == [{"tool_call_id": "call-1"}]  # kept in the receipt, never published
+
+
+@pytest.mark.parametrize("outcome", ["answered", "declined", "deferred_with_reason"])
+def test_the_declared_answer_is_the_public_reply_and_evidence_prose_is_never_the_answer(
+        ingress, send, monkeypatch, outcome):
+    """Review: evidence could say "Do not merge…" while public_reply="ACK" confirmed an "answered: ACK". For
+    these outcomes there is no separate hidden answer: the declared answer IS the public_reply, evidence cites
+    tool calls only, and what is published equals the declared public answer exactly."""
+    _entitle()
+    _transcript(_owner_record())
+    label = _LABELS[outcome]
+    _scripted(ingress, monkeypatch,
+              # the reviewer's case: prose in the evidence, an ACK as the public answer: it cannot be constructed
+              ("ACK", _resolve(outcome, [{"answer": "Do not merge; the change still loses messages."}],
+                               public_reply="ACK")))
+
+    async def refused():
+        assert await send(text=_relay()) == (200, _owed("ACK"))  # resolves nothing: owed, the free text only
+
+    asyncio.run(refused())
+    [receipt] = ingress.receipts()
+    assert "resolved" not in receipt["response"] and "Do not merge" not in json.dumps(receipt["response"])
+
+
+@pytest.mark.parametrize("outcome", ["answered", "declined", "deferred_with_reason"])
+def test_a_declared_public_answer_is_published_exactly(ingress, send, monkeypatch, outcome):
+    _entitle()
+    _transcript(_owner_record())
+    answer = "Do not merge; the change still loses messages."
+    _scripted(ingress, monkeypatch, ("ACK", _resolve(outcome, [], public_reply=answer)))
+
+    async def exercise():
+        assert await send(text=_relay()) == (200, _owed(f"{_LABELS[outcome]}: {answer}", resolved=True))
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("public_reply", [

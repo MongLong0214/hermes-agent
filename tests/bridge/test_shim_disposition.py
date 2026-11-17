@@ -623,7 +623,7 @@ def test_a_declared_question_ruling_or_conflict_runs_judgement_reply_readback_an
     """CEO C, closed as B: the CTO declares the kind; the CEO's reply is read back from the thread, and the
     peer turn's structured declaration (an explicit answer as evidence) closes it."""
     real = _real_path(gw, gw_shim, monkeypatch, tmp_path,
-                      ("머지하세요. 근거는 아래와 같습니다.", _resolve("answered", [{"answer": "머지하세요"}],
+                      ("머지하세요. 근거는 아래와 같습니다.", _resolve("answered", [],
                                                        public_reply="머지하세요. 근거는 아래와 같습니다.")),
                       relay=False, kind=kind)
     gw_drive(gw_shim, real.prompt)
@@ -705,7 +705,7 @@ def test_private_evidence_is_not_published(gw, gw_shim, monkeypatch, tmp_path, e
     is posted, and the thread never holds the planted evidence, the tool output or the turn's own free text."""
     real = _real_path(gw, gw_shim, monkeypatch, tmp_path,
                       ("The review is complete. " + evidence, _work(out=evidence),
-                       _resolve("answered", [{"answer": evidence}], public_reply="The review is complete.")))
+                       _resolve("answered", [{"tool_call_id": "call-1"}], public_reply="The review is complete.")))
     gw_drive(gw_shim, real.prompt)
     assert real.thread() == ["@cto-repo-factory answered: The review is complete."]
     assert evidence not in "\n".join(real.thread())
@@ -833,3 +833,24 @@ def test_a_pending_journal_whose_thread_cannot_be_read_stays_unconfirmed_and_is_
     done = record(shim, EVENT_A)
     assert (done["reply_state"], done["sent"], done.get("pending")) == ("unconfirmed", False, False)
     assert sum(c["cmd"] == "send" for c in calls(shim, EVENT_A)) == 1
+
+
+def test_declared_peer_answer_is_not_replaced_by_ack(gw, gw_shim, monkeypatch, tmp_path):
+    """Review: evidence said "Do not merge…" while public_reply="ACK" posted ``answered: ACK`` and confirmed. The
+    declared answer IS the public_reply and evidence cites tool calls only, so that declaration resolves
+    nothing; the declared answer, posted, is exactly what the thread is told."""
+    stuck = _real_path(gw, gw_shim, monkeypatch, tmp_path,
+                       ("ACK", _resolve("answered", [{"answer": "Do not merge; the change loses messages."}],
+                                        public_reply="ACK")), relay=False, kind="question")
+    gw_drive(gw_shim, stuck.prompt)
+    assert stuck.thread() == ["@cto-repo-factory ACK"]  # the turn's own reply, acknowledged; nothing was declared
+    assert gw_shim.recovery_delivery_state(GW_EVENT) == "owed"
+
+
+def test_a_declared_peer_answer_is_published_exactly(gw, gw_shim, monkeypatch, tmp_path):
+    answer = "Do not merge; the change loses messages."
+    real = _real_path(gw, gw_shim, monkeypatch, tmp_path, ("ACK", _resolve("answered", [], public_reply=answer)),
+                      relay=False, kind="question")
+    gw_drive(gw_shim, real.prompt)
+    assert real.thread() == [f"@cto-repo-factory answered: {answer}"]
+    assert real.settled()["reply_state"] == "confirmed" and gw_shim.recovery_delivery_state(GW_EVENT) == "answered"
