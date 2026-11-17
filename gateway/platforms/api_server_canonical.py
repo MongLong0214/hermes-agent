@@ -243,7 +243,17 @@ async def handle_canonical_surface_event(self, request: "web.Request") -> "web.R
         logger.warning("Canonical event %r answered canonical_event_uncertain: receipt %s",
                        event.event_id[:96], receipt.status)
         return _refusal("canonical_event_uncertain", 409)
-    return web.json_response({"event_id": event.event_id, "text": receipt.terminal_text})
+    body = {"event_id": event.event_id, "text": receipt.terminal_text}
+    if receipt.disposition is not None:
+        # An event whose answer owes a reply: an answer that is the silence marker is no reply, so the
+        # bridge is told which it is rather than left to read the text (gateway/response_filters.py).
+        from gateway.response_filters import is_intentional_silence_response
+
+        body["disposition"] = receipt.disposition
+        body["silent"] = is_intentional_silence_response(receipt.terminal_text)
+        if receipt.resolved:
+            body["resolved"] = True  # the turn's own declaration; only it completes the owed reply
+    return web.json_response(body)
 
 
 def _telegram_receipt_binding(bindings: dict) -> Any:

@@ -13,7 +13,7 @@ import secrets
 import sqlite3
 import time
 from contextlib import closing, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
@@ -43,6 +43,15 @@ _RECEIPT_NAMESPACE = "canonical-receipt:v2"
 _CLAIM_NAMESPACE = "canonical-claim:v1"
 _KEPT_NAMESPACE = "canonical-answer-kept:v1"
 ANSWER_UNRECORDED = "canonical_answer_unrecorded"
+# What the gateway judged an admitted event to be, recorded with its answer. Only a verified owner relay
+# (gateway/owner_relay.py: proven against the relaying CTO's transcript) is judged today, and its answer owes
+# the thread a reply: silence, a transport ack or a tool's success completes nothing. Never read from the
+# event's text.
+DISPOSITION_OWNER_RELAY = "owner_relay"
+_DISPOSITIONS = frozenset({DISPOSITION_OWNER_RELAY})
+# A relayed owner instruction whose answer did not declare it resolved is not a terminal: its redelivery runs a
+# new owner turn, at most this many in all (the first included), the last answer standing.
+_MAX_OWED_TURNS = 3
 
 logger = logging.getLogger(__name__)
 
@@ -489,6 +498,10 @@ class CanonicalReceiptResult:
     status: str
     terminal_text: str | None = None
     failure: dict | None = None
+    disposition: str | None = None
+    # The owner turn declared the instruction handled (gateway/owner_relay.py RESOLVED_MARKER); only with a
+    # disposition.
+    resolved: bool = False
 
 
 def _log_record_state(level: int, what: str, *, stage: str, binding: Any, event: Any, key: str,
@@ -816,6 +829,11 @@ class CanonicalReceiptCoordinator:
                                   observed="recorded_other" if claim_owner else "owner_unknown",
                                   delivery="not_delivered")
                 raise ValueError("canonical_receipt_conflict")
+            if answer.status == "terminal" and answer.terminal_text is not None and answer.disposition is None:
+                # A receipt written before dispositions were recorded has none, and none is never "ordinary":
+                # the event's own provenance is judged again, by the same relay grammar the live path opens.
+                if self._opens_owner_relay(event):
+                    answer = replace(answer, disposition=DISPOSITION_OWNER_RELAY)
             return answer
         if claimed is None:
             return None
@@ -823,6 +841,36 @@ class CanonicalReceiptCoordinator:
         _log_record_state(logging.WARNING, "receipt row missing", stage="claim.receipt_missing",
                           binding=binding, event=event, key=key, observed="absent", delivery="unknown")
         return CanonicalReceiptResult("uncertain")
+
+    @staticmethod
+    def _owes_a_new_turn(relay: Any, answer: Any, records: Any) -> int:
+        """How many owner turns the event has had when its recorded answer is one a verified relay still owes
+        another turn for (a terminal answer, the disposition owner relay, not declared resolved) and fewer than
+        ``_MAX_OWED_TURNS`` ran; 0 otherwise. A failure, a kept answer and a pending receipt are never run again."""
+        if (relay is None or answer is None or answer.status != "terminal" or answer.terminal_text is None
+                or answer.disposition != DISPOSITION_OWNER_RELAY or answer.resolved or records[0] is not None
+                or records[1] is None or records[2] is None):
+            return 0
+        try:
+            runs = json.loads(records[2]).get("runs", 1)
+        except Exception:
+            return 0
+        return runs if type(runs) is int and 1 <= runs < _MAX_OWED_TURNS else 0
+
+    @staticmethod
+    def _opens_owner_relay(event: Any) -> bool:
+        """Whether *event*'s own content opens an owner-relay block (``_owner_relay``'s first step, which no
+        receipt could be written for unless it parsed). Proof is not asked: it gates authority, and a reply is
+        owed whether or not the relay can still be proven; a block that breaks the grammar claims owner
+        authority all the same."""
+        from gateway.owner_relay import OwnerRelayRefused, event_content, parse_relay
+
+        try:
+            return parse_relay(event_content(
+                getattr(event, "text", None), event_id=getattr(event, "event_id", ""),
+                channel_id=getattr(event, "channel_id", ""), author_id=getattr(event, "author_id", ""))) is not None
+        except OwnerRelayRefused:
+            return True
 
     @staticmethod
     def _decode_claim(value: Any, fingerprint: str) -> str | None:
@@ -904,7 +952,10 @@ class CanonicalReceiptCoordinator:
             response = parsed.get("response")
             if (parsed.get("state") == "terminal" and isinstance(response, dict)
                     and isinstance(response.get("terminal_text"), str)):
-                return CanonicalReceiptResult("terminal", response["terminal_text"])
+                disposition = response.get("disposition")
+                disposition = disposition if disposition in _DISPOSITIONS else None
+                return CanonicalReceiptResult("terminal", response["terminal_text"], None, disposition,
+                                              disposition is not None and response.get("resolved") is True)
         except ValueError as exc:
             if str(exc) == "canonical_receipt_conflict":
                 raise
@@ -1215,7 +1266,23 @@ class CanonicalReceiptCoordinator:
                     # get_meta has no generation fence, so its result is usable only after this recheck.
                     self._require_current_claim_target(proof, actor, db, run_generation)
                 answer = self._answer_records(binding, event, key, fingerprint, records)
-                return answer if answer is not None else CanonicalReceiptResult("uncertain")
+                turns = self._owes_a_new_turn(relay, answer, records)
+                if turns:
+                    # The owner turn that answered did not declare the instruction resolved, so its receipt
+                    # is no terminal: this claim takes the event over (claim record, then receipt, each only
+                    # over the very value read) and runs a new owner turn. A holder that won the race, or a
+                    # record that moved, leaves the replay below.
+                    again = self._encode({"v": 1, "state": "claimed", "fingerprint": fingerprint, "owner": owner,
+                                          "runs": turns + 1})
+                    claimed = (db.compare_and_set_meta(self._beside(_CLAIM_NAMESPACE, key), records[2], again, **proven)
+                               and db.compare_and_set_meta(key, records[1], pending, **proven))
+                    if claimed:
+                        from gateway.owner_relay import render_owner_turn
+                        relay = (relay[0], relay[1], render_owner_turn(relay[0], relay[1], again=True), relay[3])
+                        logger.info("Owner relay not declared resolved: new owner turn %d for binding=%r event_id=%r",
+                                    turns + 1, binding.name[:96], event.event_id[:96])
+                if not claimed:
+                    return answer if answer is not None else CanonicalReceiptResult("uncertain")
 
             from gateway.canonical_answer_fallback import keep as keep_locally
             from gateway.canonical_surface import request_local_reply_sink
@@ -1227,7 +1294,9 @@ class CanonicalReceiptCoordinator:
 
             def outcome(answer: CanonicalReceiptResult) -> dict[str, Any]:
                 return ({"failure": answer.failure} if answer.failure is not None else {"response": {
-                    "binding_name": binding.name, "terminal_text": answer.terminal_text}})
+                    "binding_name": binding.name, "terminal_text": answer.terminal_text,
+                    **({"disposition": answer.disposition} if answer.disposition else {}),
+                    **({"resolved": True} if answer.resolved else {})}})
 
             def terminal_of(answer: CanonicalReceiptResult) -> str:
                 # Bound to this claim (its owner) and to this one write (a nonce no one holds before it
@@ -1384,7 +1453,17 @@ class CanonicalReceiptCoordinator:
                                                                              proof))
                         return kept
                 else:
+                    resolved = False
+                    if relay is not None and isinstance(result, CanonicalTurnResult):
+                        # The owner turn's own declaration leads its answer and is not part of the reply.
+                        from gateway.owner_relay import split_resolved
+                        reply, resolved = split_resolved(result.terminal_text)
+                        result = replace(result, terminal_text=reply)
                     answer = _result_answer(result, observation)
+                    if relay is not None and answer.terminal_text is not None:
+                        # The disposition is the gateway's own judgement of the event (its verified relay),
+                        # recorded with the answer so a replay reports it too.
+                        answer = replace(answer, disposition=DISPOSITION_OWNER_RELAY, resolved=resolved)
                     whole = result.terminal_text if isinstance(result, CanonicalTurnResult) else None
                 answer = record_or_keep(answer, whole)
             # The terminal (or the kept answer) is durable and a replay answers it, so this answer is

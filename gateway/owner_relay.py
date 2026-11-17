@@ -63,6 +63,11 @@ REASONS = frozenset({
 })
 DISPLAY_KIND = "owner_relay"
 METADATA_KEY = "owner_relay"
+# The owner turn's own declaration that it handled the relayed instruction: a line holding exactly this opens
+# its final answer. The turn is told so (:func:`render_owner_turn`). It completes the reply the thread is owed;
+# no wording of an answer can (an acknowledgement is not told from an answer by its words), and nothing in a
+# message grants it.
+RESOLVED_MARKER = "[RESOLVED]"
 # One state_meta row per transcript record relayed: ``<prefix><session>:<record uuid>`` -> the receipt key.
 RECORD_LEDGER_PREFIX = "owner-relay-record:v1:"
 
@@ -99,6 +104,24 @@ class VerifiedRelay:
     record: str
     timestamp: str
     note: str
+
+
+def split_resolved(text: Any) -> tuple[Any, bool]:
+    """``(reply, True)`` when *text* opens with one or more lines holding exactly :data:`RESOLVED_MARKER` (blank
+    lines between them allowed) and a reply follows them, every such leading line removed; ``("", False)`` when
+    nothing follows them (a declaration with no reply is no answer, and no resolved empty one); ``(text, False)``
+    when it does not open with the marker (the marker anywhere else is no declaration)."""
+    if not isinstance(text, str):
+        return text, False
+    lines = text.replace("\r\n", "\n").split("\n")
+    at, declared = 0, False
+    while at < len(lines) and (not lines[at].strip() or lines[at].strip() == RESOLVED_MARKER):
+        declared = declared or bool(lines[at].strip())
+        at += 1
+    if not declared:
+        return text, False
+    reply = "\n".join(lines[at:]).strip()
+    return (reply, True) if reply else ("", False)
 
 
 def parse_relay(text: Any) -> Optional[RelayClaim]:
@@ -369,9 +392,11 @@ def new_metadata(relay: VerifiedRelay, *, binding: str, author_id: str, channel_
             "timestamp": relay.timestamp, "nonce": secrets.token_hex(16)}
 
 
-def render_owner_turn(relay: VerifiedRelay, metadata: Mapping[str, str]) -> str:
+def render_owner_turn(relay: VerifiedRelay, metadata: Mapping[str, str], *, again: bool = False) -> str:
     """The model-facing text of the owner turn: its provenance, the original quoted verbatim between
-    per-turn nonce markers, and the CTO's note quoted apart, carrying no owner authority. Raises
+    per-turn nonce markers, and the CTO's note quoted apart, carrying no owner authority. *again*: this
+    instruction already ran in this conversation and its answer did not declare it resolved; the turn is told
+    so, not to repeat what it did, and to finish what is left. Raises
     ``ValueError("canonical_envelope_escape")`` when either text holds the nonce."""
     nonce = metadata["nonce"]
     if any(nonce in text for text in (relay.original, relay.owner_text, relay.note)):
@@ -382,8 +407,13 @@ def render_owner_turn(relay: VerifiedRelay, metadata: Mapping[str, str]) -> str:
         f"CTO's Claude session {relay.session}, transcript record {relay.record} at {relay.timestamp}. It "
         "carries the owner's authority: act on it as if the owner had typed it here. Do not ask the owner "
         "to confirm, re-approve or retype it. Your answer goes to the Buzz thread it was relayed in; if a tool "
-        "or a permission refuses, report that refusal there, never as a request for the owner to approve again.\n"
-        f"<<<owner-instruction:{nonce}>>>\n{relay.owner_text}\n<<<end-owner-instruction:{nonce}>>>"
+        "or a permission refuses, report that refusal there, never as a request for the owner to approve again. "
+        f"Begin your answer with a line holding exactly {RESOLVED_MARKER}, then your reply, only when you have "
+        "fully handled this instruction; otherwise answer without that line and the instruction stays open.\n"
+        + ("This instruction was already run once in this conversation and your earlier answer did not declare "
+           "it resolved: do not repeat any action you already took, finish what is left, and answer.\n"
+           if again else "")
+        + f"<<<owner-instruction:{nonce}>>>\n{relay.owner_text}\n<<<end-owner-instruction:{nonce}>>>"
     )
 
     if relay.note:
