@@ -102,6 +102,17 @@ def test_the_tool_has_a_required_public_reply_and_says_what_is_published():
     "Run /status and /help", "/help me", "/STOP!", "Use /stop, then /status.", "Use /stop (or /help).", "Try /stop?",
     "/중지 로 취소", "/abcdefghijklmnop", "Open HTTPS://Example.com/A/b. Then /stop", "see (https://a.b/c) and /stop;",
     "Users\\isaac\\x", "a\\b", "see https://a.b/x\\y", "see https://a.b/c\\",
+    # a URL is exactly its own characters: closing markup and quotes end it, and whatever follows is judged
+    "See <https://example.com>/Users/isaac/private/export.json",
+    "See [report](https://example.com)/Users/isaac/private/export.json",
+    "See (https://example.com)/Users/isaac/private/export.json", 'See "https://example.com"/Users/isaac/x',
+    "See 'https://example.com'/Users/isaac/x", "See `https://example.com`/Users/isaac/x",
+    "See [x](https://example.com/a)/Users/isaac/x", "See <https://example.com/a/b>/etc",
+    'See https://example.com"file:private.txt', "See <https://example.com>file:private.txt",
+    "See (https://example.com)file:private.txt", "See https://example.com'file:private.txt",
+    "See https://example.com/a>/Users/x", "See https://example.com/a)/Users/x", "See https://example.com/a]/x",
+    "see https://user:pw@example.com/x", "see https://[::1]/x", "see https://exa mple.com/x /y",
+    "see https://example.com:port/x", "see https:///x", "see https://", "see https://_x/y",
     "Output:/Users/isaac/private/export.json", "Output:/x", "Saved to /Customer Exports/private.json",
     "Saved to /customer_export", "Users/isaac/private/export.json", "see ./run.sh", "see ../x", "see a/b/c.txt",
     "Handled and/or deferred", "Handled 1/2.", "Version 2.1/2.2 shipped", "TCP/IP", "a/b",
@@ -130,6 +141,12 @@ def test_public_reply_problem_refuses_a_path_or_an_id_this_codebase_issues(text)
     "a path-like word like private-report is fine", "Say stop to cancel.",
     "Open HTTPS://Example.com/A/b. Then stop", "see (https://example.com/a/b) and https://example.com/c;",
     "https://example.com", "https://example.com/runs/42?x=1&y=2#top, then done",
+    # plain URLs in markup or quotes still pass
+    "See <https://example.com/runs/42>.", "See <https://example.com>", "See (https://example.com/a/b).",
+    "See [the report](https://example.com/runs/42?x=1#top)", 'See "https://example.com/a/b"',
+    "See 'https://example.com/a/b'", "See `https://example.com/a/b`", "See https://example.com:8080/a/b?c=d&e=f#g",
+    "See <https://example.com/a>, <https://example.org/b>; and [c](http://example.net/c).",
+    "See https://sub.example-site.co.kr/%ED%95%9C/a_b~c@d:e!$&*+,;=?q#f",
 ])
 def test_public_reply_problem_lets_prose_through(text):
     from tools.relay_resolve_tool import public_reply_problem

@@ -445,6 +445,8 @@ def test_a_declared_public_answer_is_published_exactly(ingress, send, monkeypatc
     "Output:/Users/isaac/private/export.json", "Output:/x", "Saved to /Customer Exports/private.json",
     "Saved to /customer_export", "Handled and/or deferred 1/2.", "Version 2.1/2.2 shipped",
     "Use /stop to cancel", "Saved to /root", "Saved to /srv", "Run /status", "Users\\isaac\\x",
+    "See <https://example.com>/Users/isaac/private/export.json",
+    "See [report](https://example.com)/Users/isaac/private/export.json", 'See https://example.com"file:private.txt',
     "Result of call-1 was ok",                                          # this turn's own tool call id
     "see call_a1b2c3d4e5f6", "see fc_0123456789abcdef01234567", "see toolu_0123456789abcdef", "see acp_call_3",
     "session 20261117_064935_ab12cd",                                   # a Hermes session id
@@ -472,6 +474,7 @@ def test_a_public_reply_carrying_a_path_or_id_is_refused_and_stays_owed(ingress,
 @pytest.mark.parametrize("public_reply", [
     "The project is stopped; see https://example.com/runs/42 for the report.",
     "call me back after the freeze", "call_back is a word", "see https://example.com/a/b.",
+    "See <https://example.com/runs/42>.", "See [the report](https://example.com/runs/42).",
     "프로젝트를 중지했고 보고서는 스레드에 있습니다.",
 ])
 def test_a_public_reply_that_is_plain_prose_is_published(ingress, send, monkeypatch, public_reply):

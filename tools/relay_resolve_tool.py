@@ -48,14 +48,18 @@ PUBLIC_LABELS = {"done": "done", "answered": "answered", "declined": "declined",
 _MAX_PUBLIC_REPLY = 2_000
 
 # A public_reply may not carry what the codebase keeps private. One strict rule for paths, no list of roots and no
-# exception: EVERY "/" outside an http(s) URL is refused, and so is EVERY backslash, and ``file:``. ``/stop``,
-# ``/root``, ``a/b``, ``and/or``, ``TCP/IP``, ``C:/x`` and ``~/x`` are all refused, and a URL passes.
-_URL = re.compile(r"\bhttps?://[^\W_][^\s\\]*", re.IGNORECASE)
+# exception: strip the http(s) URLs, then refuse if any "/", any backslash or ``file:`` remains. ``/stop``, ``/root``,
+# ``a/b``, ``and/or``, ``TCP/IP``, ``C:/x`` and ``~/x`` are all refused. A URL is exactly ``https?://``, a host of
+# letters, digits, dots and hyphens, an optional ``:port`` and an optional path, query or fragment made only of the
+# characters below: no ``<>()[]``, no quote or backtick and no backslash, so closing markup ends it and whatever
+# follows it, a path or ``file:`` included, is judged like any other text.
+_URL = re.compile(r"\bhttps?://[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:[/?#][A-Za-z0-9._~%!$&*+,;=:@?#/-]*)?",
+                  re.IGNORECASE)
 _FILE_URI = re.compile(r"\bfile:", re.IGNORECASE)
 
 
 def _holds_path(text: str) -> bool:
-    rest = _URL.sub(" ", text)  # a URL's own slashes are not a path; whatever is left is judged
+    rest = _URL.sub(" ", text)  # only a URL's own characters are exempt; the rest is judged
     return "/" in rest or "\\" in rest or bool(_FILE_URI.search(rest))
 
 
