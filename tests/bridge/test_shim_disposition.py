@@ -921,6 +921,29 @@ def test_a_retry_that_does_not_get_the_retry_lock_neither_resends_nor_rewrites_t
     assert path.read_bytes() == before
 
 
+def _stale_retry(shim, on_disk):
+    """A retry thread started for a pending first answer, run after the record on disk became *on_disk*."""
+    pending = dict(disposition="owner_relay", reply_state="unconfirmed", sent=False, state="send_failed",
+                   delivery="failed", pending=True, body_sha256=_body_sha("first"))
+    _journal(shim, EVENT_B, **pending)
+    started = record(shim, EVENT_B)
+    _journal(shim, EVENT_B, **dict(pending, **on_disk))  # what _settle_abandoned or a second answer left
+    shim.PUBLISH_RETRY_BACKOFF = (0,)  # unguarded, the thread would resend at once
+    path = Path(shim.PUBLISHED, EVENT_B)
+    before = path.read_bytes()
+    shim._retry_publication(EVENT_B, started, f"@{PEER} first", {_body_sha("first")}, EVENT_B[:12])
+    assert [c for c in calls(shim, EVENT_B) if c["cmd"] == "send"] == []
+    assert path.read_bytes() == before
+
+
+def test_a_retry_whose_record_was_settled_before_it_took_the_lock_neither_resends_nor_rewrites_it(shim):
+    _stale_retry(shim, {"pending": False, "reply_state": "unconfirmed"})
+
+
+def test_a_retry_whose_record_now_belongs_to_another_pending_item_neither_resends_nor_rewrites_it(shim):
+    _stale_retry(shim, {"body_sha256": _body_sha("second")})
+
+
 def _unlink_before_flock(shim, monkeypatch, path, times):
     """The lock file's previous holder releases (unlinks) it just before this flock lands on the old inode."""
     real, seen = shim.fcntl.flock, []

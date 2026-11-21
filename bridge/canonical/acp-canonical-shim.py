@@ -1154,6 +1154,14 @@ def _retry_publication(name, record, body, digests, tag):
         log(f"prompt {tag}… retry lock not held; not resending, record left as it is")
         return
     try:
+        # Under the lock, only the pending item this thread was started for is finished: a record settled
+        # meanwhile (_settle_abandoned) or now another item's is not resent and not rewritten from this one.
+        now = publication_record(name)
+        if (now.get("pending") is not True or any(now.get(k) != record.get(k)
+                                                  for k in ("kind", "body_sha256", "channel", "reply_to"))):
+            log(f"prompt {tag}… record is no longer the pending item this retry was started for; "
+                "not resending, record left as it is")
+            return
         _retry_publication_locked(name, record, body, digests, tag)
     finally:
         _release_retry_lock(name, lock)
