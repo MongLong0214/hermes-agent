@@ -59,7 +59,7 @@ def test_a_resolve_for_another_event_is_refused(scope):
     {"evidence": [{"tool_call_id": 7}]},
     {"public_reply": None}, {"public_reply": ""}, {"public_reply": "   "}, {"public_reply": 7},
     {"public_reply": "x" * 2_001},
-    {"public_reply": "See /Users/isaac/.hermes/export.json"}, {"public_reply": "call_a1b2c3d4e5f6 passed"},
+    {"public_reply": "See /Users/someone/.hermes/export.json"}, {"public_reply": "call_a1b2c3d4e5f6 passed"},
 ])
 def test_a_declaration_without_a_known_outcome_and_well_formed_evidence_is_refused(scope, change):
     refused = _call({**GOOD, **change})
@@ -90,35 +90,35 @@ def test_the_tool_has_a_required_public_reply_and_says_what_is_published():
 
 
 @pytest.mark.parametrize("text", [
-    "Saved to /Users/isaac/.hermes/private/customer-export.json", "Saved to /tmp/x/y", "at /etc/hosts",
-    "Saved to ~/private/out.txt", "Saved to C:\\Users\\isaac\\out.txt", "(/Users/isaac/a)",
+    "Saved to /Users/someone/.hermes/private/customer-export.json", "Saved to /tmp/x/y", "at /etc/hosts",
+    "Saved to ~/private/out.txt", "Saved to C:\\Users\\someone\\out.txt", "(/Users/someone/a)",
     # the review's forms: a drive with a forward slash, a UNC share, a single-segment root, a file: URI
-    "Saved at C:/Users/isaac/private/export.json", "Saved at d:/x", "Saved at \\\\server\\private\\customer-export.json",
+    "Saved at C:/Users/someone/private/export.json", "Saved at d:/x", "Saved at \\\\server\\private\\customer-export.json",
     "Saved at \\\\host\\share", "Saved at \\\\", "Saved at /private-report.json", "see /opt/x", "see /etc/hosts",
-    "Saved at /export.json", "Saved at file:///Users/isaac/private/export.json", "see file:/tmp/x",
+    "Saved at /export.json", "Saved at file:///Users/someone/private/export.json", "see file:/tmp/x",
     "see FILE:///etc/hosts", "see file:relative.txt", "the file: it is ready",
     # one strict rule: every slash outside an http(s) URL is refused, and so is every backslash: no /word exception
     "Saved to /root", "Saved to /srv", "Look in /etc", "see /tmp.", "see /Users", "/stop", "Use /stop.", "/status",
     "Run /status and /help", "/help me", "/STOP!", "Use /stop, then /status.", "Use /stop (or /help).", "Try /stop?",
     "/중지 로 취소", "/abcdefghijklmnop", "Open HTTPS://Example.com/A/b. Then /stop", "see (https://a.b/c) and /stop;",
-    "Users\\isaac\\x", "a\\b", "see https://a.b/x\\y", "see https://a.b/c\\",
+    "Users\\someone\\x", "a\\b", "see https://a.b/x\\y", "see https://a.b/c\\",
     # a URL is exactly its own characters: closing markup and quotes end it, and whatever follows is judged
-    "See <https://example.com>/Users/isaac/private/export.json",
-    "See [report](https://example.com)/Users/isaac/private/export.json",
-    "See (https://example.com)/Users/isaac/private/export.json", 'See "https://example.com"/Users/isaac/x',
-    "See 'https://example.com'/Users/isaac/x", "See `https://example.com`/Users/isaac/x",
-    "See [x](https://example.com/a)/Users/isaac/x", "See <https://example.com/a/b>/etc",
+    "See <https://example.com>/Users/someone/private/export.json",
+    "See [report](https://example.com)/Users/someone/private/export.json",
+    "See (https://example.com)/Users/someone/private/export.json", 'See "https://example.com"/Users/someone/x',
+    "See 'https://example.com'/Users/someone/x", "See `https://example.com`/Users/someone/x",
+    "See [x](https://example.com/a)/Users/someone/x", "See <https://example.com/a/b>/etc",
     'See https://example.com"file:private.txt', "See <https://example.com>file:private.txt",
     "See (https://example.com)file:private.txt", "See https://example.com'file:private.txt",
     "See https://example.com/a>/Users/x", "See https://example.com/a)/Users/x", "See https://example.com/a]/x",
     "see https://user:pw@example.com/x", "see https://[::1]/x", "see https://exa mple.com/x /y",
     "see https://example.com:port/x", "see https:///x", "see https://", "see https://_x/y",
-    "Output:/Users/isaac/private/export.json", "Output:/x", "Saved to /Customer Exports/private.json",
-    "Saved to /customer_export", "Users/isaac/private/export.json", "see ./run.sh", "see ../x", "see a/b/c.txt",
+    "Output:/Users/someone/private/export.json", "Output:/x", "Saved to /Customer Exports/private.json",
+    "Saved to /customer_export", "Users/someone/private/export.json", "see ./run.sh", "see ../x", "see a/b/c.txt",
     "Handled and/or deferred", "Handled 1/2.", "Version 2.1/2.2 shipped", "TCP/IP", "a/b",
     "see (/stop)", "see ('/ok')", "see x/stop", "/stop/", "/stop/x", "/stop.json", "/stop-all", "/stop_all", "/stop2",
-    "/abcdefghijklmnopq", "see /stop:/x", "see /Users/isaac/x?u=https://a.b", "Saved to https:///Users/isaac/x",
-    "see http://a.b/c and /Users/isaac/x", "see ahttps://a.b/c", "see https://a.b/c /Users/isaac/x",
+    "/abcdefghijklmnopq", "see /stop:/x", "see /Users/someone/x?u=https://a.b", "Saved to https:///Users/someone/x",
+    "see http://a.b/c and /Users/someone/x", "see ahttps://a.b/c", "see https://a.b/c /Users/someone/x",
     "see call_a1b2c3d4e5f6", "see call_ABCdef0123456789abcdefgh", "see fc_0123456789abcdef01234567",
     "see toolu_0123456789abcdef", "see acp_call_3",
     "session 20261117_064935_ab12cd", "session 20261117_064935_ab12cd34",

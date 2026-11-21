@@ -86,7 +86,7 @@ def test_the_published_reply_of_a_declared_kind_is_the_label_and_the_public_repl
         ingress, send, monkeypatch, kind, disposition, outcome, label):
     """The turn ended "ACK" and its evidence holds private text: the thread receives ``<label>: <public_reply>``
     and nothing of the turn's free text or evidence."""
-    private = "Do not merge; /Users/isaac/.hermes/private/notes.md says the change loses messages."
+    private = "Do not merge; /Users/someone/.hermes/private/notes.md says the change loses messages."
     _scripted(ingress, monkeypatch, ("ACK " + private, _work(out=private),
                                      _resolve(outcome, [{"tool_call_id": "call-1"}],
                                               public_reply="Do not merge; it still loses messages.")))
@@ -104,7 +104,7 @@ def test_the_published_reply_of_a_declared_kind_is_the_label_and_the_public_repl
 @pytest.mark.parametrize("kind, disposition", _KINDS)
 def test_a_declared_kinds_public_reply_with_a_path_or_id_is_refused_and_stays_owed(
         ingress, send, monkeypatch, kind, disposition):
-    _scripted(ingress, monkeypatch, ("ACK", _resolve("answered", [], public_reply="See /Users/isaac/.hermes/x.json")))
+    _scripted(ingress, monkeypatch, ("ACK", _resolve("answered", [], public_reply="See /Users/someone/.hermes/x.json")))
 
     async def exercise():
         assert await send(text=_tagged(kind)) == (

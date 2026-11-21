@@ -128,6 +128,21 @@ def turn_calls(messages: Any, boundary: Any) -> list:
     return calls
 
 
+def declaration_attempted(messages: Any, boundary: Any) -> bool:
+    """True when the turn that began at ``messages[boundary]`` called ``relay_resolve`` at all, accepted or not."""
+    from tools.relay_resolve_tool import TOOL_NAME
+
+    if not isinstance(messages, list) or isinstance(boundary, bool) or not isinstance(boundary, int):
+        return False
+    for row in messages[max(boundary, 0):]:
+        if isinstance(row, Mapping) and row.get("role") == "assistant" and isinstance(row.get("tool_calls"), list):
+            for call in row["tool_calls"]:
+                function = call.get("function") if isinstance(call, Mapping) else None
+                if isinstance(function, Mapping) and function.get("name") == TOOL_NAME:
+                    return True
+    return False
+
+
 def accepted_declaration(messages: Any, boundary: Any, *, event_id: str, earlier: Any = (),
                          allowed: Any = None) -> Optional[tuple]:
     """``(outcome, public_reply, evidence)`` of this turn's declaration, or None: the LAST ``relay_resolve`` call of

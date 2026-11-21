@@ -280,21 +280,21 @@ def test_a_declaration_citing_what_the_turn_did_or_decided_resolves_the_relayed_
     ("blank_answer", ("ACK", _resolve("answered", [{"answer": "  "}]))),
     ("answered_cites_a_tool_call_it_did_not_make", ("ACK", _resolve("answered", [{"tool_call_id": "call-9"}]))),
     # The reviewer's path forms, and the single-segment, drive, UNC and file: URI ones.
-    ("public_reply_with_a_drive_path", ("ACK", _work(), _resolve("done", public_reply="Saved at C:/Users/isaac/export.json"))),
+    ("public_reply_with_a_drive_path", ("ACK", _work(), _resolve("done", public_reply="Saved at C:/Users/someone/export.json"))),
     ("public_reply_with_a_unc_path", ("ACK", _work(), _resolve("done", public_reply="Saved at \\\\server\\share\\export.json"))),
-    ("public_reply_with_a_file_uri", ("ACK", _work(), _resolve("done", public_reply="Saved at file:///Users/isaac/export.json"))),
+    ("public_reply_with_a_file_uri", ("ACK", _work(), _resolve("done", public_reply="Saved at file:///Users/someone/export.json"))),
     ("public_reply_with_a_path_after_a_colon", ("ACK", _work(), _resolve(
-        "done", public_reply="Output:/Users/isaac/private/export.json"))),
+        "done", public_reply="Output:/Users/someone/private/export.json"))),
     ("public_reply_with_a_spaced_path", ("ACK", _work(), _resolve("done", public_reply="Saved to /Customer Exports/private.json"))),
     ("public_reply_with_a_slash_command", ("ACK", _work(), _resolve("done", public_reply="Use /stop to cancel"))),
     ("public_reply_with_a_bare_root", ("ACK", _work(), _resolve("done", public_reply="Saved to /root"))),
-    ("public_reply_with_a_backslash", ("ACK", _work(), _resolve("done", public_reply="Saved to Users\\isaac\\x"))),
+    ("public_reply_with_a_backslash", ("ACK", _work(), _resolve("done", public_reply="Saved to Users\\someone\\x"))),
     ("public_reply_with_a_slash_in_prose", ("ACK", _work(), _resolve("done", public_reply="Handled and/or deferred."))),
     ("public_reply_with_a_root_named_file", ("ACK", _work(), _resolve("done", public_reply="Saved at /private-report.json"))),
     # public_reply is required, and what is published is only ever it: a structural filter refuses private text.
     ("no_public_reply", ("ACK", _work(), _resolve("done", public_reply=None))),
     ("empty_public_reply", ("ACK", _work(), _resolve("done", public_reply="   "))),
-    ("public_reply_with_a_path", ("ACK", _work(), _resolve("done", public_reply="See /Users/isaac/.hermes/export.json"))),
+    ("public_reply_with_a_path", ("ACK", _work(), _resolve("done", public_reply="See /Users/someone/.hermes/export.json"))),
     ("public_reply_with_a_home_path", ("ACK", _work(), _resolve("done", public_reply="Saved to ~/private/out.txt"))),
     ("public_reply_with_a_tool_call_id_of_this_turn", ("ACK", _work(), _resolve("done", public_reply="Result of call-1: ok"))),
     ("public_reply_with_a_generated_tool_call_id", ("ACK", _work(), _resolve("done", public_reply="call_a1b2c3d4e5f6 passed"))),
@@ -379,7 +379,7 @@ def test_a_redelivery_runs_a_reply_only_recovery_turn_that_cites_the_earlier_tur
 
 @pytest.mark.parametrize("outcome, label", [("done", "done"), ("answered", "answered"), ("declined", "declined"),
                                             ("deferred_with_reason", "deferred")])
-@pytest.mark.parametrize("final", ["ACK", "[SILENT]", "자세히: /Users/isaac/.hermes/private/customer-export.json"])
+@pytest.mark.parametrize("final", ["ACK", "[SILENT]", "자세히: /Users/someone/.hermes/private/customer-export.json"])
 def test_private_evidence_is_not_published(ingress, send, monkeypatch, outcome, label, final):
     """Review (public safety): publishing a declaration's evidence leaked private tool output, local paths and
     session or claim ids to the thread. Evidence cites tool calls only, stays in the receipt, and is never
@@ -388,7 +388,7 @@ def test_private_evidence_is_not_published(ingress, send, monkeypatch, outcome, 
     thread receives once the turn declared."""
     _entitle()
     _transcript(_owner_record())
-    private = "Private tool output: customer export contains INTERNAL-CUSTOMER-7741 at /Users/isaac/.hermes/x.json"
+    private = "Private tool output: customer export contains INTERNAL-CUSTOMER-7741 at /Users/someone/.hermes/x.json"
     _scripted(ingress, monkeypatch, (final, _work(out=private),
                                      _resolve(outcome, [{"tool_call_id": "call-1"}],
                                               public_reply="The review is complete.")))
@@ -440,13 +440,13 @@ def test_a_declared_public_answer_is_published_exactly(ingress, send, monkeypatc
 
 
 @pytest.mark.parametrize("public_reply", [
-    "Saved to /Users/isaac/.hermes/private/customer-export.json",       # an absolute path
-    "Saved to ~/private/out.txt", "Saved to C:\\Users\\isaac\\out.txt",
-    "Output:/Users/isaac/private/export.json", "Output:/x", "Saved to /Customer Exports/private.json",
+    "Saved to /Users/someone/.hermes/private/customer-export.json",       # an absolute path
+    "Saved to ~/private/out.txt", "Saved to C:\\Users\\someone\\out.txt",
+    "Output:/Users/someone/private/export.json", "Output:/x", "Saved to /Customer Exports/private.json",
     "Saved to /customer_export", "Handled and/or deferred 1/2.", "Version 2.1/2.2 shipped",
-    "Use /stop to cancel", "Saved to /root", "Saved to /srv", "Run /status", "Users\\isaac\\x",
-    "See <https://example.com>/Users/isaac/private/export.json",
-    "See [report](https://example.com)/Users/isaac/private/export.json", 'See https://example.com"file:private.txt',
+    "Use /stop to cancel", "Saved to /root", "Saved to /srv", "Run /status", "Users\\someone\\x",
+    "See <https://example.com>/Users/someone/private/export.json",
+    "See [report](https://example.com)/Users/someone/private/export.json", 'See https://example.com"file:private.txt',
     "Result of call-1 was ok",                                          # this turn's own tool call id
     "see call_a1b2c3d4e5f6", "see fc_0123456789abcdef01234567", "see toolu_0123456789abcdef", "see acp_call_3",
     "session 20261117_064935_ab12cd",                                   # a Hermes session id
@@ -1185,3 +1185,58 @@ def test_a_failed_relayed_turn_never_reports_no_side_effects_after_its_owner_too
     else:
         assert body["error"]["side_effects"] == "unknown"
     assert target.read_text() == "work bytes"  # work bytes kept
+
+
+@pytest.mark.parametrize("final", [
+    "자세히: /Users/x/private.txt",
+    "Saved at /Users/x/private.txt, see session 20261117_064935_ab12cd",
+    "Result of call_a1b2c3d4e5f6 is stored",
+])
+def test_a_refused_declarations_free_text_is_published_only_through_the_public_filter(
+        ingress, send, monkeypatch, final):
+    """CEO ruling: a turn that tried to declare and was refused leaves its free text unfiltered. It must not reach
+    the thread with a path or an id; a fixed notice goes instead, and the event stays owed."""
+    _entitle()
+    _transcript(_owner_record())
+    _scripted(ingress, monkeypatch, (final, _work(), _resolve("done", public_reply="Saved at /Users/x/private.txt")))
+
+    async def exercise():
+        status, body = await send(text=_relay())
+        assert (status, body) == (200, _owed("declaration refused; this event stays open"))
+        assert "/Users/x" not in json.dumps(body, ensure_ascii=False) and "20261117" not in json.dumps(body)
+
+    asyncio.run(exercise())
+    [receipt] = ingress.receipts()
+    assert "resolved" not in receipt["response"] and "outcome" not in receipt["response"]
+    assert "/Users/x" not in json.dumps(receipt["response"], ensure_ascii=False)
+
+
+def test_a_refused_declarations_safe_free_text_is_published_and_the_event_stays_owed(ingress, send, monkeypatch):
+    _entitle()
+    _transcript(_owner_record())
+    _scripted(ingress, monkeypatch, ("I could not finish this one.", _work(), _resolve("done", [], ok=False)))
+
+    async def exercise():
+        assert await send(text=_relay()) == (200, _owed("I could not finish this one."))
+
+    asyncio.run(exercise())
+    [receipt] = ingress.receipts()
+    assert "resolved" not in receipt["response"] and "outcome" not in receipt["response"]
+
+
+def test_a_recovery_turn_that_declares_nothing_publishes_its_free_text_only_through_the_public_filter(
+        ingress, send, monkeypatch):
+    """The reply-only recovery turn is given the earlier turns' call ids and paths; with no declaration, its free
+    text must not carry them to the thread. A fixed notice goes instead and the event stays owed."""
+    _entitle()
+    _transcript(_owner_record())
+    _scripted(ingress, monkeypatch, ("ACK", _work()),
+              ("Done via call-1, output in /home/user/private/out.txt", ))
+
+    async def exercise():
+        assert await send(text=_relay()) == (200, _owed("ACK"))
+        status, body = await send(text=_relay())
+        assert (status, body) == (200, _owed("declaration refused; this event stays open"))
+        assert "call-1" not in json.dumps(body) and "/home/user" not in json.dumps(body)
+
+    asyncio.run(exercise())

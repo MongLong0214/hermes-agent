@@ -738,7 +738,7 @@ def test_a_reopened_legacy_silence_posts_the_owed_notice_and_never_re_executes(g
 
 @pytest.mark.parametrize("evidence", [
     "Private tool output: customer export contains INTERNAL-CUSTOMER-7741.",
-    "Evidence file: /Users/isaac/.hermes/private/customer-export.json",
+    "Evidence file: /Users/someone/.hermes/private/customer-export.json",
     "Session 7b622a35-9409-4df4-bfe7-1e140ed238ba; claim private-claim-7741",
 ])
 def test_private_evidence_is_not_published(gw, gw_shim, monkeypatch, tmp_path, evidence):
@@ -755,12 +755,12 @@ def test_private_evidence_is_not_published(gw, gw_shim, monkeypatch, tmp_path, e
     assert gw_shim.recovery_delivery_state(GW_EVENT) == "answered"
 
 
-@pytest.mark.parametrize("public_reply", ["Saved to /Users/isaac/.hermes/private/customer-export.json",
+@pytest.mark.parametrize("public_reply", ["Saved to /Users/someone/.hermes/private/customer-export.json",
                                           "session 7b622a35-9409-4df4-bfe7-1e140ed238ba", "call_a1b2c3d4e5f6 passed",
-                                          "Output:/Users/isaac/private/export.json",
+                                          "Output:/Users/someone/private/export.json",
                                           "Saved to /Customer Exports/private.json", "Saved to /root", "Use /stop",
-                                          "Users\\isaac\\x", "See <https://example.com>/Users/isaac/private/export.json",
-                                          "See [report](https://example.com)/Users/isaac/private/export.json",
+                                          "Users\\someone\\x", "See <https://example.com>/Users/someone/private/export.json",
+                                          "See [report](https://example.com)/Users/someone/private/export.json",
                                           'See https://example.com"file:private.txt'])
 def test_a_public_reply_carrying_a_path_or_id_is_refused_and_stays_owed_on_the_real_path(
         gw, gw_shim, monkeypatch, tmp_path, public_reply):

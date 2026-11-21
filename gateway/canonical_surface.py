@@ -138,6 +138,9 @@ def bound_actor_db(
     return actor, db
 
 
+REFUSED_DECLARATION_NOTICE = "declaration refused; this event stays open"
+
+
 @dataclass(frozen=True)
 class CanonicalTurnResult:
     """The terminal selected from one canonical turn, before request readback."""
@@ -150,6 +153,9 @@ class CanonicalTurnResult:
     calls: tuple = ()
     public_reply: str | None = None
     evidence: tuple = ()
+    # The turn called ``relay_resolve`` and no declaration was accepted: its free text is public only through
+    # the public filter (see ``submit``).
+    declaration_refused: bool = False
 
 
 class RequestLocalReplySink(Protocol):
@@ -1535,6 +1541,13 @@ class CanonicalReceiptCoordinator:
                         from gateway.owner_relay import published_reply
                         published = True
                         result = replace(result, terminal_text=published_reply(result.outcome, result.public_reply))
+                    if (not published and isinstance(result, CanonicalTurnResult) and result.declaration_refused
+                            and (relay is not None or peer_kind is not None)):
+                        # A refused declaration leaves the turn's free text unfiltered: it is published only if it
+                        # passes the same filter as a public_reply, else a fixed notice. The event stays owed.
+                        from tools.relay_resolve_tool import public_reply_problem
+                        if public_reply_problem(result.terminal_text) is not None:
+                            result = replace(result, terminal_text=REFUSED_DECLARATION_NOTICE)
                     answer = _result_answer(result, observation)
                     if relay is not None and answer.terminal_text is not None:
                         # The disposition is the gateway's own judgement of the event (its verified relay),
