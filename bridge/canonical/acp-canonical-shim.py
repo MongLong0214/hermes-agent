@@ -1113,17 +1113,28 @@ _RETRIES_LOCK = threading.Lock()
 def _retry_lock(name):
     """The fd holding ``PUBLISHED/.<name>.retry`` under an exclusive ``flock``, or None when another holder has it.
     A retry thread holds it while it lives; the kernel drops it when the process dies (or a retry never started),
-    which is how a later shim tells a pending journal whose owner is gone from one still being finished."""
-    try:
-        fd = os.open(os.path.join(PUBLISHED, f".{name}.retry"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    except OSError:
-        return None
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    which is how a later shim tells a pending journal whose owner is gone from one still being finished.
+    A release unlinks the file, so a lock won on an inode the path no longer names (unlinked, or replaced by
+    another holder's file) is not held: it is dropped and taken once more on the file now at the path."""
+    path = os.path.join(PUBLISHED, f".{name}.retry")
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        except OSError:
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return None
+        try:
+            held, named = os.fstat(fd), os.stat(path)
+            if (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino):
+                return fd
+        except OSError:
+            pass
         os.close(fd)
-        return None
-    return fd
+    return None
 
 
 def _release_retry_lock(name, fd):
@@ -1139,6 +1150,9 @@ def _release_retry_lock(name, fd):
 def _retry_publication(name, record, body, digests, tag):
     """Finish one answer's post off the turn path (``_retry_publication_locked``), holding its retry lock."""
     lock = _retry_lock(name)
+    if lock is None:  # another holder has it (or it cannot be taken): no resend, no record update
+        log(f"prompt {tag}… retry lock not held; not resending, record left as it is")
+        return
     try:
         _retry_publication_locked(name, record, body, digests, tag)
     finally:

@@ -900,3 +900,55 @@ def test_a_declared_peer_answer_is_published_exactly(gw, gw_shim, monkeypatch, t
     gw_drive(gw_shim, real.prompt)
     assert real.thread() == [f"@cto-repo-factory answered: {answer}"]
     assert real.settled()["reply_state"] == "confirmed" and gw_shim.recovery_delivery_state(GW_EVENT) == "answered"
+
+
+# ---- the retry lock ---------------------------------------------------------------------------------------
+
+def test_a_retry_that_does_not_get_the_retry_lock_neither_resends_nor_rewrites_the_record(shim):
+    """Another holder owns the answer's retry lock: this retry thread must not resend or touch its record."""
+    _journal(shim, EVENT_B, sent=False, state="send_failed", delivery="failed", pending=True,
+             disposition="owner_relay", reply_state="unconfirmed", body_sha256=_body_sha("first"))
+    shim.PUBLISH_RETRY_BACKOFF = (0,)  # unguarded, the thread would resend at once
+    path = Path(shim.PUBLISHED, EVENT_B)
+    before = path.read_bytes()
+    live = shim._retry_lock(EVENT_B)
+    assert live is not None
+    try:
+        shim._retry_publication(EVENT_B, record(shim, EVENT_B), f"@{PEER} first", {_body_sha("first")}, EVENT_B[:12])
+    finally:
+        shim._release_retry_lock(EVENT_B, live)
+    assert [c for c in calls(shim, EVENT_B) if c["cmd"] == "send"] == []
+    assert path.read_bytes() == before
+
+
+def _unlink_before_flock(shim, monkeypatch, path, times):
+    """The lock file's previous holder releases (unlinks) it just before this flock lands on the old inode."""
+    real, seen = shim.fcntl.flock, []
+    os.makedirs(shim.PUBLISHED, exist_ok=True)
+
+    def flock(fd, op):
+        if len(seen) < times:
+            seen.append(fd)
+            os.unlink(path)
+        return real(fd, op)
+
+    monkeypatch.setattr(shim.fcntl, "flock", flock)
+    return seen
+
+
+def test_a_retry_lock_on_an_inode_that_was_unlinked_is_taken_again_on_the_file_now_at_the_path(shim, monkeypatch):
+    path = os.path.join(shim.PUBLISHED, f".{EVENT_B}.retry")
+    seen = _unlink_before_flock(shim, monkeypatch, path, times=1)
+    held = shim._retry_lock(EVENT_B)
+    assert held is not None and len(seen) == 1  # the dead inode's lock was dropped, the live one taken
+    assert os.fstat(held).st_ino == os.stat(path).st_ino
+    shim._release_retry_lock(EVENT_B, held)
+
+
+def test_a_retry_lock_whose_path_keeps_vanishing_is_not_held(shim, monkeypatch):
+    path = os.path.join(shim.PUBLISHED, f".{EVENT_B}.retry")
+    seen = _unlink_before_flock(shim, monkeypatch, path, times=10)
+    assert shim._retry_lock(EVENT_B) is None
+    for fd in seen:  # every fd it opened was closed
+        with pytest.raises(OSError):
+            os.fstat(fd)
