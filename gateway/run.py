@@ -3934,7 +3934,7 @@ class GatewayRunner(
                     if not opening_row_is_this_relay(result.get("messages"), boundary, relay_meta, peer_prompt):
                         raise ValueError("canonical_turn_refused")
                     from dataclasses import replace as _replace
-                    from gateway.owner_relay import accepted_declaration, declaration_attempted, turn_calls
+                    from gateway.owner_relay import accepted_declaration, declaration_attempted, known_call_ids, turn_calls
                     declaration = accepted_declaration(result.get("messages"), boundary, event_id=event.event_id,
                                                        earlier=earlier_calls or ())
                     return _replace(
@@ -3945,7 +3945,8 @@ class GatewayRunner(
                         # A refused declaration, or a reply-only recovery turn that made none: its free text
                         # is public only through the public filter.
                         declaration_refused=declaration is None and (earlier_calls is not None or declaration_attempted(
-                            result.get("messages"), boundary)))
+                            result.get("messages"), boundary)),
+                        known_call_ids=known_call_ids(result.get("messages"), boundary, earlier_calls or ()))
                 try:
                     facts = turn_provenance(
                         result.get("messages"), history_boundary=boundary, peer=peer, body=event.text,
@@ -3956,7 +3957,7 @@ class GatewayRunner(
                     raise ValueError("canonical_turn_refused")
                 if owed_kind is not None:
                     from dataclasses import replace as _replace
-                    from gateway.owner_relay import accepted_declaration, declaration_attempted
+                    from gateway.owner_relay import accepted_declaration, declaration_attempted, known_call_ids
                     from tools.relay_resolve_tool import PEER_OUTCOMES
                     declaration = accepted_declaration(result.get("messages"), boundary, event_id=event.event_id,
                                                        allowed=PEER_OUTCOMES)
@@ -3964,7 +3965,8 @@ class GatewayRunner(
                                     public_reply=declaration[1] if declaration else None,
                                     evidence=tuple(declaration[2]) if declaration else (),
                                     declaration_refused=declaration is None and declaration_attempted(
-                                        result.get("messages"), boundary))
+                                        result.get("messages"), boundary),
+                                    known_call_ids=known_call_ids(result.get("messages"), boundary))
                 return selected
             finally:
                 for name, value in outward_callbacks.items():

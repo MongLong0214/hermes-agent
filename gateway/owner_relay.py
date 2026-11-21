@@ -128,6 +128,20 @@ def turn_calls(messages: Any, boundary: Any) -> list:
     return calls
 
 
+def known_call_ids(messages: Any, boundary: Any, earlier: Any = ()) -> tuple:
+    """Every tool call id of the turn that began at ``messages[boundary]`` (the declaration's own included) and of
+    the *earlier* turns' recorded calls: what a public text may never carry. Used by the accepted path and by the
+    free-text fallback alike, so the two cannot drift."""
+    ids = set()
+    if isinstance(messages, list) and isinstance(boundary, int) and not isinstance(boundary, bool):
+        for row in messages[max(boundary, 0):]:
+            if isinstance(row, Mapping) and row.get("role") == "assistant" and isinstance(row.get("tool_calls"), list):
+                ids |= {c.get("id") for c in row["tool_calls"] if isinstance(c, Mapping)}
+        ids |= {c["id"] for c in turn_calls(messages, boundary)}
+    ids |= {c.get("id") for c in earlier or () if isinstance(c, Mapping)}
+    return tuple(sorted(i for i in ids if isinstance(i, str) and i))
+
+
 def declaration_attempted(messages: Any, boundary: Any) -> bool:
     """True when the turn that began at ``messages[boundary]`` called ``relay_resolve`` at all, accepted or not."""
     from tools.relay_resolve_tool import TOOL_NAME
@@ -188,9 +202,8 @@ def accepted_declaration(messages: Any, boundary: Any, *, event_id: str, earlier
         return None
     if args["outcome"] == "done" and not items:
         return None
-    every_id = {c["id"] for c in turn_calls(rows, 0)} | {call_id} | {c.get("id") for c in earlier if isinstance(c, Mapping)}
     public_reply = args.get("public_reply")
-    if public_reply_problem(public_reply, [i for i in every_id if isinstance(i, str)]) is not None:
+    if public_reply_problem(public_reply, known_call_ids(rows, 0, earlier)) is not None:
         return None
     evidence = [{"tool_call_id": value} for _, value in items]
     return args["outcome"], public_reply.strip(), evidence

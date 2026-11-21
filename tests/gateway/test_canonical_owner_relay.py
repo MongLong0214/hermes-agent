@@ -1240,3 +1240,40 @@ def test_a_recovery_turn_that_declares_nothing_publishes_its_free_text_only_thro
         assert "call-1" not in json.dumps(body) and "/home/user" not in json.dumps(body)
 
     asyncio.run(exercise())
+
+
+_WEIRD_ID = "toolu-weird-XYZ123"
+
+
+def test_the_weird_call_id_is_not_caught_by_the_shape_filter_alone():
+    from tools.relay_resolve_tool import public_reply_problem
+    assert public_reply_problem(f"Finished {_WEIRD_ID} fine") is None
+    assert public_reply_problem(f"Finished {_WEIRD_ID} fine", [_WEIRD_ID]) is not None
+
+
+def test_a_refused_declarations_free_text_never_carries_a_real_call_id_of_any_shape(ingress, send, monkeypatch):
+    _entitle()
+    _transcript(_owner_record())
+    _scripted(ingress, monkeypatch, (f"Finished {_WEIRD_ID} fine", _work(call_id=_WEIRD_ID),
+                                     _resolve("done", [], ok=False)))
+
+    async def exercise():
+        status, body = await send(text=_relay())
+        assert (status, body) == (200, _owed("declaration refused; this event stays open"))
+
+    asyncio.run(exercise())
+    [receipt] = ingress.receipts()
+    assert "resolved" not in receipt["response"] and _WEIRD_ID not in receipt["response"]["terminal_text"]
+
+
+def test_a_recovery_turn_without_a_declaration_never_carries_an_earlier_real_call_id_of_any_shape(
+        ingress, send, monkeypatch):
+    _entitle()
+    _transcript(_owner_record())
+    _scripted(ingress, monkeypatch, ("ACK", _work(call_id=_WEIRD_ID)), (f"Finished {_WEIRD_ID} fine",))
+
+    async def exercise():
+        assert await send(text=_relay()) == (200, _owed("ACK"))
+        assert await send(text=_relay()) == (200, _owed("declaration refused; this event stays open"))
+
+    asyncio.run(exercise())

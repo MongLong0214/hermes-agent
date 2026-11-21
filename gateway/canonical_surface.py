@@ -156,6 +156,9 @@ class CanonicalTurnResult:
     # The turn called ``relay_resolve`` and no declaration was accepted: its free text is public only through
     # the public filter (see ``submit``).
     declaration_refused: bool = False
+    # Every real tool call id of this turn and the earlier ones (gateway.owner_relay.known_call_ids): the fallback
+    # filter refuses them whatever their shape. Not recorded.
+    known_call_ids: tuple = ()
 
 
 class RequestLocalReplySink(Protocol):
@@ -1546,7 +1549,7 @@ class CanonicalReceiptCoordinator:
                         # A refused declaration leaves the turn's free text unfiltered: it is published only if it
                         # passes the same filter as a public_reply, else a fixed notice. The event stays owed.
                         from tools.relay_resolve_tool import public_reply_problem
-                        if public_reply_problem(result.terminal_text) is not None:
+                        if public_reply_problem(result.terminal_text, result.known_call_ids) is not None:
                             result = replace(result, terminal_text=REFUSED_DECLARATION_NOTICE)
                     answer = _result_answer(result, observation)
                     if relay is not None and answer.terminal_text is not None:
