@@ -334,7 +334,8 @@ def _append_skipped_tool_results(
     for tc in tool_calls:
         name = _tc_name(tc)
         result = content.format(name=name)
-        messages.append(make_tool_result_message(name, result, _pairing_tool_call_id(tc), effect_disposition="none"))
+        messages.append(make_tool_result_message(name, result, _pairing_tool_call_id(tc), effect_disposition="none",
+                                                 outcome="refused"))
         if hook_error_type is not None:
             _ToolCallRef(name, {}, effective_task_id, (hook_id or _pairing_tool_call_id)(tc), []).emit_post(
                 agent, result,
@@ -347,6 +348,9 @@ def _append_skipped_tool_results(
     return True
 
 
+_REPLY_ONLY_REFUSAL = ("[Tool call not executed — {name} was requested in a reply-only recovery turn. This turn may "
+                       "only answer the thread and call relay_resolve: the earlier turn's work is never repeated, and "
+                       "a batch holding any other call runs nothing.]")
 _PEER_TOOL_REFUSAL = ("[Tool call not executed — {name} was requested during a canonical peer turn. Only the "
                       "configured ACP CEO tools, with in-scope arguments, may run in a canonical peer turn, and a "
                       "batch holding any other call runs nothing. A peer has no approval authority.]")
@@ -356,7 +360,14 @@ def peer_batch_refused(agent, tool_calls, emitted_names=None) -> bool:
     """True in a canonical peer turn whose batch may not run: it runs only when EVERY call is an
     allowed ACP CEO call under the grant its verified ingress bound (agent.canonical_peer_tools)
     and, given ``emitted_names``, every name is still exactly as the model emitted it. Authority
-    follows the turn principal and grant, never message text."""
+    follows the turn principal and grant, never message text.
+
+    A reply-only recovery turn of a relayed owner instruction (tools.relay_resolve_tool) may run nothing but
+    its declaration, so a batch with any other call is refused here, whoever's turn it is."""
+    from tools.relay_resolve_tool import reply_only_refuses
+
+    if reply_only_refuses(_tc_name(tc) for tc in tool_calls):
+        return True
     if not _peer_turn(agent):
         return False
     if emitted_names is not None and [_tc_name(tc) for tc in tool_calls] != list(emitted_names):
@@ -470,14 +481,18 @@ def append_peer_refusals(agent, tool_calls, messages: list, *, reasons: Optional
     ``reasons`` (:func:`_peer_argument_reasons`), each call states its own argument or scope block,
     or that a sibling's block stopped the batch, instead of the permission text."""
     if reasons is None:
-        _append_skipped_tool_results(agent, messages, tool_calls, "", content=_PEER_TOOL_REFUSAL)
+        from tools.relay_resolve_tool import is_reply_only_turn
+
+        _append_skipped_tool_results(agent, messages, tool_calls, "",
+                                     content=_REPLY_ONLY_REFUSAL if is_reply_only_turn() else _PEER_TOOL_REFUSAL)
         return
     for tc, block in zip(tool_calls, reasons):
         name = _tc_name(tc)
         # No str.format over the block: it carries a JSON schema, braces included.
         result = (_PEER_ARGUMENT_REFUSAL.replace("{name}", name).replace("{reason}", _flatten_probe(block)) if block
                   else _PEER_SIBLING_REFUSAL.replace("{name}", name))
-        messages.append(make_tool_result_message(name, result, _pairing_tool_call_id(tc), effect_disposition="none"))
+        messages.append(make_tool_result_message(name, result, _pairing_tool_call_id(tc), effect_disposition="none",
+                                                 outcome="refused"))
 
 
 def _refuse_peer_tool_calls(agent, tool_calls, messages: list) -> bool:
@@ -1279,7 +1294,9 @@ def _commit_tool_result(
     # Multimodal dicts become an OpenAI-style content list; text-only servers get a
     # string-safe fallback so a rejected image result never poisons history.
     _tool_content = agent._tool_result_content_for_active_model(function_name, persisted_result)
-    tool_message = make_tool_result_message(function_name, _tool_content, tool_call_id, effect_disposition=effect_disposition)
+    tool_message = make_tool_result_message(
+        function_name, _tool_content, tool_call_id, effect_disposition=effect_disposition,
+        outcome="refused" if blocked else "failed" if is_error else "ok")
     # Prepare presentation data before the append. The emitting completion callback
     # stays below the durability fence; raw tool/model content remains unchanged.
     prepare_metadata = getattr(agent, "tool_result_metadata_callback", None)

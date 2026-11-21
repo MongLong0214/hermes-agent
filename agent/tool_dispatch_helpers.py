@@ -403,6 +403,7 @@ def make_tool_result_message(
     tool_call_id: str,
     *,
     effect_disposition: str | None = None,
+    outcome: str | None = None,
 ) -> dict:
     """Build a tool-result message: OpenAI ``name`` (wire format) plus internal ``tool_name``
     (session DB). High-risk tool content (web_extract, web_search, browser_*, mcp_*) is
@@ -429,6 +430,11 @@ def make_tool_result_message(
             message["_tool_output_risk"] = risk_metadata
     if effect_disposition is not None:
         message["effect_disposition"] = effect_disposition
+    if outcome is not None:
+        # What the executor decided, where it produced this result: ``ok``, ``failed`` or ``refused``. Internal
+        # (the underscore keeps it off the wire); what the relayed-owner declaration may cite is read from
+        # here, never from the result's text.
+        message["_tool_outcome"] = outcome
     return message
 
 

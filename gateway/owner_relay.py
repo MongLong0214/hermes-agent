@@ -63,11 +63,6 @@ REASONS = frozenset({
 })
 DISPLAY_KIND = "owner_relay"
 METADATA_KEY = "owner_relay"
-# The owner turn's own declaration that it handled the relayed instruction: a line holding exactly this opens
-# its final answer. The turn is told so (:func:`render_owner_turn`). It completes the reply the thread is owed;
-# no wording of an answer can (an acknowledgement is not told from an answer by its words), and nothing in a
-# message grants it.
-RESOLVED_MARKER = "[RESOLVED]"
 # One state_meta row per transcript record relayed: ``<prefix><session>:<record uuid>`` -> the receipt key.
 RECORD_LEDGER_PREFIX = "owner-relay-record:v1:"
 
@@ -106,22 +101,120 @@ class VerifiedRelay:
     note: str
 
 
-def split_resolved(text: Any) -> tuple[Any, bool]:
-    """``(reply, True)`` when *text* opens with one or more lines holding exactly :data:`RESOLVED_MARKER` (blank
-    lines between them allowed) and a reply follows them, every such leading line removed; ``("", False)`` when
-    nothing follows them (a declaration with no reply is no answer, and no resolved empty one); ``(text, False)``
-    when it does not open with the marker (the marker anywhere else is no declaration)."""
-    if not isinstance(text, str):
-        return text, False
-    lines = text.replace("\r\n", "\n").split("\n")
-    at, declared = 0, False
-    while at < len(lines) and (not lines[at].strip() or lines[at].strip() == RESOLVED_MARKER):
-        declared = declared or bool(lines[at].strip())
-        at += 1
-    if not declared:
-        return text, False
-    reply = "\n".join(lines[at:]).strip()
-    return (reply, True) if reply else ("", False)
+def turn_calls(messages: Any, boundary: Any) -> list:
+    """``[{"id", "tool", "ok"}, ...]``: every tool call of the turn that began at ``messages[boundary]`` that got a
+    result row, in order, with ``ok``: the executor recorded that call's outcome as ``ok`` on the row
+    (``_tool_outcome``, set where it produced the result). A call that failed or was refused is listed too (it
+    may have done part of its work) and cannot be cited. The result's text is never read. The declaration itself
+    is not work."""
+    from tools.relay_resolve_tool import TOOL_NAME
+
+    if not isinstance(messages, list) or isinstance(boundary, bool) or not isinstance(boundary, int):
+        return []
+    outcomes = {}
+    for row in messages[max(boundary, 0):]:
+        if isinstance(row, Mapping) and row.get("role") == "tool" and isinstance(row.get("tool_call_id"), str):
+            outcomes[row["tool_call_id"]] = row.get("_tool_outcome")
+    calls = []
+    for row in messages[max(boundary, 0):]:
+        if not isinstance(row, Mapping) or row.get("role") != "assistant" or not isinstance(row.get("tool_calls"), list):
+            continue
+        for call in row["tool_calls"]:
+            function = call.get("function") if isinstance(call, Mapping) else None
+            name = function.get("name") if isinstance(function, Mapping) else None
+            call_id = call.get("id") if isinstance(call, Mapping) else None
+            if isinstance(name, str) and isinstance(call_id, str) and name != TOOL_NAME and call_id in outcomes:
+                calls.append({"id": call_id, "tool": name, "ok": outcomes[call_id] == "ok"})
+    return calls
+
+
+def known_call_ids(messages: Any, boundary: Any, earlier: Any = ()) -> tuple:
+    """Every tool call id of the turn that began at ``messages[boundary]`` (the declaration's own included) and of
+    the *earlier* turns' recorded calls: what a public text may never carry. Used by the accepted path and by the
+    free-text fallback alike, so the two cannot drift."""
+    ids = set()
+    if isinstance(messages, list) and isinstance(boundary, int) and not isinstance(boundary, bool):
+        for row in messages[max(boundary, 0):]:
+            if isinstance(row, Mapping) and row.get("role") == "assistant" and isinstance(row.get("tool_calls"), list):
+                ids |= {c.get("id") for c in row["tool_calls"] if isinstance(c, Mapping)}
+        ids |= {c["id"] for c in turn_calls(messages, boundary)}
+    ids |= {c.get("id") for c in earlier or () if isinstance(c, Mapping)}
+    return tuple(sorted(i for i in ids if isinstance(i, str) and i))
+
+
+def declaration_attempted(messages: Any, boundary: Any) -> bool:
+    """True when the turn that began at ``messages[boundary]`` called ``relay_resolve`` at all, accepted or not."""
+    from tools.relay_resolve_tool import TOOL_NAME
+
+    if not isinstance(messages, list) or isinstance(boundary, bool) or not isinstance(boundary, int):
+        return False
+    for row in messages[max(boundary, 0):]:
+        if isinstance(row, Mapping) and row.get("role") == "assistant" and isinstance(row.get("tool_calls"), list):
+            for call in row["tool_calls"]:
+                function = call.get("function") if isinstance(call, Mapping) else None
+                if isinstance(function, Mapping) and function.get("name") == TOOL_NAME:
+                    return True
+    return False
+
+
+def accepted_declaration(messages: Any, boundary: Any, *, event_id: str, earlier: Any = (),
+                         allowed: Any = None) -> Optional[tuple]:
+    """``(outcome, public_reply, evidence)`` of this turn's declaration, or None: the LAST ``relay_resolve`` call of
+    the turn that began at ``messages[boundary]``, when the executor recorded it ``ok`` (its handler accepted it),
+    it names *event_id* and a known outcome, its ``public_reply`` passes the structural filter
+    (``tools.relay_resolve_tool.public_reply_problem``, also against every tool call id of this and the *earlier*
+    turns), and every evidence item is real: a ``tool_call_id`` of a call this turn made before it, or one of the
+    *earlier* turns' recorded calls, that the executor recorded ``ok``; ``done`` needs at least one. Evidence cites
+    tool calls only (``[{"tool_call_id": ...}]``, kept in the receipt, never published): the declared answer of
+    answered, declined and deferred is the ``public_reply`` itself, and prose in evidence is no answer (such a
+    declaration is malformed). Only ``outcome`` and ``public_reply`` are published (:func:`published_reply`).
+    *allowed*: the outcomes this turn may declare (default all). Anything else resolves nothing."""
+    from tools.relay_resolve_tool import OUTCOMES, TOOL_NAME, evidence_items, public_reply_problem
+
+    if not isinstance(messages, list) or isinstance(boundary, bool) or not isinstance(boundary, int):
+        return None
+    rows = messages[max(boundary, 0):]
+    declaration = None
+    for at, row in enumerate(rows):
+        if isinstance(row, Mapping) and row.get("role") == "assistant" and isinstance(row.get("tool_calls"), list):
+            for call in row["tool_calls"]:
+                function = call.get("function") if isinstance(call, Mapping) else None
+                if isinstance(function, Mapping) and function.get("name") == TOOL_NAME:
+                    declaration = (at, call.get("id"), function.get("arguments"))
+    if declaration is None:
+        return None
+    at, call_id, raw = declaration
+    try:
+        args = json.loads(raw) if isinstance(raw, str) else raw
+        accepted = next(r.get("_tool_outcome") == "ok" for r in rows[at:]
+                        if isinstance(r, Mapping) and r.get("role") == "tool" and r.get("tool_call_id") == call_id)
+    except (ValueError, StopIteration, TypeError):
+        return None
+    if (not accepted or not isinstance(args, Mapping) or args.get("event_id") != event_id
+            or args.get("outcome") not in (allowed or OUTCOMES)):
+        return None
+    items = evidence_items(args.get("evidence"))
+    if items is None:
+        return None
+    known = {c["id"] for c in turn_calls(rows[:at], 0) if c["ok"]}
+    known |= {c.get("id") for c in earlier if isinstance(c, Mapping) and c.get("ok") is True}
+    if any(value not in known for _, value in items):
+        return None
+    if args["outcome"] == "done" and not items:
+        return None
+    public_reply = args.get("public_reply")
+    if public_reply_problem(public_reply, known_call_ids(rows, 0, earlier)) is not None:
+        return None
+    evidence = [{"tool_call_id": value} for _, value in items]
+    return args["outcome"], public_reply.strip(), evidence
+
+
+def published_reply(outcome: str, public_reply: str) -> str:
+    """What the thread is told for an accepted declaration: exactly ``<outcome label>: <public_reply>``, composed
+    here and nowhere else. The turn's own free text and the evidence are never published."""
+    from tools.relay_resolve_tool import PUBLIC_LABELS
+
+    return f"{PUBLIC_LABELS[outcome]}: {public_reply}"
 
 
 def parse_relay(text: Any) -> Optional[RelayClaim]:
@@ -197,6 +290,44 @@ def event_content(text: Any, *, event_id: str, channel_id: str, author_id: str) 
     if at >= len(lines) or not lines[at].startswith(_CONTENT):
         return text
     return "\n".join([lines[at][len(_CONTENT):], *lines[at + 1:]])
+
+
+ACP_KIND_TAG = "acp-kind"
+_KIND_WORDS = {"question": "a question", "ruling": "a ruling request", "conflict": "a conflict"}
+
+
+def peer_declaration_note(disposition: str, event_id: str) -> str:
+    """What the peer turn of a post a bound CTO declared owed is told, after the quoted post: it owes an answer
+    and closes it with the ``relay_resolve`` declaration, which an acknowledgement is not."""
+    return (f"\n[The canonical CTO declared the post above {_KIND_WORDS.get(disposition, 'owed')} the CEO owes an "
+            f"answer. Declare it handled by calling the relay_resolve tool once with event_id "
+            f"{json.dumps(event_id)}, an outcome (answered, declined or deferred_with_reason) and a public_reply: "
+            "the answer, decision or, for a conflict, the resolution, as the one plain statement the CTO is told, "
+            "published exactly as '<outcome>: <public_reply>', never with a slash outside an http(s) URL, a "
+            "backslash, or a tool call, session, claim or receipt id. An acknowledgement, or an answer without that declaration, leaves it open.]")
+
+
+def event_acp_kind(text: Any, *, event_id: str, channel_id: str, author_id: str) -> Optional[str]:
+    """The value of the one ``["acp-kind", value]`` tag on the event *text* frames (ACP's CTO channel ``reply``
+    tool writes it on a CTO->CEO post), or None. It is read only from the event's own Tags line, the last line
+    of the bridge's framing of this very event (its id, channel and author, as :func:`event_content` reads it),
+    and only as a tag of exactly two strings, once: nothing in the message's words is ever read. Whether the
+    author may declare it is the coordinator's judgement (the bound canonical CTO), not this reader's."""
+    if not isinstance(text, str) or event_content(
+            text, event_id=event_id, channel_id=channel_id, author_id=author_id) is text:
+        return None
+    lines = text.replace("\r\n", "\n").split("\n")
+    tail = lines[-2] if len(lines) >= 2 and lines[-1].startswith("Parsed: ") else lines[-1]
+    if not tail.startswith("Tags: "):
+        return None
+    try:
+        tags = json.loads(tail[len("Tags: "):])
+    except ValueError:
+        return None
+    if not (isinstance(tags, list) and all(isinstance(t, list) and all(isinstance(v, str) for v in t) for t in tags)):
+        return None
+    declared = [t for t in tags if t and t[0] == ACP_KIND_TAG]
+    return declared[0][1] if len(declared) == 1 and len(declared[0]) == 2 else None
 
 
 def _instant(value: Any) -> Optional[datetime]:
@@ -392,12 +523,12 @@ def new_metadata(relay: VerifiedRelay, *, binding: str, author_id: str, channel_
             "timestamp": relay.timestamp, "nonce": secrets.token_hex(16)}
 
 
-def render_owner_turn(relay: VerifiedRelay, metadata: Mapping[str, str], *, again: bool = False) -> str:
+def render_owner_turn(relay: VerifiedRelay, metadata: Mapping[str, str], *, earlier: Any = None) -> str:
     """The model-facing text of the owner turn: its provenance, the original quoted verbatim between
-    per-turn nonce markers, and the CTO's note quoted apart, carrying no owner authority. *again*: this
-    instruction already ran in this conversation and its answer did not declare it resolved; the turn is told
-    so, not to repeat what it did, and to finish what is left. Raises
-    ``ValueError("canonical_envelope_escape")`` when either text holds the nonce."""
+    per-turn nonce markers, and the CTO's note quoted apart, carrying no owner authority. *earlier*: the calls
+    (``[{"id", "tool"}]``) the instruction's earlier turn made, for a reply-only recovery turn: this instruction
+    already ran, its answer did not declare it resolved, and this turn may do nothing but answer and declare.
+    Raises ``ValueError("canonical_envelope_escape")`` when either text holds the nonce."""
     nonce = metadata["nonce"]
     if any(nonce in text for text in (relay.original, relay.owner_text, relay.note)):
         raise ValueError("canonical_envelope_escape")
@@ -408,11 +539,19 @@ def render_owner_turn(relay: VerifiedRelay, metadata: Mapping[str, str], *, agai
         "carries the owner's authority: act on it as if the owner had typed it here. Do not ask the owner "
         "to confirm, re-approve or retype it. Your answer goes to the Buzz thread it was relayed in; if a tool "
         "or a permission refuses, report that refusal there, never as a request for the owner to approve again. "
-        f"Begin your answer with a line holding exactly {RESOLVED_MARKER}, then your reply, only when you have "
-        "fully handled this instruction; otherwise answer without that line and the instruction stays open.\n"
-        + ("This instruction was already run once in this conversation and your earlier answer did not declare "
-           "it resolved: do not repeat any action you already took, finish what is left, and answer.\n"
-           if again else "")
+        "When the instruction is handled, declare it by calling the relay_resolve tool once with event_id "
+        f"{json.dumps(metadata['event_id'])}, an outcome (done, answered, declined or deferred_with_reason), "
+        "evidence (tool_call_id items naming tool results of this instruction's turns: required for done, internal "
+        "and never published) and a public_reply: the one plain statement the thread is told, published exactly as "
+        "'<outcome>: <public_reply>', so for answered, declined or deferred it IS your answer, decision or reason; "
+        "never with a slash outside an http(s) URL, a backslash, or a tool call, session, claim or receipt id. "
+        "Without a declaration the instruction stays open, and your final answer is only an acknowledgement.\n"
+        + (("This is a reply-only recovery turn. This instruction already ran in this conversation and its answer "
+            "did not declare it resolved. You have no tool but relay_resolve now: do not act and do not repeat "
+            "any action. The earlier turn made these calls: "
+            + (", ".join(f"{c['tool']} (tool_call_id {c['id']}{'' if c.get('ok') else ', failed'})"
+                         for c in earlier) or "none")
+            + ". Answer the thread and declare what is true, citing them.\n") if earlier is not None else "")
         + f"<<<owner-instruction:{nonce}>>>\n{relay.owner_text}\n<<<end-owner-instruction:{nonce}>>>"
     )
 

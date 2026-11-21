@@ -80,6 +80,10 @@ class PeerToolGrant:
     pins: dict = field(default_factory=dict, repr=False, compare=False)
     prepared: dict = field(default_factory=dict, repr=False, compare=False)
     attempted: list = field(default_factory=list, repr=False, compare=False)
+    # The event of the post a bound canonical CTO declared a question, ruling request or conflict (ACP's
+    # ``acp-kind``): the one event this turn's ``relay_resolve`` declaration may name. None for every other peer
+    # turn, which may not declare anything.
+    resolve_event: Optional[str] = None
 
 
 _grant: contextvars.ContextVar[Optional[PeerToolGrant]] = contextvars.ContextVar(
@@ -262,8 +266,43 @@ def _fence_holds(grant: PeerToolGrant) -> bool:
     return True
 
 
-def _check(policy: _Policy, name: str, args: Any) -> Optional[list]:
+def _check_resolve(args: Any) -> Optional[list]:
+    """The pin of a ``relay_resolve`` call, only for the event the grant names (a post the bound CTO declared
+    owed) and only while the fence holds; it needs no policy entry, opens no other tool, and runs only on exactly
+    the arguments checked. None for any other turn or event."""
+    from tools.arg_coercion import coerce_tool_args
+    from tools.registry import registry, tool_error
+    from tools.relay_resolve_tool import TOOL_NAME
+
+    grant, entry = _grant.get(), registry.get_entry(TOOL_NAME)
+    if (grant is None or not grant.resolve_event or entry is None or not isinstance(args, Mapping)
+            or args.get("event_id") != grant.resolve_event or not _fence_holds(grant)):
+        return None
+    final = coerce_tool_args(TOOL_NAME, copy.deepcopy(dict(args)))
+    canonical = _canonical(final)
+    if canonical is None:
+        return None
+    handler = entry.handler
+
+    def run(call_args: Any, **kwargs: Any) -> Any:
+        live = _grant.get()
+        if (live is None or live.resolve_event != grant.resolve_event or _canonical(call_args) != canonical
+                or not _fence_holds(live)):
+            return tool_error("Not run: a canonical peer turn declares only the event it was admitted for, with "
+                              "the arguments its batch checked.")
+        return handler(call_args, **kwargs)
+
+    return [PinnedCall(TOOL_NAME, run, final, canonical, peer_grant_digest({"resolve": grant.resolve_event}))]
+
+
+def _check(policy: Optional[_Policy], name: str, args: Any) -> Optional[list]:
     """The :class:`PinnedCall` list an allowed call needs (``[]`` for discovery), or None."""
+    from tools.relay_resolve_tool import TOOL_NAME as RESOLVE_TOOL
+
+    if name == RESOLVE_TOOL:
+        return _check_resolve(args)  # needs no policy entry and none of the discovery bridge
+    if policy is None:
+        return None  # nothing else runs without a policy
     from tools.arg_coercion import coerce_tool_args
     from tools.tool_search import TOOL_CALL_NAME, TOOL_DESCRIBE_NAME, TOOL_SEARCH_NAME, normalize_tool_call_entries
 
@@ -316,14 +355,18 @@ def batch_allowed(agent: Any, calls: Sequence[tuple[str, Any]], emitted: Optiona
     own; given ``emitted`` (``(call id, tool call)`` per call), it also replaces the prepared calls
     dispatch consumes. A refused batch clears both."""
     policy = _active_policy(agent)
-    checked: Optional[list] = [] if policy is not None and calls else None
+    grant = _grant.get()
+    # A turn the bound CTO declared owed may declare it without a policy entry (``_check_resolve``); nothing else
+    # runs without a policy.
+    usable = bool(calls) and (policy is not None or (grant is not None and grant.agent is agent
+                                                      and bool(grant.resolve_event)))
+    checked: Optional[list] = [] if usable else None
     for name, args in calls if checked is not None else ():
         pins = _check(policy, name, args)
         if pins is None:
             checked = None
             break
         checked.append(pins)
-    grant = _grant.get()
     if grant is not None:
         with _pins_lock:
             grant.pins.clear()

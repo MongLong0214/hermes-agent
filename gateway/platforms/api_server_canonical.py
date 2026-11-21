@@ -244,15 +244,18 @@ async def handle_canonical_surface_event(self, request: "web.Request") -> "web.R
                        event.event_id[:96], receipt.status)
         return _refusal("canonical_event_uncertain", 409)
     body = {"event_id": event.event_id, "text": receipt.terminal_text}
-    if receipt.disposition is not None:
-        # An event whose answer owes a reply: an answer that is the silence marker is no reply, so the
-        # bridge is told which it is rather than left to read the text (gateway/response_filters.py).
-        from gateway.response_filters import is_intentional_silence_response
+    # The bridge is told whether the answer is the silence marker rather than left to read the text
+    # (gateway/response_filters.py): for an owed event it is no reply, for any other it is no post at all.
+    from gateway.response_filters import is_intentional_silence_response
 
+    silent = is_intentional_silence_response(receipt.terminal_text)
+    if receipt.disposition is not None:
         body["disposition"] = receipt.disposition
-        body["silent"] = is_intentional_silence_response(receipt.terminal_text)
+        body["silent"] = silent
         if receipt.resolved:
-            body["resolved"] = True  # the turn's own declaration; only it completes the owed reply
+            body["resolved"] = True  # the declaration the gateway accepted; only it completes the owed reply
+    elif silent:
+        body["silent"] = True
     return web.json_response(body)
 
 

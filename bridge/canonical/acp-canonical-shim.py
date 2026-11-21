@@ -758,9 +758,10 @@ ANSWER_OWED = frozenset({"owner_relay", "question", "ruling", "conflict"})
 
 class Answer(str):
     """The gateway's answer text, with the disposition it recorded for the event and whether the answer is
-    the silence marker (``disposition`` None: the event is owed nothing) and whether the CEO turn declared the
-    event resolved (gateway/owner_relay.py RESOLVED_MARKER). Only that declaration completes an owed reply:
-    nothing in an answer's wording does."""
+    the silence marker (``disposition`` None: the event is owed nothing) and whether the gateway accepted the
+    turn's declaration that the event is resolved (``relay_resolve``, tools/relay_resolve_tool.py, judged by
+    gateway/owner_relay.py ``accepted_outcome``). Only that completes an owed reply: nothing in an answer's
+    wording does."""
 
     disposition = None
     silent = False
@@ -769,7 +770,7 @@ class Answer(str):
     def __new__(cls, text, disposition=None, silent=False, resolved=False):
         self = super().__new__(cls, text)
         self.disposition = disposition if isinstance(disposition, str) and disposition in ANSWER_OWED else None
-        self.silent = silent is True and self.disposition is not None
+        self.silent = silent is True
         self.resolved = resolved is True and self.disposition is not None
         return self
 
@@ -1109,7 +1110,64 @@ _RETRIES = []  # one daemon thread per answer whose post is still being retried;
 _RETRIES_LOCK = threading.Lock()
 
 
+def _retry_lock(name):
+    """The fd holding ``PUBLISHED/.<name>.retry`` under an exclusive ``flock``, or None when another holder has it.
+    A retry thread holds it while it lives; the kernel drops it when the process dies (or a retry never started),
+    which is how a later shim tells a pending journal whose owner is gone from one still being finished.
+    A release unlinks the file, so a lock won on an inode the path no longer names (unlinked, or replaced by
+    another holder's file) is not held: it is dropped and taken once more on the file now at the path."""
+    path = os.path.join(PUBLISHED, f".{name}.retry")
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        except OSError:
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return None
+        try:
+            held, named = os.fstat(fd), os.stat(path)
+            if (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino):
+                return fd
+        except OSError:
+            pass
+        os.close(fd)
+    return None
+
+
+def _release_retry_lock(name, fd):
+    if fd is None:
+        return
+    try:
+        os.unlink(os.path.join(PUBLISHED, f".{name}.retry"))
+    except OSError:
+        pass
+    os.close(fd)
+
+
 def _retry_publication(name, record, body, digests, tag):
+    """Finish one answer's post off the turn path (``_retry_publication_locked``), holding its retry lock."""
+    lock = _retry_lock(name)
+    if lock is None:  # another holder has it (or it cannot be taken): no resend, no record update
+        log(f"prompt {tag}… retry lock not held; not resending, record left as it is")
+        return
+    try:
+        # Under the lock, only the pending item this thread was started for is finished: a record settled
+        # meanwhile (_settle_abandoned) or now another item's is not resent and not rewritten from this one.
+        now = publication_record(name)
+        if (now.get("pending") is not True or any(now.get(k) != record.get(k)
+                                                  for k in ("kind", "body_sha256", "channel", "reply_to"))):
+            log(f"prompt {tag}… record is no longer the pending item this retry was started for; "
+                "not resending, record left as it is")
+            return
+        _retry_publication_locked(name, record, body, digests, tag)
+    finally:
+        _release_retry_lock(name, lock)
+
+
+def _retry_publication_locked(name, record, body, digests, tag):
     """Finish one answer's post off the turn path. Before each resend the thread is read back: an earlier
     attempt that landed is recorded as ``sent`` (``recovered``) and never sent again, and a read-back that
     fails is read again after the next wait, never taken for absence. At most one resend per wait in
@@ -1205,6 +1263,43 @@ def _reopens_owed_slot(name, body, resolved):
     return True
 
 
+def _settle_abandoned(name):
+    """An owed answer's journal says ``pending: true`` and nothing is finishing it: its shim died (or its retry
+    never started) after an exit 0 send whose read-back failed. A retry thread alive anywhere holds the journal's
+    retry lock, and then nothing is touched. Otherwise the thread is read for the OLD post (its own body digest
+    and target, whatever answer is being published now), never resent: found, it is ``confirmed`` (or
+    ``acknowledged``, when it was not the turn's declaration) and pending is cleared; not found or unreadable,
+    pending is cleared and it stays ``unconfirmed`` (nobody is left to finish it). The answer being published now
+    is then the next publication of the still-owed event."""
+    if publication_record(name).get("pending") is not True:
+        return False
+    lock = _retry_lock(name)
+    if lock is None:
+        return False
+    try:
+        prior = publication_record(name)
+        if (prior.get("kind") != "answer" or prior.get("pending") is not True
+                or prior.get("disposition") not in ANSWER_OWED or not isinstance(prior.get("body_sha256"), str)):
+            return False
+        owed, resolved = prior["disposition"], prior.get("resolved") is True
+        posted = _read_back(prior.get("channel"), prior.get("reply_to"), {prior["body_sha256"]}) == "posted"
+        at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        if posted:
+            _rewrite_publication(name, dict(
+                prior, sent=True, state="sent", delivery="posted", disposition=owed, recovered=True, pending=False,
+                reason="found in the thread after the shim that sent it ended", at=at,
+                reply_state=_reply_state(True, resolved)))
+            log(f"prompt {name[:12]}… pending owed reply found in the thread after its shim ended; not posted again")
+        else:
+            _rewrite_publication(name, dict(prior, sent=False, delivery="failed", pending=False,
+                                            reply_state="unconfirmed", at=at))
+            log(f"prompt {name[:12]}… pending owed reply not shown by the thread and its shim is gone: unconfirmed; "
+                "not posted again")
+        return posted
+    finally:
+        _release_retry_lock(name, lock)
+
+
 def _settle_claimed(name, body, digests, channel, target, owed, resolved):
     """The answer is the text its claimed journal already holds, or the event is not owed: nothing is posted
     either way. True only when the thread, read now, shows this very post and it is journaled so.
@@ -1214,7 +1309,7 @@ def _settle_claimed(name, body, digests, channel, target, owed, resolved):
     is ``confirmed`` (or ``acknowledged``, without the turn's declaration); not found, ``unconfirmed``. A
     reply already ``acknowledged`` becomes ``confirmed`` when this answer is the turn's declaration."""
     prior = publication_record(name)
-    if prior.get("kind") != "answer" or prior.get("pending") is True:
+    if prior.get("kind") != "answer" or prior.get("pending") is True:  # not an answer, or a live retry owns it
         return False
     legacy = "disposition" not in prior
     if owed not in ANSWER_OWED:
@@ -1266,6 +1361,27 @@ def reopen_base_silence(event_id, channel, answer):
     return cleared
 
 
+def close_silently(event_id, channel):
+    """An event the gateway judged owed nothing ended with the silence marker: a real no-action report. It closes
+    with no reply and no post (the marker is never posted as text); the journal says so (``silent``), and
+    recovery reads it answered. True when this call journaled it."""
+    name = outcome_key(event_id, channel)
+    fd, why = _claim(name)
+    if fd is None:
+        log(f"prompt {name[:12]}… no-action report already journaled once; nothing to post" if why == "exists"
+            else f"prompt {name[:12]}… no-action report not journaled: {why}")
+        return False
+    record = {"journal": 2, "sent": False, "state": "silent", "delivery": "none", "silent": True,
+              "disposition": None, "kind": "answer", "event_id": event_id, "ref": None, "channel": channel,
+              "roster_generation": getattr(_local, "roster_generation", None), "reply_to": event_id,
+              "reason": "no-action report ended silent; nothing posted", "attempts": 0,
+              "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    with os.fdopen(fd, "w") as marker:
+        marker.write(json.dumps(record) + "\n")
+    log(f"prompt {name[:12]}… no-action report ended silent: closed, nothing posted")
+    return True
+
+
 def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_to=None, preclaim=False,
                   owed=None, resolved=False):
     """Post *answer* once as the thread reply to *event_id*. True only when the wrapper sent it.
@@ -1300,6 +1416,8 @@ def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_t
     digests = {_sha256(body), _sha256(f"@{handle} {body}")}
     owes = owed in ANSWER_OWED and kind == "answer"
     fd, why = _claim(name)
+    if fd is None and why == "exists" and kind == "answer":
+        _settle_abandoned(name)  # an old post left pending by a dead shim is settled first, whatever is published now
     if fd is None and why == "exists" and owes and _reopens_owed_slot(name, body, resolved):
         fd, why = _claim(name)
     if fd is None:
@@ -1548,7 +1666,7 @@ def recovery_delivery_state(event_id):
     # (``disposition`` null), or owed and ``confirmed`` (the thread showed it and the CEO turn declared the event
     # resolved). An answer with no disposition at all is a base shim's: nothing says the event was not owed, so
     # it is ``unverified`` and recovery fetches the original and asks the gateway again.
-    if any(r.get("kind") == "answer" and r.get("sent") is True and "disposition" in r
+    if any(r.get("kind") == "answer" and (r.get("sent") is True or r.get("silent") is True) and "disposition" in r
            and (r["disposition"] is None or r.get("reply_state") == "confirmed") for r in records):
         return "answered"
     with _INFLIGHT_LOCK:
@@ -2163,6 +2281,8 @@ def deliver_event(session, parsed, text, mentioned):
         # cleared from ``.answer``, it takes that slot, where the event's one terminal answer lives.
         publish_reply(base, channel, UNANSWERED_NOTICE.format(disposition=owed, event=base), kind="notice",
                       preclaim=cleared != ".answer", owed=owed)
+    elif answered and getattr(answer, "silent", False):
+        close_silently(base, channel)  # an event owed nothing: a no-action report closes with no post at all
     elif answered and answer and answer.strip():
         publish_reply(base, channel, answer, owed=owed, resolved=getattr(answer, "resolved", False))
     elif notice is not None:

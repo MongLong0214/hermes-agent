@@ -3615,6 +3615,7 @@ class GatewayRunner(
         expected_db_path: Any = None, expected_db_identity: Any = None,
         expected_run_generation: int | None = None,
         held_lease: Any = None, peer: Any = None, relay: Any = None, observation: Any = None,
+        earlier_calls: Any = None, owed_kind: Any = None,
     ) -> Any:
         """Run one exact cached actor without creating, routing, or delivering anything.
 
@@ -3628,7 +3629,15 @@ class GatewayRunner(
         instruction a canonical CTO relayed, proven against its transcript) the same turn runs as the
         *owner's* instead, on the same session and actor: the model gets the relay's rendering, the row
         stores it with the relay's provenance (``display_kind`` ``owner_relay``), and the turn runs under
-        the owner's own tools and settings, not a peer grant. Its answer still goes only to the request."""
+        the owner's own tools and settings, not a peer grant. Its answer still goes only to the request.
+
+        The owner turn alone has the ``relay_resolve`` declaration (tools/relay_resolve_tool.py), bound to this
+        event. ``earlier_calls`` (the calls an earlier turn of this event made, as its receipt recorded them)
+        makes it a reply-only recovery turn: it may run nothing but that declaration, so recovering the reply
+        never repeats the work. Its declaration is judged from its own rows (``accepted_declaration``).
+        ``owed_kind`` (the disposition of a post the bound canonical CTO declared a question, ruling request or
+        conflict) gives a peer turn the same declaration, for this event alone: its grant names the event, its
+        tool surface carries the tool, and it is told it owes the declaration."""
         from gateway.canonical_surface import (
             bound_actor_db,
             cached_actor,
@@ -3809,7 +3818,8 @@ class GatewayRunner(
                     # Its sends land in the caller's observation: a failed turn records that scope.
                     grant_token = None if owner_turn else bind_grant(PeerToolGrant(
                         binding.name, agent, require_peer_fence,
-                        attempted=observation.attempted if observation is not None else []))
+                        attempted=observation.attempted if observation is not None else [],
+                        resolve_event=event.event_id if owed_kind is not None else None))
                     prior_principal = getattr(agent, "_turn_principal", None)
                     prior_skip_review = getattr(agent, "skip_background_review", False)
                     agent._turn_principal = None if owner_turn else "peer"
@@ -3826,6 +3836,22 @@ class GatewayRunner(
                         session_key=entry.session_key,
                         parent_chat_id=str(getattr(origin, "parent_chat_id", "") or ""),
                         cron_session=current_cron_session())
+                    from tools.relay_resolve_tool import bind_scope, reset_reply_only, reset_scope, set_reply_only
+                    declares = owner_turn or owed_kind is not None
+                    prior_notes = getattr(agent, "_gateway_turn_context_notes", "")
+                    if owed_kind is not None:
+                        # Told beside the quoted post, on the one-shot must-deliver channel: the stored row and
+                        # its provenance stay exactly the CTO's post.
+                        from gateway.owner_relay import peer_declaration_note
+                        agent._gateway_turn_context_notes = peer_declaration_note(owed_kind, event.event_id)
+                    scope_token = bind_scope(event.event_id) if declares else None
+                    reply_only_token = set_reply_only(True) if owner_turn and earlier_calls is not None else None
+                    surface = (getattr(agent, "tools", None), getattr(agent, "valid_tool_names", None))
+                    if declares:
+                        # The declaration is in this turn's tool surface and in no other's.
+                        from tools.relay_resolve_tool import SCHEMA as RESOLVE_SCHEMA
+                        agent.tools = [*(surface[0] or []), {"type": "function", "function": RESOLVE_SCHEMA}]
+                        agent.valid_tool_names = {*(surface[1] or ()), RESOLVE_SCHEMA["name"]}
                     try:
                         if observation is not None:
                             observation.actor_started = True
@@ -3860,6 +3886,14 @@ class GatewayRunner(
                         reset_relayed_owner_effects(effects_token)
                         reset_relayed_owner_turn(relayed_token)
                         reset_turn_principal(principal_token)
+                        if owed_kind is not None:
+                            agent._gateway_turn_context_notes = prior_notes
+                        if declares:
+                            agent.tools, agent.valid_tool_names = surface
+                        if reply_only_token is not None:
+                            reset_reply_only(reply_only_token)
+                        if scope_token is not None:
+                            reset_scope(scope_token)
 
                 result = await run_owned_turn(
                     self, agent, run_peer_turn,
@@ -3899,7 +3933,20 @@ class GatewayRunner(
                     # The owner turn's own opening row, and no peer or other relay row after it.
                     if not opening_row_is_this_relay(result.get("messages"), boundary, relay_meta, peer_prompt):
                         raise ValueError("canonical_turn_refused")
-                    return selected
+                    from dataclasses import replace as _replace
+                    from gateway.owner_relay import accepted_declaration, declaration_attempted, known_call_ids, turn_calls
+                    declaration = accepted_declaration(result.get("messages"), boundary, event_id=event.event_id,
+                                                       earlier=earlier_calls or ())
+                    return _replace(
+                        selected, calls=tuple(turn_calls(result.get("messages"), boundary)),
+                        outcome=declaration[0] if declaration else None,
+                        public_reply=declaration[1] if declaration else None,
+                        evidence=tuple(declaration[2]) if declaration else (),
+                        # A refused declaration, or a reply-only recovery turn that made none: its free text
+                        # is public only through the public filter.
+                        declaration_refused=declaration is None and (earlier_calls is not None or declaration_attempted(
+                            result.get("messages"), boundary)),
+                        known_call_ids=known_call_ids(result.get("messages"), boundary, earlier_calls or ()))
                 try:
                     facts = turn_provenance(
                         result.get("messages"), history_boundary=boundary, peer=peer, body=event.text,
@@ -3908,6 +3955,18 @@ class GatewayRunner(
                     facts = None
                 if facts is None or not facts.binds:
                     raise ValueError("canonical_turn_refused")
+                if owed_kind is not None:
+                    from dataclasses import replace as _replace
+                    from gateway.owner_relay import accepted_declaration, declaration_attempted, known_call_ids
+                    from tools.relay_resolve_tool import PEER_OUTCOMES
+                    declaration = accepted_declaration(result.get("messages"), boundary, event_id=event.event_id,
+                                                       allowed=PEER_OUTCOMES)
+                    return _replace(selected, outcome=declaration[0] if declaration else None,
+                                    public_reply=declaration[1] if declaration else None,
+                                    evidence=tuple(declaration[2]) if declaration else (),
+                                    declaration_refused=declaration is None and declaration_attempted(
+                                        result.get("messages"), boundary),
+                                    known_call_ids=known_call_ids(result.get("messages"), boundary))
                 return selected
             finally:
                 for name, value in outward_callbacks.items():
