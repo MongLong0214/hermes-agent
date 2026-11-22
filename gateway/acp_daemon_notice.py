@@ -13,7 +13,8 @@ A verified notice then runs the CEO turn once on the existing ``acp-canonical-ce
 ``CanonicalReceiptCoordinator``, keyed by the notice's ``event_id``, as a peer turn whose author is
 ``acp-daemon``: quoted data, never owner speech. The coordinator's receipt is the idempotency record, so a
 resend of the same notice is answered from it and never runs a second turn; the same event id with a
-different text is ``409 daemon_notice_payload_mismatch``.
+different ``payload_digest`` (destination included) is ``409 daemon_notice_payload_mismatch``: the digest is part
+of the event text the coordinator fingerprints.
 
 A notice's origin, if its text carries one, is not read: nothing is sent to Telegram, only the 200 below.
 ``/events`` and ``CanonicalIngressEvent`` are unchanged and still refuse a notice.
@@ -27,16 +28,12 @@ import hashlib
 import hmac
 import json
 import logging
-import os
 import re
-import sqlite3
-from contextlib import closing
 from typing import Any, Optional
 
 from gateway import acp_managed_ingress
 from gateway.canonical_surface import (
-    CanonicalIngressEvent, CanonicalReceiptCoordinator, CanonicalSurfaceBinding,
-    ExistingCanonicalBindingResolver, _expected_identity,
+    CanonicalIngressEvent, CanonicalReceiptCoordinator, CanonicalSurfaceBinding, _expected_identity,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,6 +52,7 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SIGNATURE = re.compile(r"hmac-sha256:[0-9a-f]{64}\Z")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _MAX_ID_CHARS = 256
+_MAX_PID = 2**31 - 1
 _MAX_TEXT_CHARS = 16_384 - len(LABEL)
 # Raised by the coordinator only while it holds no record of the event: nothing ran under this id.
 _PRE_CLAIM = frozenset({"canonical_binding_stale", "canonical_agent_replaced", "canonical_turn_busy",
@@ -122,8 +120,12 @@ class DaemonNotice:
                 or not _SIGNATURE.fullmatch(body["signature"])):
             raise ValueError("daemon_notice_invalid")
         try:
-            text.encode("utf-8")
             destination = dict(_expected_identity(body["destination"]))
+            if not 0 < destination["process_pid"] <= _MAX_PID or not _bounded(destination["session_id"], 512):
+                raise ValueError("daemon_notice_invalid")
+            # Everything that is signed or keyed must be encodable: an unpaired surrogate is no UTF-8.
+            for value in (body["event_id"], text, destination["session_id"], destination["process_started_at"]):
+                value.encode("utf-8")
         except (UnicodeEncodeError, ValueError):
             raise ValueError("daemon_notice_invalid") from None
         return cls(body["event_id"], destination, text, body["payload_digest"], body["signature"])
@@ -133,7 +135,10 @@ class DaemonNotice:
                                "event_id": self.event_id, "destination": self.destination, "text": self.text})
 
     def authentic(self, secret: str) -> bool:
-        canonical = self.canonical().encode("utf-8")
+        try:
+            canonical = self.canonical().encode("utf-8")
+        except (UnicodeEncodeError, ValueError):
+            return False
         digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
         mac = "hmac-sha256:" + hmac.new(notice_key(secret), canonical, hashlib.sha256).hexdigest()
         return hmac.compare_digest(digest, self.payload_digest) & hmac.compare_digest(mac, self.signature)
@@ -148,36 +153,17 @@ class _NoticeBinding(CanonicalSurfaceBinding):
         return (author_id, channel_id) == (AUTHOR, CHANNEL)
 
 
-def _current_identity(runner: Any, binding: Any, event: Any) -> Optional[dict]:
-    """This gateway's CEO identity now, as ``GET /v1/canonical-surface/identity`` states it."""
-    from gateway.platforms.api_server_canonical import _process_started_at
-    from hermes_state_target_bind import _lineage_root_digest, _resolve_lineage_root
-
-    try:
-        _entry, proof = ExistingCanonicalBindingResolver(runner.session_store).resolve_with_proof(binding, event)
-        with closing(sqlite3.connect(proof.db_path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
-            conn.row_factory = sqlite3.Row
-            root = _resolve_lineage_root(conn, proof.session_id)
-    except Exception:
-        return None
-    pid = os.getpid()
-    started = _process_started_at(pid)
-    if started is None:
-        return None
-    return {"session_id": proof.session_id, "lineage_root_digest": _lineage_root_digest(root),
-            "process_pid": pid, "process_started_at": started}
-
-
 def _refusal(status: int, code: str) -> tuple[int, dict]:
     return status, {"error": code, "detail": code}
 
 
-def _accepted(notice: DaemonNotice, binding: Any, event: CanonicalIngressEvent) -> tuple[int, dict]:
+def _accepted(notice: DaemonNotice, current: dict, binding: Any, event: CanonicalIngressEvent) -> tuple[int, dict]:
     """The answer ACP's ``daemonNoticeSettlement`` settles on. The receipt id names the coordinator's own
-    durable receipt for this notice."""
+    durable receipt for this notice; session and lineage are this gateway's own live identity (which the
+    notice's destination was just required to equal), never copied from the request."""
     return 200, {"event_id": notice.event_id, "payload_digest": notice.payload_digest, "receipt": {
-        "status": "completed", "session_id": notice.destination["session_id"],
-        "lineage_root_digest": notice.destination["lineage_root_digest"],
+        "status": "completed", "session_id": current["session_id"],
+        "lineage_root_digest": current["lineage_root_digest"],
         "receipt_id": "hermes-" + CanonicalReceiptCoordinator._key(binding, event)}}
 
 
@@ -192,8 +178,9 @@ async def receive(runner: Any, raw: bytes) -> tuple[int, dict]:
         return _refusal(503, "daemon_notice_unavailable")
     if not notice.authentic(secret):
         return _refusal(401, "daemon_notice_signature_invalid")
-    binding = (getattr(runner.config, "canonical_surface_bindings", None) or {}).get(BINDING)
-    if binding is None:
+    bindings = getattr(runner.config, "canonical_surface_bindings", None) or {}
+    binding = bindings.get(BINDING)
+    if binding is None or len(bindings) != 1:
         return _refusal(503, "daemon_notice_unavailable")
     try:
         return await _serve(runner, binding, notice)
@@ -205,11 +192,16 @@ async def receive(runner: Any, raw: bytes) -> tuple[int, dict]:
 async def _serve(runner: Any, binding: Any, notice: DaemonNotice) -> tuple[int, dict]:
     notice_binding = _NoticeBinding(**{f.name: getattr(binding, f.name) for f in dataclasses.fields(binding)})
     event = CanonicalIngressEvent(binding=binding.name, event_id=notice.event_id, author_id=AUTHOR,
-                                  channel_id=CHANNEL, text=LABEL + notice.text,
+                                  channel_id=CHANNEL, text=f"{LABEL}[notice {notice.payload_digest}]\n{notice.text}",
                                   expected_identity=dict(notice.destination))
-    current = _current_identity(runner, notice_binding, event)
+    # Resolved exactly as GET /identity publishes it: the sole binding, its primary pair through the roster.
+    from gateway.platforms.api_server_canonical import live_identity
+
+    current, refused = live_identity(runner)
     if current is None:
-        return _refusal(409, "canonical_binding_stale")
+        return _refusal(409 if refused[0] == "canonical_binding_stale" else 503,
+                        "canonical_binding_stale" if refused[0] == "canonical_binding_stale"
+                        else "daemon_notice_unavailable")
     if current != notice.destination:
         return _refusal(409, "daemon_notice_destination_mismatch")
     try:
@@ -229,4 +221,4 @@ async def _serve(runner: Any, binding: Any, notice: DaemonNotice) -> tuple[int, 
         return _refusal(409, "canonical_event_failed")
     if not (answer.terminal_text or "").strip():
         return _refusal(409, "canonical_event_uncertain")
-    return _accepted(notice, notice_binding, event)
+    return _accepted(notice, current, notice_binding, event)

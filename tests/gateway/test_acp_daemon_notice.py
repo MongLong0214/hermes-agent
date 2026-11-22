@@ -101,7 +101,12 @@ def rig(ingress, monkeypatch):
                         assert response.status == 200
                         return await response.json()
 
-                yield SimpleNamespace(post=post, identity=identity, client=client, port=port, auth=auth)
+                async def identity_status():
+                    async with client.get(f"http://127.0.0.1:{port}/v1/canonical-surface/identity",
+                                          headers=auth) as response:
+                        return response.status, await response.json()
+
+                yield SimpleNamespace(post=post, identity=identity, identity_status=identity_status, client=client, port=port, auth=auth)
         finally:
             await adapter.disconnect()
 
@@ -300,6 +305,76 @@ def test_no_canonical_ceo_binding_is_a_503_with_no_turn(rig):
     assert turns(rig) == []
 
 
+def test_a_replay_for_a_new_destination_is_a_409_never_the_old_receipt_under_the_new_session(rig, monkeypatch):
+    from gateway.platforms import api_server_canonical as canonical
+
+    live = canonical.live_identity
+    current = {}
+    monkeypatch.setattr(canonical, "live_identity", lambda runner: (current.get("identity") or live(runner)[0], None))
+
+    async def go(s):
+        first = await s.post(sign(s.destination))
+        assert first[0] == 200 and first[1]["receipt"]["session_id"] == s.destination["session_id"]
+        # The CEO session is reset: the same event id and text, signed for the new session, now current.
+        current["identity"] = dict(s.destination, session_id=s.destination["session_id"] + "-new")
+        replay = await s.post(sign(current["identity"]))
+        assert replay == (409, {"error": "daemon_notice_payload_mismatch",
+                                "detail": "daemon_notice_payload_mismatch"})
+
+    rig.run(go)
+    assert len(turns(rig)) == 1 and receipt_count(rig) == 1
+
+
+def test_a_notice_is_refused_when_identity_would_refuse_because_the_only_room_is_retired(rig):
+    from tests.bridge.test_canonical_roster import OWNER, document, replace, room
+    from gateway.canonical_surface import CanonicalSurfaceBinding
+    from bridge.canonical.canonical_roster import RosterReader
+
+    root = rig.ingress.home / "bridge"
+    (root / "keys").mkdir(parents=True)
+    (root / "keys" / "owner.pub").write_text(OWNER)
+    path = root / "required-mentions.json"
+    room_id = "10000000-0000-4000-8000-000000000001"
+    replace(path, document(2, 1, {room_id: room()}))
+    binding = dataclasses.replace(rig.ingress.runner.config.canonical_surface_bindings[notices.BINDING],
+                                  allowed_channel_ids=(room_id,), allowed_author_ids=("b" * 64,),
+                                  roster=RosterReader(path))
+    rig.ingress.runner.config.canonical_surface_bindings = {binding.name: binding}
+
+    async def go(s):
+        before = await s.identity()
+        body = sign(before)
+        assert (await s.post(body))[0] == 200
+        replace(path, document(2, 2, {room_id: room(status="retired")}))
+        status, _ = await s.identity_status()
+        assert status != 200
+        other = sign(before, event_id="acp-notice:" + "2" * 64)
+        status, answer = await s.post(other)
+        assert status in (409, 503) and answer["error"] in ("daemon_notice_unavailable", "canonical_binding_stale")
+
+    rig.run(go)
+    assert len(turns(rig)) == 1
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda b: b["destination"].update(process_pid=2**40),
+    lambda b: b["destination"].update(process_pid=2**63),
+    lambda b: b.update(event_id="acp-notice:\\ud800"),
+    lambda b: b["destination"].update(session_id="s\\ud800"),
+    lambda b: b.update(text="x\\ud800"),
+])
+def test_out_of_range_or_unpaired_surrogate_fields_are_a_400_never_a_500(rig, mutate):
+    async def go(s):
+        body = sign(s.destination)
+        mutate(body)
+        raw = json.dumps(body).encode().replace(b"\\\\ud800", b"\\ud800")
+        status, answer = await s.post(raw)
+        assert (status, answer["error"]) == (400, "daemon_notice_invalid")
+
+    rig.run(go)
+    assert turns(rig) == [] and receipt_count(rig) == 0
+
+
 # --- /events is unchanged --------------------------------------------------------------------------
 
 
@@ -364,7 +439,8 @@ def test_bytes_sealed_by_acps_sealDaemonNotice_are_accepted_by_the_receiver(rig,
         return CanonicalReceiptResult(status="terminal", terminal_text="the CEO's answer")
 
     monkeypatch.setattr(acp_managed_ingress, "read_secret", lambda: _FIXTURE_SECRET)
-    monkeypatch.setattr(notices, "_current_identity", lambda *a: dict(wire["destination"]))
+    monkeypatch.setattr("gateway.platforms.api_server_canonical.live_identity",
+                        lambda runner: (dict(wire["destination"]), None))
     monkeypatch.setattr(CanonicalReceiptCoordinator, "submit", submit)
 
     async def go(s):
@@ -378,7 +454,7 @@ def test_bytes_sealed_by_acps_sealDaemonNotice_are_accepted_by_the_receiver(rig,
 
     rig.run(go)
     [event] = seen
-    assert event.text == notices.LABEL + wire["text"] and event.expected_identity == wire["destination"]
+    assert event.text == f"{notices.LABEL}[notice {wire['payload_digest']}]\n" + wire["text"] and event.expected_identity == wire["destination"]
 
 
 def _node(*args, timeout=60):
