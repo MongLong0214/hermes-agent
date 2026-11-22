@@ -431,6 +431,119 @@ def test_a_changed_replay_is_a_payload_mismatch_before_the_destination_is_judged
     assert len(turns(rig)) == 1
 
 
+async def _send(s, body):
+    try:
+        return await s.post(body)
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return ("transport",)
+
+
+def _index_rows(rig):
+    db = rig.ingress.runner.session_store._db
+    return [json.loads(row[0]) for row in db._read_all(
+        "SELECT value FROM state_meta WHERE key LIKE ?", (notices._RECORD_PREFIX + "%",))]
+
+
+def test_a_first_attempt_that_fails_before_the_coordinator_claims_is_delivered_by_the_resend(rig, monkeypatch):
+    from gateway.canonical_surface import ExistingCanonicalBindingResolver
+    import sqlite3
+
+    real = ExistingCanonicalBindingResolver.resolve_with_proof
+    calls = []
+
+    def flaky(self, binding, event):
+        if isinstance(binding, notices._NoticeBinding):
+            calls.append(1)
+            if len(calls) == 1:
+                raise sqlite3.OperationalError("database is locked")
+        return real(self, binding, event)
+
+    monkeypatch.setattr(ExistingCanonicalBindingResolver, "resolve_with_proof", flaky)
+
+    async def go(s):
+        body = sign(s.destination)
+        first = await _send(s, body)
+        assert first[0] == 409 and first[1]["error"] == "canonical_event_uncertain"
+        assert [r["state"] for r in _index_rows(rig)] == ["claimed"]
+        second = await _send(s, body)
+        assert second[0] == 200
+        assert await _send(s, body) == second
+
+    rig.run(go)
+    assert len(turns(rig)) == 1 and [r["state"] for r in _index_rows(rig)] == ["done"]
+
+
+def test_a_cancelled_lease_wait_is_delivered_by_the_resend(rig, monkeypatch):
+    runner = rig.ingress.runner
+    real = runner._turn_leases.acquire
+    calls = []
+
+    async def acquire(*a, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            raise asyncio.CancelledError()  # what a gateway shutdown delivers at this await
+        return await real(*a, **kw)
+
+    monkeypatch.setattr(runner._turn_leases, "acquire", acquire)
+
+    async def go(s):
+        body = sign(s.destination)
+        await _send(s, body)
+        second = await _send(s, body)
+        assert second[0] == 200
+        assert await _send(s, body) == second
+
+    rig.run(go)
+    assert len(turns(rig)) == 1
+
+
+def test_a_crash_after_the_coordinators_claim_stays_uncertain_and_runs_no_second_turn(rig, monkeypatch):
+    # The coordinator claimed (claim record and a pending receipt) and the process died: the turn may have run.
+    from gateway import canonical_surface as cs
+
+    async def go(s):
+        body = sign(s.destination)
+        runner = rig.ingress.runner
+        binding = runner.config.canonical_surface_bindings[notices.BINDING]
+        nb = notices._NoticeBinding(**{f.name: getattr(binding, f.name) for f in dataclasses.fields(binding)})
+        notice = notices.DaemonNotice.from_json_bytes(json.dumps(body).encode())
+        from gateway.canonical_surface import CanonicalIngressEvent
+        event = CanonicalIngressEvent(binding=binding.name, event_id=notice.event_id, author_id=notices.AUTHOR,
+                                      channel_id=notices.CHANNEL, text=f"{notices.LABEL}[notice {notice.payload_digest}]\n{notice.text}",
+                                      expected_identity=dict(notice.destination))
+        key = CanonicalReceiptCoordinator._key(nb, event)
+        db = runner.session_store._db_for_key(binding.session_key)
+        proof = {"proven_db_path": db.db_path, "proven_db_identity": db._db_file_identity}
+        fingerprint = CanonicalReceiptCoordinator._fingerprint(nb, event)
+        dead = {"v": 1, "owner": "a-dead-process", "fingerprint": fingerprint}
+        assert db.claim_meta_once(CanonicalReceiptCoordinator._beside(cs._CLAIM_NAMESPACE, key),
+                                  CanonicalReceiptCoordinator._encode({**dead, "state": "claimed"}), **proof)
+        assert db.claim_meta_once(key, CanonicalReceiptCoordinator._encode({**dead, "state": "pending"}), **proof)
+        index = runner.session_store._db
+        assert index.claim_meta_once(notices._record_key(notice.event_id), json.dumps({
+            "v": 1, "state": "claimed", "payload_digest": notice.payload_digest, "coordinator_key": key,
+            "db_path": str(db.db_path)}), proven_db_path=index.db_path, proven_db_identity=index._db_file_identity)
+        for _ in range(2):
+            status, answer = await s.post(body)
+            assert (status, answer["error"]) == (409, "canonical_event_uncertain")
+
+    rig.run(go)
+    assert turns(rig) == []
+
+
+def test_an_unreadable_index_row_is_uncertain_never_a_payload_mismatch(rig):
+    async def go(s):
+        body = sign(s.destination)
+        db = rig.ingress.runner.session_store._db
+        assert db.claim_meta_once(notices._record_key(body["event_id"]), "{not json", proven_db_path=db.db_path,
+                                  proven_db_identity=db._db_file_identity)
+        status, answer = await s.post(body)
+        assert (status, answer["error"]) == (409, "canonical_event_uncertain")
+
+    rig.run(go)
+    assert turns(rig) == []
+
+
 @pytest.mark.parametrize("mutate", [
     lambda b: b["destination"].update(process_pid=2**40),
     lambda b: b["destination"].update(process_pid=2**63),
