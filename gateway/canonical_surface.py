@@ -1207,6 +1207,11 @@ class CanonicalReceiptCoordinator:
                 self._require_current_claim_target(proof, actor, db)
                 if event.expected_identity is not None:
                     self._require_expected_identity(proof, event.expected_identity)
+                # A binding may carry one further check, run here under the lease and immediately before
+                # the turn (the daemon-notice binding re-asks what /identity publishes). It raises ValueError.
+                under_lease = getattr(binding, "under_lease_check", None)
+                if under_lease is not None:
+                    under_lease()
                 if self._session_held(proof.session_key):
                     raise ValueError("canonical_turn_busy")
                 # An open user row would be merged with this peer turn by the agent's alternation

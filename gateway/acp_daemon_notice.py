@@ -146,25 +146,38 @@ class DaemonNotice:
 
 class _NoticeBinding(CanonicalSurfaceBinding):
     """The CEO binding as one verified notice reaches it: it admits the ``acp-daemon`` principal on the
-    notice channel and nothing else. The roster and configured pairs are not consulted, and no peer of
-    the binding is admitted through it."""
+    notice channel and nothing else, and only while the binding's own primary pair still resolves through
+    the roster (so a retired only-room refuses it as it refuses ``/identity``). No peer of the binding is
+    admitted through it. ``under_lease_check`` is set per request (see ``_serve``)."""
 
     def admits(self, author_id: Any, channel_id: Any) -> bool:
+        self.primary_pair()  # raises canonical_principal_rejected / canonical_roster_unavailable
         return (author_id, channel_id) == (AUTHOR, CHANNEL)
+
+
+_RECORD_PREFIX = "acp-daemon-notice:v1:"
+
+
+def _record_key(event_id: str) -> str:
+    return _RECORD_PREFIX + hashlib.sha256(event_id.encode("utf-8")).hexdigest()
+
+
+def _read_record(db: Any, key: str) -> tuple[Optional[str], Optional[dict]]:
+    raw = db.get_meta(key)
+    try:
+        record = json.loads(raw) if raw is not None else None
+    except ValueError:
+        record = {"state": "unreadable"}
+    return raw, record if isinstance(record, dict) or record is None else {"state": "unreadable"}
 
 
 def _refusal(status: int, code: str) -> tuple[int, dict]:
     return status, {"error": code, "detail": code}
 
 
-def _accepted(notice: DaemonNotice, current: dict, binding: Any, event: CanonicalIngressEvent) -> tuple[int, dict]:
-    """The answer ACP's ``daemonNoticeSettlement`` settles on. The receipt id names the coordinator's own
-    durable receipt for this notice; session and lineage are this gateway's own live identity (which the
-    notice's destination was just required to equal), never copied from the request."""
-    return 200, {"event_id": notice.event_id, "payload_digest": notice.payload_digest, "receipt": {
-        "status": "completed", "session_id": current["session_id"],
-        "lineage_root_digest": current["lineage_root_digest"],
-        "receipt_id": "hermes-" + CanonicalReceiptCoordinator._key(binding, event)}}
+def _accepted(notice: DaemonNotice, receipt: dict) -> tuple[int, dict]:
+    """The answer ACP's ``daemonNoticeSettlement`` settles on, from the receipt that ran the turn."""
+    return 200, {"event_id": notice.event_id, "payload_digest": notice.payload_digest, "receipt": receipt}
 
 
 async def receive(runner: Any, raw: bytes) -> tuple[int, dict]:
@@ -190,12 +203,28 @@ async def receive(runner: Any, raw: bytes) -> tuple[int, dict]:
 
 
 async def _serve(runner: Any, binding: Any, notice: DaemonNotice) -> tuple[int, dict]:
-    notice_binding = _NoticeBinding(**{f.name: getattr(binding, f.name) for f in dataclasses.fields(binding)})
-    event = CanonicalIngressEvent(binding=binding.name, event_id=notice.event_id, author_id=AUTHOR,
-                                  channel_id=CHANNEL, text=f"{LABEL}[notice {notice.payload_digest}]\n{notice.text}",
-                                  expected_identity=dict(notice.destination))
+    # Idempotency is the notice index: one record per event_id in the launch home's store, independent of
+    # the session and Telegram route the CEO is bound to. The first payload_digest seen is binding.
+    db = runner.session_store._db
+    if db is None:
+        return _refusal(503, "daemon_notice_unavailable")
+    proof = {"proven_db_path": db.db_path, "proven_db_identity": db._db_file_identity}
+    key = _record_key(notice.event_id)
+    raw, record = _read_record(db, key)
+    if record is not None:
+        if record.get("payload_digest") != notice.payload_digest:
+            return _refusal(409, "daemon_notice_payload_mismatch")
+        if record.get("state") == "done":
+            return _accepted(notice, record["receipt"])
+        if record.get("state") != "refused":
+            return _refusal(409, "canonical_event_uncertain")  # claimed: never run again on a guess
+
     # Resolved exactly as GET /identity publishes it: the sole binding, its primary pair through the roster.
     from gateway.platforms.api_server_canonical import live_identity
+
+    def current_destination() -> Optional[dict]:
+        identity, _why = live_identity(runner)
+        return identity
 
     current, refused = live_identity(runner)
     if current is None:
@@ -204,14 +233,47 @@ async def _serve(runner: Any, binding: Any, notice: DaemonNotice) -> tuple[int, 
                         else "daemon_notice_unavailable")
     if current != notice.destination:
         return _refusal(409, "daemon_notice_destination_mismatch")
+
+    claimed = json.dumps({"v": 1, "state": "claimed", "payload_digest": notice.payload_digest}, sort_keys=True)
+    won = (db.claim_meta_once(key, claimed, **proof) if raw is None
+           else db.compare_and_set_meta(key, raw, claimed, **proof))
+    if not won:
+        _raw, other = _read_record(db, key)
+        if other is not None and other.get("payload_digest") != notice.payload_digest:
+            return _refusal(409, "daemon_notice_payload_mismatch")
+        return _refusal(409, "canonical_event_uncertain")
+
+    def settle(state: str, **detail: Any) -> bool:
+        return db.compare_and_set_meta(
+            key, claimed, json.dumps({"v": 1, "state": state, "payload_digest": notice.payload_digest, **detail},
+                                     sort_keys=True), **proof)
+
+    notice_binding = _NoticeBinding(**{f.name: getattr(binding, f.name) for f in dataclasses.fields(binding)})
+
+    def still_current() -> None:
+        # Under the turn lease, immediately before the turn: what /identity publishes now must still be the
+        # destination the notice was signed for.
+        if current_destination() != notice.destination:
+            raise ValueError("canonical_binding_stale")
+
+    object.__setattr__(notice_binding, "under_lease_check", still_current)
+    event = CanonicalIngressEvent(binding=binding.name, event_id=notice.event_id, author_id=AUTHOR,
+                                  channel_id=CHANNEL, text=f"{LABEL}[notice {notice.payload_digest}]\n{notice.text}",
+                                  expected_identity=dict(notice.destination))
     try:
         answer = await CanonicalReceiptCoordinator(runner).submit(notice_binding, event)
     except ValueError as exc:
         code = str(exc)
+        # Raised only while the coordinator holds no record of this event: nothing ran under it.
+        if code in _PRE_CLAIM | {"canonical_roster_unavailable", "canonical_principal_rejected",
+                                 "canonical_receipt_conflict"}:
+            settle("refused")
         if code == "canonical_receipt_conflict":
             return _refusal(409, "daemon_notice_payload_mismatch")
         if code == "canonical_roster_unavailable":
             return _refusal(503, "daemon_notice_unavailable")
+        if code == "canonical_principal_rejected":
+            return _refusal(409, "canonical_binding_stale")
         if code in _PRE_CLAIM:
             return _refusal(409, code)
         return _refusal(409, "canonical_event_uncertain")
@@ -221,4 +283,8 @@ async def _serve(runner: Any, binding: Any, notice: DaemonNotice) -> tuple[int, 
         return _refusal(409, "canonical_event_failed")
     if not (answer.terminal_text or "").strip():
         return _refusal(409, "canonical_event_uncertain")
-    return _accepted(notice, current, notice_binding, event)
+    receipt = {"status": "completed", "session_id": current["session_id"],
+               "lineage_root_digest": current["lineage_root_digest"],
+               "receipt_id": "hermes-" + CanonicalReceiptCoordinator._key(notice_binding, event)}
+    settle("done", receipt=receipt)
+    return _accepted(notice, receipt)

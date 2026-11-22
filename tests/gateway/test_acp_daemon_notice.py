@@ -325,9 +325,9 @@ def test_a_replay_for_a_new_destination_is_a_409_never_the_old_receipt_under_the
     assert len(turns(rig)) == 1 and receipt_count(rig) == 1
 
 
-def test_a_notice_is_refused_when_identity_would_refuse_because_the_only_room_is_retired(rig):
+def _roster_binding(rig):
+    """The CEO binding with a roster whose only room is active; returns (path, room id)."""
     from tests.bridge.test_canonical_roster import OWNER, document, replace, room
-    from gateway.canonical_surface import CanonicalSurfaceBinding
     from bridge.canonical.canonical_roster import RosterReader
 
     root = rig.ingress.home / "bridge"
@@ -340,17 +340,92 @@ def test_a_notice_is_refused_when_identity_would_refuse_because_the_only_room_is
                                   allowed_channel_ids=(room_id,), allowed_author_ids=("b" * 64,),
                                   roster=RosterReader(path))
     rig.ingress.runner.config.canonical_surface_bindings = {binding.name: binding}
+    return path, room_id
+
+
+def _retire(path, room_id):
+    from tests.bridge.test_canonical_roster import document, replace, room
+
+    replace(path, document(2, 2, {room_id: room(status="retired")}))
+
+
+def test_a_notice_is_refused_when_identity_would_refuse_because_the_only_room_is_retired(rig):
+    path, room_id = _roster_binding(rig)
 
     async def go(s):
         before = await s.identity()
-        body = sign(before)
-        assert (await s.post(body))[0] == 200
-        replace(path, document(2, 2, {room_id: room(status="retired")}))
+        assert (await s.post(sign(before)))[0] == 200
+        _retire(path, room_id)
         status, _ = await s.identity_status()
         assert status != 200
-        other = sign(before, event_id="acp-notice:" + "2" * 64)
-        status, answer = await s.post(other)
+        status, answer = await s.post(sign(before, event_id="acp-notice:" + "2" * 64))
         assert status in (409, 503) and answer["error"] in ("daemon_notice_unavailable", "canonical_binding_stale")
+
+    rig.run(go)
+    assert len(turns(rig)) == 1
+
+
+def test_a_notice_queued_behind_the_turn_lease_is_refused_when_the_room_is_retired_meanwhile(rig):
+    path, room_id = _roster_binding(rig)
+    session_id = rig.ingress.entry.session_id
+    runner = rig.ingress.runner
+
+    async def go(s):
+        before = await s.identity()
+        body = sign(before, event_id="acp-notice:" + "3" * 64)
+        token = await runner._turn_leases.acquire(session_id, owner_key="ordinary-turn", generation=1)
+        lease = runner._turn_leases._get_or_create(session_id)
+        queued = asyncio.ensure_future(s.post(body))
+        for _ in range(500):
+            await asyncio.sleep(0.01)
+            if lease.pending_acquires:
+                break
+        assert lease.pending_acquires  # resolved and admitted, now waiting on the lease
+        _retire(path, room_id)
+        runner._turn_leases.release(token)
+        status, answer = await queued
+        assert (status, answer["error"]) == (409, "canonical_binding_stale")
+        # Nothing ran, so the same notice is not lost: it is refused again while identity refuses.
+        assert (await s.post(body))[0] in (409, 503)
+
+    rig.run(go)
+    assert turns(rig) == [] and receipt_count(rig) == 0
+
+
+def test_the_same_event_id_after_the_ceo_is_rebound_to_another_route_runs_no_second_turn(rig):
+    from gateway.session import SessionSource
+
+    runner = rig.ingress.runner
+
+    async def go(s):
+        body = sign(s.destination)
+        first = await s.post(body)
+        assert first[0] == 200
+        # The CEO is rebound to another Telegram route (another session key, chat and session).
+        source = SessionSource(platform=rig.ingress.source.platform, chat_id="chat-2", chat_type="dm", user_id="user-2")
+        entry = runner.session_store.get_or_create_session(source)
+        runner.config.canonical_surface_bindings = {notices.BINDING: dataclasses.replace(
+            runner.config.canonical_surface_bindings[notices.BINDING], session_key=entry.session_key,
+            session_id=entry.session_id, telegram_chat_id="chat-2", telegram_user_id="user-2")}
+        moved = await s.identity()
+        assert moved["session_id"] != s.destination["session_id"]
+        # The same signed bytes: the original receipt, no turn. A new payload under that id: a 409.
+        assert await s.post(body) == first
+        again = await s.post(sign(moved))
+        assert again == (409, {"error": "daemon_notice_payload_mismatch", "detail": "daemon_notice_payload_mismatch"})
+
+    rig.run(go)
+    assert len(turns(rig)) == 1 and receipt_count(rig) == 1
+
+
+def test_a_changed_replay_is_a_payload_mismatch_before_the_destination_is_judged(rig):
+    async def go(s):
+        assert (await s.post(sign(s.destination)))[0] == 200
+        stale = dict(s.destination, session_id="20261001_000000_previous")
+        for changed in (sign(stale), sign(s.destination, text=refusal_text("refusal-other")),
+                        sign(stale, text=refusal_text("refusal-other"))):
+            assert await s.post(changed) == (409, {"error": "daemon_notice_payload_mismatch",
+                                                   "detail": "daemon_notice_payload_mismatch"})
 
     rig.run(go)
     assert len(turns(rig)) == 1
