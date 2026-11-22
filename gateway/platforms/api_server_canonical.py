@@ -25,6 +25,7 @@ logger = logging.getLogger("gateway.platforms.api_server")
 ROUTE = "/v1/canonical-surface/events"
 IDENTITY_ROUTE = "/v1/canonical-surface/identity"
 RECEIPTS_TELEGRAM_ROUTE = "/v1/canonical-surface/receipts/telegram/{update_id}"
+DAEMON_NOTICES_ROUTE = "/v1/canonical-surface/daemon-notices"
 
 
 class _ProcBSDInfo(ctypes.Structure):
@@ -105,8 +106,30 @@ def _http_routes(self) -> list[tuple[str, str, Any]]:
     async def handle_receipt(request: "web.Request") -> "web.Response":
         return await handle_telegram_receipt_lookup(self, request)
 
+    async def handle_notice(request: "web.Request") -> "web.Response":
+        return await handle_daemon_notice(self, request)
+
     return [("POST", ROUTE, handle), ("GET", IDENTITY_ROUTE, identity),
-            ("GET", RECEIPTS_TELEGRAM_ROUTE, handle_receipt)]
+            ("GET", RECEIPTS_TELEGRAM_ROUTE, handle_receipt), ("POST", DAEMON_NOTICES_ROUTE, handle_notice)]
+
+
+async def handle_daemon_notice(self, request: "web.Request") -> "web.Response":
+    """``POST /v1/canonical-surface/daemon-notices``: one signed ``acp-daemon-notice/v1`` body, served by
+    ``gateway.acp_daemon_notice`` (its own closed parser; ``/events`` still refuses notices). The gateway
+    key authenticates the channel and the lane-secret HMAC authenticates the notice; both are required."""
+    auth_error = self._check_auth(request)
+    if auth_error:
+        return auth_error
+    from gateway import acp_daemon_notice
+    from gateway.platforms.api_server import _api_request_profile
+
+    runner = self.gateway_runner
+    if runner is None:
+        return web.json_response({"error": "daemon_notice_unavailable"}, status=503)
+    if _api_request_profile.get() not in (None, "default"):
+        return web.json_response({"error": "canonical_binding_unknown"}, status=404)
+    status, body = await acp_daemon_notice.receive(runner, await request.read())
+    return web.json_response(body, status=status)
 
 
 async def handle_canonical_surface_identity(self, request: "web.Request") -> "web.Response":
