@@ -25,6 +25,7 @@ logger = logging.getLogger("gateway.platforms.api_server")
 ROUTE = "/v1/canonical-surface/events"
 IDENTITY_ROUTE = "/v1/canonical-surface/identity"
 RECEIPTS_TELEGRAM_ROUTE = "/v1/canonical-surface/receipts/telegram/{update_id}"
+DAEMON_NOTICES_ROUTE = "/v1/canonical-surface/daemon-notices"
 
 
 class _ProcBSDInfo(ctypes.Structure):
@@ -105,8 +106,30 @@ def _http_routes(self) -> list[tuple[str, str, Any]]:
     async def handle_receipt(request: "web.Request") -> "web.Response":
         return await handle_telegram_receipt_lookup(self, request)
 
+    async def handle_notice(request: "web.Request") -> "web.Response":
+        return await handle_daemon_notice(self, request)
+
     return [("POST", ROUTE, handle), ("GET", IDENTITY_ROUTE, identity),
-            ("GET", RECEIPTS_TELEGRAM_ROUTE, handle_receipt)]
+            ("GET", RECEIPTS_TELEGRAM_ROUTE, handle_receipt), ("POST", DAEMON_NOTICES_ROUTE, handle_notice)]
+
+
+async def handle_daemon_notice(self, request: "web.Request") -> "web.Response":
+    """``POST /v1/canonical-surface/daemon-notices``: one signed ``acp-daemon-notice/v1`` body, served by
+    ``gateway.acp_daemon_notice`` (its own closed parser; ``/events`` still refuses notices). The gateway
+    key authenticates the channel and the lane-secret HMAC authenticates the notice; both are required."""
+    auth_error = self._check_auth(request)
+    if auth_error:
+        return auth_error
+    from gateway import acp_daemon_notice
+    from gateway.platforms.api_server import _api_request_profile
+
+    runner = self.gateway_runner
+    if runner is None:
+        return web.json_response({"error": "daemon_notice_unavailable"}, status=503)
+    if _api_request_profile.get() not in (None, "default"):
+        return web.json_response({"error": "canonical_binding_unknown"}, status=404)
+    status, body = await acp_daemon_notice.receive(runner, await request.read())
+    return web.json_response(body, status=status)
 
 
 async def handle_canonical_surface_identity(self, request: "web.Request") -> "web.Response":
@@ -120,11 +143,6 @@ async def handle_canonical_surface_identity(self, request: "web.Request") -> "we
     auth_error = self._check_auth(request)
     if auth_error:
         return auth_error
-    from gateway.canonical_surface import ExistingCanonicalBindingResolver
-    from hermes_state_target_bind import (
-        TargetBindReceiptFenceError, _lineage_root_digest, _resolve_lineage_root,
-    )
-
     # The router matches the mirror, and the prefix middleware validates its profile.
     # Keep the query/path check exact: no extra parameters or alternate profile aliases.
     if request.path_qs != IDENTITY_ROUTE and not (
@@ -135,9 +153,29 @@ async def handle_canonical_surface_identity(self, request: "web.Request") -> "we
     runner = self.gateway_runner
     if runner is None:
         return _refusal("canonical_unavailable", 503, "Canonical request unavailable.")
+    identity, refusal = live_identity(runner)
+    if identity is None:
+        code, status = refusal
+        if code == "canonical_roster_unavailable":
+            return _refusal_for(code)
+        if code == "canonical_unavailable":
+            return _refusal(code, status, "Canonical request unavailable.")
+        return _refusal(code, status)
+    return web.json_response(identity)
+
+
+def live_identity(runner: Any) -> tuple[dict | None, tuple[str, int] | None]:
+    """The sole configured binding's existing live head and this process, as ``GET /identity`` publishes
+    it, or ``(None, (code, status))`` when it would refuse. The one place that decides it: the daemon-notice
+    route resolves its destination through here."""
+    from gateway.canonical_surface import ExistingCanonicalBindingResolver
+    from hermes_state_target_bind import (
+        TargetBindReceiptFenceError, _lineage_root_digest, _resolve_lineage_root,
+    )
+
     bindings = getattr(runner.config, "canonical_surface_bindings", None) or {}
     if len(bindings) != 1:
-        return _refusal("canonical_binding_unknown", 404)
+        return None, ("canonical_binding_unknown", 404)
     binding = next(iter(bindings.values()))
     resolver = ExistingCanonicalBindingResolver(runner.session_store)
     try:
@@ -151,18 +189,18 @@ async def handle_canonical_surface_identity(self, request: "web.Request") -> "we
             root_id = _resolve_lineage_root(conn, entry.session_id)
     except (ValueError, IndexError, sqlite3.Error, TargetBindReceiptFenceError) as exc:
         if str(exc) == "canonical_roster_unavailable":
-            return _refusal_for(str(exc))
-        return _refusal("canonical_binding_stale", 409)
+            return None, ("canonical_roster_unavailable", 503)
+        return None, ("canonical_binding_stale", 409)
     pid = os.getpid()
     started_at = _process_started_at(pid)
     if started_at is None:
-        return _refusal("canonical_unavailable", 503, "Canonical request unavailable.")
-    return web.json_response({
+        return None, ("canonical_unavailable", 503)
+    return {
         "session_id": entry.session_id,
         "lineage_root_digest": _lineage_root_digest(root_id),
         "process_pid": pid,
         "process_started_at": started_at,
-    })
+    }, None
 
 
 def _refusal_for(code: str, reason: Any = None) -> "web.Response":
